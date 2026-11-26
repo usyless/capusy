@@ -150,6 +150,34 @@ inline int64_t unix_now() noexcept {
     return std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
 }
 
+inline FixedWString<32> format_timestamp_iso(int64_t unix_s) noexcept {
+    FixedWString<32> out;
+    if (unix_s <= 0) return out;
+    const uint64_t ft = (static_cast<uint64_t>(unix_s) + 11'644'473'600ull) * 10'000'000ull;
+    const FILETIME f{.dwLowDateTime = static_cast<DWORD>(ft), .dwHighDateTime = static_cast<DWORD>(ft >> 32u)};
+    FILETIME local{};
+    SYSTEMTIME st{};
+    FileTimeToLocalFileTime(&f, &local);
+    FileTimeToSystemTime(&local, &st);
+
+    const auto push2 = [&](WORD v) noexcept {
+        out.push_back(static_cast<wchar_t>(L'0' + ((v / 10) % 10)));
+        out.push_back(static_cast<wchar_t>(L'0' + (v % 10)));
+    };
+    out.append(to_fixed_wstr<8>(st.wYear));
+    out.push_back(L'-');
+    push2(st.wMonth);
+    out.push_back(L'-');
+    push2(st.wDay);
+    out.push_back(L' ');
+    push2(st.wHour);
+    out.push_back(L':');
+    push2(st.wMinute);
+    out.push_back(L':');
+    push2(st.wSecond);
+    return out;
+}
+
 inline FixedWString<64> format_timestamp(int64_t unix_s) noexcept {
     FixedWString<64> out;
     if (unix_s <= 0) return out;
@@ -236,6 +264,54 @@ inline const fs::path& settings_path() {
 inline const fs::path& history_db_path() {
     static const fs::path p = data_dir() / L"history.db";
     return p;
+}
+
+inline const fs::path& update_state_path() {
+    static const fs::path p = data_dir() / L"update_state.json";
+    return p;
+}
+
+struct WindowInfo {
+    std::string title;
+    std::string process_name;
+};
+
+/// Reads the title and executable filename of `hwnd` (returns empty fields if invalid or owned by this process).
+inline WindowInfo query_window_info(HWND hwnd) {
+    WindowInfo info;
+    if (!hwnd) return info;
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hwnd, &pid);
+    if (pid == 0 || pid == GetCurrentProcessId()) return info;
+
+    std::array<wchar_t, 512> title_buf; // NOLINT(cppcoreguidelines-pro-type-member-init)
+    const int tlen = GetWindowTextW(hwnd, title_buf.data(), static_cast<int>(title_buf.size()));
+    if (tlen > 0) {
+        std::wstring_view sv{title_buf.data(), static_cast<size_t>(tlen)};
+        while (!sv.empty() && (sv.front() == L' ' || sv.front() == L'\t' || sv.front() == L'\r' || sv.front() == L'\n')) sv.remove_prefix(1);
+        while (!sv.empty() && (sv.back() == L' ' || sv.back() == L'\t' || sv.back() == L'\r' || sv.back() == L'\n')) sv.remove_suffix(1);
+        if (!sv.empty()) info.title = to_utf8(sv);
+    }
+
+    if (const wil::unique_handle proc{OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid)}) {
+        std::array<wchar_t, 512> exe_buf; // NOLINT(cppcoreguidelines-pro-type-member-init)
+        auto len = static_cast<DWORD>(exe_buf.size());
+        if (QueryFullProcessImageNameW(proc.get(), 0, exe_buf.data(), &len) && len > 0) {
+            std::wstring_view full{exe_buf.data(), len};
+            const size_t slash = full.find_last_of(L"\\/");
+            const std::wstring_view base = (slash != std::wstring_view::npos) ? full.substr(slash + 1) : full;
+            if (!base.empty()) info.process_name = to_utf8(base);
+        }
+    }
+    return info;
+}
+
+inline WindowInfo foreground_window_info() {
+    HWND fg = GetForegroundWindow();
+    if (!fg) return {};
+    HWND root = GetAncestor(fg, GA_ROOTOWNER);
+    if (root) fg = root;
+    return query_window_info(fg);
 }
 
 inline fs::path default_captures_dir() {

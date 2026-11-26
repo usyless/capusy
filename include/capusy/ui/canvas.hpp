@@ -24,7 +24,9 @@ namespace capusy::ui {
 }
 
 namespace glyph {
+inline constexpr wchar_t search = 0xE721;
 inline constexpr wchar_t settings = 0xE713;
+inline constexpr wchar_t download = 0xE896;
 inline constexpr wchar_t close = 0xE8BB;
 inline constexpr wchar_t play = 0xF5B0;
 inline constexpr wchar_t pause = 0xF8AE;

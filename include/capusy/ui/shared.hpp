@@ -6,6 +6,7 @@
 #include <capusy/history_store.hpp>
 #include <capusy/hotkeys.hpp>
 #include <capusy/settings.hpp>
+#include <capusy/update_logic.hpp>
 
 #include <atomic>
 #include <dwmapi.h>
@@ -39,6 +40,13 @@ struct Shared {
     bool recording_active = false;
     int background_jobs = 0;
 
+    UpdateState update_state;
+    bool update_checking = false;
+
+    [[nodiscard]] bool has_update_available() const noexcept {
+        return !update_state.latest_version.empty() && is_newer_version(update_state.latest_version, to_utf8(APP_VERSION));
+    }
+
     std::function<void()> on_capture_full;
     std::function<void()> on_capture_region;
     std::function<void()> on_toggle_record;
@@ -50,6 +58,7 @@ struct Shared {
     std::function<void()> on_visibility_changed;
     std::function<void()> on_history_changed;
     std::function<void()> on_redraw_all;
+    std::function<void(std::wstring_view)> on_update_balloon;
 
     void call(std::function<void()> fn) {
         const HWND hwnd = call_hwnd.load(std::memory_order_acquire);
@@ -368,9 +377,13 @@ inline void populate_clipboard_payload(ClipboardPayload& payload, const Raster* 
         }
     }
     if (png_file) {
-        if (auto bytes = ulp::fs::read_as_bytes(*png_file); bytes && !bytes->empty() && bytes->size() < (128ull << 20u)) {
-            payload.png.resize(bytes->size());
-            std::memcpy(payload.png.data(), bytes->data(), bytes->size());
+        const bool is_png = png_file->size() >= 4 &&
+                            _wcsicmp(png_file->c_str() + (png_file->size() - 4), L".png") == 0;
+        if (is_png) {
+            if (auto bytes = ulp::fs::read_as_bytes(*png_file); bytes && !bytes->empty() && bytes->size() < (128ull << 20u)) {
+                payload.png.resize(bytes->size());
+                std::memcpy(payload.png.data(), bytes->data(), bytes->size());
+            }
         }
     }
 }

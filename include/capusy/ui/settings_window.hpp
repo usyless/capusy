@@ -4,12 +4,17 @@
 #include "shared.hpp"
 #include "widgets.hpp"
 
+#include <capusy/updater.hpp>
+
 #include <algorithm>
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace capusy::ui {
@@ -23,10 +28,22 @@ public:
     SettingsWindow(SettingsWindow&&) = delete;
     SettingsWindow& operator=(SettingsWindow&&) = delete;
     ~SettingsWindow() {
+        stop_background_jobs();
         stop_recording_hotkey();
         app_icon_.reset();
         target_.release();
         if (hwnd_) DestroyWindow(hwnd_);
+    }
+
+    void stop_background_jobs() noexcept {
+        update_job_.thread.request_stop();
+        update_check_thread_.request_stop();
+        update_job_.thread = {};
+        update_check_thread_ = {};
+    }
+
+    void maybe_auto_check_updates() {
+        start_update_check(false);
     }
 
     bool create(HINSTANCE inst) {
@@ -127,6 +144,12 @@ private:
         IdToggleStartup,
         IdToggleAutoCopy,
         IdToggleCaptureCursor,
+        IdToggleSplitMonth,
+        IdFmtPng,
+        IdFmtJpeg,
+        IdFmtBmp,
+        IdFmtTiff,
+        IdSliderImageQuality,
         IdBrowseSaveDir,
         IdOpenSaveDir,
         IdToggleToast,
@@ -139,8 +162,53 @@ private:
         IdBitrate12,
         IdBitrate20,
         IdToggleRecordCursor,
+        IdToggleAutoUpdate,
+        IdCheckUpdates,
+        IdInstallUpdate,
+        IdInstallUpdateDisabled,
+        IdOpenReleaseUrl,
         IdScrollbar,
     };
+
+    struct UpdateJob {
+        std::mutex mx;
+        std::wstring log;
+        bool failed = false;
+        uint64_t done = 0;
+        uint64_t total = 0;
+        bool busy = false;
+        std::jthread thread;
+    };
+
+    struct JobView {
+        std::wstring log;
+        bool failed = false;
+        uint64_t done = 0;
+        uint64_t total = 0;
+    };
+
+    [[nodiscard]] JobView view_update_job() {
+        const std::scoped_lock lk{update_job_.mx};
+        return {.log = update_job_.log, .failed = update_job_.failed, .done = update_job_.done, .total = update_job_.total};
+    }
+
+    void report_update(std::wstring_view msg, bool failed = false) {
+        {
+            const std::scoped_lock lk{update_job_.mx};
+            update_job_.log.assign(msg);
+            update_job_.failed = failed;
+        }
+        sh_.call([this] { invalidate(); });
+    }
+
+    void report_update_progress(uint64_t done, uint64_t total) {
+        {
+            const std::scoped_lock lk{update_job_.mx};
+            update_job_.done = done;
+            update_job_.total = total;
+        }
+        sh_.call([this] { invalidate(); });
+    }
 
     void sync_state(bool animate) {
         startup_enabled_ = is_startup_enabled();
@@ -152,8 +220,10 @@ private:
         sw_startup_.set(startup_enabled_ ? 1.0f : 0.0f, animate);
         sw_auto_copy_.set(sh_.settings.auto_copy_clipboard ? 1.0f : 0.0f, animate);
         sw_cap_cursor_.set(sh_.settings.capture_cursor ? 1.0f : 0.0f, animate);
+        sw_split_month_.set(sh_.settings.split_by_month ? 1.0f : 0.0f, animate);
         sw_toast_.set(sh_.settings.show_corner_toast ? 1.0f : 0.0f, animate);
         sw_rec_cursor_.set(sh_.settings.record_cursor ? 1.0f : 0.0f, animate);
+        sw_auto_update_.set(sh_.settings.auto_check_updates ? 1.0f : 0.0f, animate);
     }
 
     void start_anim() noexcept {
@@ -174,8 +244,10 @@ private:
         if (sw_startup_.step(dt, 22.0f, 0.004f)) moving = true;
         if (sw_auto_copy_.step(dt, 22.0f, 0.004f)) moving = true;
         if (sw_cap_cursor_.step(dt, 22.0f, 0.004f)) moving = true;
+        if (sw_split_month_.step(dt, 22.0f, 0.004f)) moving = true;
         if (sw_toast_.step(dt, 22.0f, 0.004f)) moving = true;
         if (sw_rec_cursor_.step(dt, 22.0f, 0.004f)) moving = true;
+        if (sw_auto_update_.step(dt, 22.0f, 0.004f)) moving = true;
         const float d = target_scroll_ - scroll_;
         if (std::abs(d) < 0.5f) {
             scroll_ = target_scroll_;
@@ -396,6 +468,63 @@ private:
 
             y = next_y;
         }
+
+        // 3. Screenshot Format & Folder Organization card
+        {
+            const ImageFormat fmt = sh_.settings.resolved_image_format();
+            const bool show_quality = image_format_supports_quality(fmt);
+            const CardHeader hd = make_header(cv, rw, L"Screenshot Format & Folders", cv.theme().on_surface,
+                                              L"Image container format, compression quality, and ShareX-style monthly folders");
+
+            Flow fmt_row{8.0f, 8.0f};
+            flow_text(cv, fmt_row, L"Image format:", Font::Body, cv.theme().on_surface, 130.0f, 32.0f);
+            fmt_row.add(84.0f, 32.0f, [&](D2D1_RECT_F r) {
+                draw_button(cv, hover_.alpha(IdFmtPng), r, 0, L"PNG", IdFmtPng, 0, fmt == ImageFormat::Png ? 1 : 0);
+            });
+            fmt_row.add(84.0f, 32.0f, [&](D2D1_RECT_F r) {
+                draw_button(cv, hover_.alpha(IdFmtJpeg), r, 0, L"JPEG", IdFmtJpeg, 0, fmt == ImageFormat::Jpeg ? 1 : 0);
+            });
+            fmt_row.add(84.0f, 32.0f, [&](D2D1_RECT_F r) {
+                draw_button(cv, hover_.alpha(IdFmtBmp), r, 0, L"BMP", IdFmtBmp, 0, fmt == ImageFormat::Bmp ? 1 : 0);
+            });
+            fmt_row.add(84.0f, 32.0f, [&](D2D1_RECT_F r) {
+                draw_button(cv, hover_.alpha(IdFmtTiff), r, 0, L"TIFF", IdFmtTiff, 0, fmt == ImageFormat::Tiff ? 1 : 0);
+            });
+
+            const float split_y = y + 16.0f + hd.h + 12.0f;
+            const float sep_y = split_y + 40.0f;
+            const float fmt_y = sep_y + 14.0f;
+            const float fmt_h = fmt_row.height(rw);
+            const float qual_y = fmt_y + fmt_h + 12.0f;
+            const float qual_h = show_quality ? 34.0f : 22.0f;
+            const float card_h = (qual_y + qual_h + 16.0f) - y;
+            const float next_y = card_begin(cv, x, y, w, card_h, CARD_GAP);
+
+            (void)draw_header(cv, lx, y, rw, hd);
+            cv.text(L"Organize captures into YYYY-MM folders (ShareX style)", rect(lx, split_y, rw - 60.0f, 32.0f), Font::Body, cv.theme().on_surface);
+            draw_switch(cv, hover_.alpha(IdToggleSplitMonth), sw_split_month_.value, lx + rw, split_y + 16.0f, IdToggleSplitMonth);
+
+            cv.hline(lx, lx + rw, sep_y, with_alpha(cv.theme().outline_variant, 0.5f));
+            fmt_row.draw(lx, fmt_y, rw);
+
+            if (show_quality) {
+                FixedWString<48> qlbl{L"JPEG quality: "};
+                qlbl.append(to_fixed_wstr<16>(sh_.settings.image_quality));
+                qlbl.append(L"%");
+                cv.text(qlbl, rect(lx, qual_y, 170.0f, 32.0f), Font::Body, cv.theme().on_surface);
+                slider_quality_r_ = rect(lx + 180.0f, qual_y, std::max(100.0f, rw - 180.0f), 32.0f);
+                const float qr = std::clamp(static_cast<float>(sh_.settings.image_quality - 10) / 90.0f, 0.0f, 1.0f);
+                draw_slider(cv, hover_.alpha(IdSliderImageQuality), slider_quality_r_, qr, dragging_slider_ == IdSliderImageQuality, IdSliderImageQuality);
+            } else {
+                const wchar_t* note = (fmt == ImageFormat::Png)
+                    ? L"PNG is lossless (default) — full pixel quality with compact compression."
+                    : (fmt == ImageFormat::Bmp ? L"BMP is uncompressed lossless — fastest write, largest file size."
+                                               : L"TIFF is lossless — full pixel quality for archival workflows.");
+                cv.text(note, rect(lx, qual_y, rw, 22.0f), Font::Caption, cv.theme().on_surface_variant);
+            }
+
+            y = next_y;
+        }
         return y;
     }
 
@@ -527,7 +656,261 @@ private:
             format_size(stats_.db_bytes));
         cv.text(db_info, rect(lx, y + 196.0f, rw, 22.0f), Font::Small, cv.theme().on_surface_variant, Align::Center);
         cv.text(history_db_path().wstring(), rect(lx, y + 220.0f, rw, 20.0f), Font::MonoSmall, cv.theme().outline, Align::Center);
-        return next_y;
+        y = next_y;
+
+        // Software Updates card (modeled on usyseek)
+        {
+            const JobView upd_view = view_update_job();
+            const bool update_avail = sh_.has_update_available();
+            const bool can_install = update_avail && !sh_.update_state.asset_url.empty();
+
+            std::wstring caption;
+            D2D1_COLOR_F title_col = cv.theme().on_surface;
+            if (sh_.update_checking) {
+                caption = L"Checking GitHub Releases…";
+            } else if (update_avail) {
+                overwrite_to(
+                    caption,
+                    L"New version ",
+                    sh_.update_state.latest_tag.empty() ? "v" : "",
+                    sh_.update_state.latest_tag.empty() ? sh_.update_state.latest_version : sh_.update_state.latest_tag,
+                    L" is available (current: v", APP_VERSION, L").");
+                title_col = cv.theme().primary;
+            } else if (!sh_.update_state.last_error.empty()) {
+                overwrite_to(caption, L"Last check failed: ", sh_.update_state.last_error);
+                if (sh_.update_state.last_check_unix > 0) {
+                    append_to(caption, L"  •  Checked ", format_ago(sh_.update_state.last_check_unix));
+                }
+            } else if (sh_.update_state.last_check_unix > 0) {
+                overwrite_to(caption, L"Up to date  •  Last checked ", format_ago(sh_.update_state.last_check_unix));
+            } else {
+                caption = L"Checks github.com/usyless/capusy/releases once every 24 hours.";
+            }
+
+            const CardHeader hd = make_header(cv, rw, L"Software Updates", title_col, caption);
+
+            const wchar_t* check_lbl = sh_.update_checking ? L"Checking…" : L"Check Now";
+            std::wstring install_lbl = L"Download & Install";
+            if (update_job_.busy) {
+                install_lbl = upd_view.total > 0
+                    ? ulp::str::concat_strings(L"Cancel  •  ", to_fixed_wstr(upd_view.done * 100 / upd_view.total), L"%")
+                    : L"Cancel";
+            } else if (update_avail) {
+                overwrite_to(
+                    install_lbl,
+                    L"Download & Install ",
+                    sh_.update_state.latest_tag.empty() ? "v" : "",
+                    sh_.update_state.latest_tag.empty() ? sh_.update_state.latest_version : sh_.update_state.latest_tag);
+            }
+
+            Flow actions{8.0f, 8.0f};
+            actions.add(button_width(cv, check_lbl, true, 126.0f), 34.0f, [&](D2D1_RECT_F r) {
+                if (sh_.update_checking || update_job_.busy) {
+                    draw_disabled_button(cv, r, glyph::refresh, check_lbl, IdNone);
+                } else {
+                    draw_button(cv, hover_.alpha(IdCheckUpdates), r, glyph::refresh, check_lbl, IdCheckUpdates, 0, 0);
+                }
+            });
+            if (can_install || update_job_.busy) {
+                actions.add(button_width(cv, install_lbl, true, 170.0f), 34.0f, [&](D2D1_RECT_F r) {
+                    if (sh_.recording_active && !update_job_.busy) {
+                        draw_disabled_button(cv, r, glyph::download, install_lbl, IdInstallUpdateDisabled);
+                    } else {
+                        draw_button(cv, hover_.alpha(IdInstallUpdate), r, update_job_.busy ? glyph::close : glyph::download,
+                                    install_lbl, IdInstallUpdate, 0, update_job_.busy ? 2 : 1);
+                    }
+                });
+            }
+            actions.add(button_width(cv, L"View Releases", true, 134.0f), 34.0f, [&](D2D1_RECT_F r) {
+                draw_button(cv, hover_.alpha(IdOpenReleaseUrl), r, glyph::open, L"View Releases", IdOpenReleaseUrl, 0, 3);
+            });
+
+            std::wstring pkg_note;
+            if (update_avail && !sh_.update_state.asset_name.empty()) {
+                append_to(pkg_note, L"Selected package: ", sh_.update_state.asset_name);
+                if (sh_.update_state.asset_size > 0) {
+                    append_to(pkg_note, L" (", format_size(sh_.update_state.asset_size), L")");
+                }
+                pkg_note += tar_supports_7z()
+                    ? L"  •  Windows tar supports .7z"
+                    : L"  •  Using .zip for Windows compatibility";
+            }
+
+            std::wstring job_note = upd_view.log;
+            if (update_job_.busy && upd_view.total > 0) {
+                append_to(job_note, L"  ", format_size(upd_view.done), L" / ", format_size(upd_view.total));
+            }
+            const bool show_bar = update_job_.busy && upd_view.total > 0;
+            std::wstring notes_txt;
+            if (update_avail && !sh_.update_state.release_notes.empty()) {
+                notes_txt = to_wide(sh_.update_state.release_notes);
+                if (notes_txt.size() > 600) {
+                    notes_txt.resize(600);
+                    notes_txt += L'…';
+                }
+            }
+
+            const float auto_y = y + 16.0f + hd.h + 12.0f;
+            const float line2_y = auto_y + 38.0f;
+            const float actions_y = line2_y + 12.0f;
+            const float actions_h = actions.height(rw);
+            float cy = actions_y + actions_h;
+
+            const float pkg_y = cy + 8.0f;
+            const float pkg_h = pkg_note.empty() ? 0.0f : text_height(cv, pkg_note, Font::Caption, rw, 18.0f);
+            if (pkg_h > 0.0f) cy = pkg_y + pkg_h;
+
+            const float bar_y = cy + 8.0f;
+            if (show_bar) cy = bar_y + 6.0f;
+
+            const float job_y = cy + 8.0f;
+            const float job_h = job_note.empty() ? 0.0f : text_height(cv, job_note, Font::Caption, rw, 18.0f);
+            if (job_h > 0.0f) cy = job_y + job_h;
+
+            const float notes_y = cy + 12.0f;
+            const float notes_inner_w = std::max(120.0f, rw - 24.0f);
+            const float notes_txt_h = notes_txt.empty() ? 0.0f : text_height(cv, notes_txt, Font::Small, notes_inner_w, 18.0f);
+            const float notes_h = notes_txt.empty() ? 0.0f : (20.0f + notes_txt_h);
+            if (notes_h > 0.0f) cy = notes_y + notes_h;
+
+            const float uh = cy + 18.0f - y;
+            const float u_next_y = card_begin(cv, x, y, w, uh, CARD_GAP);
+            (void)draw_header(cv, lx, y, rw, hd);
+
+            cv.text(L"Check automatically (every 24h)", rect(lx, auto_y, rw - 60.0f, 32.0f), Font::Body, cv.theme().on_surface);
+            draw_switch(cv, hover_.alpha(IdToggleAutoUpdate), sw_auto_update_.value, lx + rw, auto_y + 16.0f, IdToggleAutoUpdate);
+
+            cv.hline(lx, lx + rw, line2_y, with_alpha(cv.theme().outline_variant, 0.5f));
+            actions.draw(lx, actions_y, rw);
+            if (pkg_h > 0.0f) {
+                cv.text_wrap(pkg_note, rect(lx, pkg_y, rw, pkg_h), Font::Caption, cv.theme().on_surface_variant);
+            }
+            if (show_bar) {
+                const float pct = std::clamp(static_cast<float>(upd_view.done) / static_cast<float>(upd_view.total), 0.0f, 1.0f);
+                const D2D1_RECT_F trk = rect(lx, bar_y, rw, 6.0f);
+                cv.fill_round(trk, 3.0f, with_alpha(cv.theme().outline_variant, 0.35f));
+                if (pct > 0.0f) {
+                    cv.fill_round(rect(lx, bar_y, std::max(6.0f, rw * pct), 6.0f), 3.0f, cv.theme().primary);
+                }
+            }
+            if (job_h > 0.0f) {
+                cv.text_wrap(job_note, rect(lx, job_y, rw, job_h), Font::Caption,
+                             upd_view.failed ? cv.theme().error : cv.theme().on_surface_variant);
+            }
+            if (notes_h > 0.0f) {
+                const D2D1_RECT_F nr = rect(lx, notes_y, rw, notes_h);
+                draw_well(cv, nr, 10.0f, true);
+                cv.text_wrap(notes_txt, rect(nr.left + 12.0f, nr.top + 10.0f, notes_inner_w, notes_txt_h),
+                             Font::Small, cv.theme().on_surface_variant);
+            }
+            y = u_next_y;
+        }
+        return y;
+    }
+
+    // ------------------------------------------------------------------------------------------
+    // Auto-Update Check & Staged Install (identical workflow to usyseek)
+    // ------------------------------------------------------------------------------------------
+
+    void start_update_check(bool manual) {
+        if (sh_.update_checking || update_job_.busy) return;
+        if (!manual && !should_auto_check_updates(sh_.settings.auto_check_updates, sh_.update_state.last_check_unix, unix_now())) {
+            return;
+        }
+        if (update_check_thread_.joinable()) update_check_thread_.join();
+        sh_.update_checking = true;
+        ++sh_.background_jobs;
+
+        UpdateState st = sh_.update_state;
+        st.last_check_unix = unix_now();
+        (void)save_update_state(st);
+        sh_.update_state.last_check_unix = st.last_check_unix;
+        invalidate();
+
+        update_check_thread_ = std::jthread([this, st = std::move(st)](const std::stop_token& stop) mutable {
+            bool is_newer = false;
+            const bool ok = check_latest_release(st, is_newer, stop);
+            if (stop.stop_requested()) return;
+            sh_.call([this, st = std::move(st), ok, is_newer] mutable {
+                sh_.update_checking = false;
+                if (sh_.background_jobs > 0) --sh_.background_jobs;
+                if (ok && is_newer) {
+                    const std::string ver_label = st.latest_tag.empty() ? ulp::str::concat_strings("v", st.latest_version) : st.latest_tag;
+                    if (st.notified_version != st.latest_version) {
+                        st.notified_version = st.latest_version;
+                        (void)save_update_state(st);
+                        if (sh_.on_update_balloon) {
+                            sh_.on_update_balloon(to_wide(ver_label));
+                        }
+                    }
+                }
+                sh_.update_state = std::move(st);
+                if (sh_.on_visibility_changed) sh_.on_visibility_changed();
+                if (sh_.on_redraw_all) sh_.on_redraw_all();
+                invalidate();
+            });
+        });
+    }
+
+    void start_update_install() {
+        if (update_job_.busy) {
+            update_job_.thread.request_stop();
+            return;
+        }
+        if (sh_.recording_active || !sh_.has_update_available() || sh_.update_state.asset_url.empty()) return;
+
+        if (update_job_.thread.joinable()) update_job_.thread.join();
+        {
+            const std::scoped_lock lk{update_job_.mx};
+            update_job_.log.clear();
+            update_job_.failed = false;
+            update_job_.done = 0;
+            update_job_.total = 0;
+        }
+        update_job_.busy = true;
+        ++sh_.background_jobs;
+        invalidate();
+
+        UpdateState st = sh_.update_state;
+        const auto staged_root = std::make_shared<fs::path>();
+        const auto stage_ok = std::make_shared<bool>(false);
+
+        update_job_.thread = std::jthread([this, st = std::move(st), staged_root, stage_ok](const std::stop_token& stop) {
+            try {
+                std::wstring err;
+                *stage_ok = download_and_stage_update(
+                    st, *staged_root, err,
+                    [this](std::wstring_view msg) { report_update(msg); },
+                    [this](uint64_t done, uint64_t total) { report_update_progress(done, total); },
+                    stop);
+                report_update_progress(0, 0);
+                if (!*stage_ok) {
+                    report_update(err, !stop.stop_requested());
+                }
+            } catch (const std::exception& e) {
+                *stage_ok = false;
+                report_update_progress(0, 0);
+                report_update(to_wide(e.what()), true);
+            }
+
+            sh_.call([this, staged_root, stage_ok] {
+                update_job_.busy = false;
+                if (sh_.background_jobs > 0) --sh_.background_jobs;
+                if (sh_.on_visibility_changed) sh_.on_visibility_changed();
+                if (!*stage_ok) {
+                    invalidate();
+                    return;
+                }
+                const DWORD wait_pid = GetCurrentProcessId();
+                bool uac_cancelled = false;
+                std::wstring err;
+                if (!launch_staged_updater(*staged_root, exe_dir(), wait_pid, true, uac_cancelled, err)) {
+                    report_update(err, true);
+                    return;
+                }
+                PostQuitMessage(0);
+            });
+        });
     }
 
     // ------------------------------------------------------------------------------------------
@@ -540,12 +923,16 @@ private:
     }
 
     void update_slider_from_x(int slider_id, float x) {
-        const D2D1_RECT_F r = (slider_id == IdSliderToastSize) ? slider_size_r_ : slider_timeout_r_;
+        const D2D1_RECT_F r = (slider_id == IdSliderToastSize)
+            ? slider_size_r_
+            : (slider_id == IdSliderImageQuality ? slider_quality_r_ : slider_timeout_r_);
         const float l = r.left + 8.0f;
         const float ri = std::max(l + 4.0f, r.right - 8.0f);
         const float k = std::clamp((x - l) / (ri - l), 0.0f, 1.0f);
         if (slider_id == IdSliderToastSize) {
             sh_.settings.toast_width_dip = std::round((160.0f + (k * 260.0f)) / 5.0f) * 5.0f;
+        } else if (slider_id == IdSliderImageQuality) {
+            sh_.settings.image_quality = std::clamp(static_cast<int>(std::lround((10.0f + (k * 90.0f)) / 5.0f)) * 5, 10, 100);
         } else {
             sh_.settings.toast_timeout_s = std::round((1.0f + (k * 14.0f)) * 2.0f) / 2.0f;
         }
@@ -622,6 +1009,16 @@ private:
                 sync_state(true);
                 start_anim();
                 return;
+            case IdToggleSplitMonth:
+                sh_.settings.split_by_month = !sh_.settings.split_by_month;
+                sh_.save();
+                sync_state(true);
+                start_anim();
+                return;
+            case IdFmtPng: sh_.settings.image_format = "png"; sh_.save(); invalidate(); return;
+            case IdFmtJpeg: sh_.settings.image_format = "jpeg"; sh_.save(); invalidate(); return;
+            case IdFmtBmp: sh_.settings.image_format = "bmp"; sh_.save(); invalidate(); return;
+            case IdFmtTiff: sh_.settings.image_format = "tiff"; sh_.save(); invalidate(); return;
             case IdBrowseSaveDir:
                 if (auto dir = browse_folder_dialog(hwnd_, L"Choose capture save folder", resolve_save_dir(sh_.settings).wstring())) {
                     sh_.settings.save_dir = to_utf8(*dir);
@@ -641,6 +1038,7 @@ private:
                 return;
             case IdSliderToastSize:
             case IdSliderToastTimeout:
+            case IdSliderImageQuality:
                 dragging_slider_ = h->id;
                 SetCapture(hwnd_);
                 update_slider_from_x(h->id, p.x);
@@ -659,6 +1057,25 @@ private:
                 sync_state(true);
                 start_anim();
                 return;
+            case IdToggleAutoUpdate:
+                sh_.settings.auto_check_updates = !sh_.settings.auto_check_updates;
+                sh_.save();
+                sync_state(true);
+                start_anim();
+                return;
+            case IdCheckUpdates:
+                start_update_check(true);
+                return;
+            case IdInstallUpdate:
+                start_update_install();
+                return;
+            case IdOpenReleaseUrl: {
+                const std::wstring url = sh_.update_state.release_url.empty()
+                    ? std::wstring{GITHUB_RELEASES_PAGE_URL}
+                    : to_wide(sh_.update_state.release_url);
+                (void)open_file(url);
+                return;
+            }
             case IdScrollbar:
                 dragging_scroll_ = true;
                 SetCapture(hwnd_);
@@ -818,14 +1235,18 @@ private:
     AnimFloat sw_startup_;
     AnimFloat sw_auto_copy_;
     AnimFloat sw_cap_cursor_;
+    AnimFloat sw_split_month_;
     AnimFloat sw_toast_;
     AnimFloat sw_rec_cursor_;
+    AnimFloat sw_auto_update_;
 
     bool startup_enabled_ = false;
     std::wstring save_dir_w_;
     HistoryStats stats_{};
     std::optional<HotkeyAction> recording_action_;
     std::wstring record_conflict_msg_;
+    UpdateJob update_job_;
+    std::jthread update_check_thread_;
 
     wil::com_ptr<ID2D1Bitmap1> app_icon_;
     uint64_t app_icon_epoch_ = 0;
@@ -839,6 +1260,7 @@ private:
     D2D1_RECT_F scroll_thumb_{};
     D2D1_RECT_F slider_size_r_{};
     D2D1_RECT_F slider_timeout_r_{};
+    D2D1_RECT_F slider_quality_r_{};
     bool dragging_scroll_ = false;
     bool in_sizemove_ = false;
     float scroll_drag_offset_ = 0.0f;

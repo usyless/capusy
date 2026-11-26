@@ -66,6 +66,8 @@ public:
 
         cursor_arrow_ = LoadCursorW(nullptr, IDC_ARROW);
         cursor_hand_ = LoadCursorW(nullptr, IDC_HAND);
+        cursor_ibeam_ = LoadCursorW(nullptr, IDC_IBEAM);
+        search_field_.placeholder = L"Search title, name, date…";
         return true;
     }
 
@@ -97,6 +99,9 @@ public:
         if (!hwnd_ || dragging_out_) return;
         KillTimer(hwnd_, TIMER_VIDEO);
         KillTimer(hwnd_, TIMER_DROP);
+        KillTimer(hwnd_, TIMER_CARET);
+        set_search_focus(false);
+        dragging_search_ = false;
         video_.close();
         sh_.previews.clear();
         sh_.thumbs.clear();
@@ -120,41 +125,93 @@ public:
         if (filter_ == Filter::Images) filter = CaptureKind::Image;
         else if (filter_ == Filter::Videos) filter = CaptureKind::Video;
 
-        if (auto list = sh_.history.list_recent(1000, filter)) {
-            entries_ = std::move(*list);
+        if (auto list = sh_.history.list_recent(2500, filter)) {
+            all_entries_ = std::move(*list);
         } else {
-            entries_.clear();
+            all_entries_.clear();
         }
 
-        // Precompute display strings once so scrolling does zero heap/filesystem conversions per frame.
-        row_cache_.clear();
-        row_cache_.reserve(entries_.size());
-        for (const CaptureEntry& e : entries_) {
+        // Precompute display strings and lowercased search haystack once so scrolling & typing stay instant.
+        all_cache_.clear();
+        all_cache_.reserve(all_entries_.size());
+        for (const CaptureEntry& e : all_entries_) {
             RowCache rc;
             rc.wpath = to_wide(e.path);
             const size_t slash = rc.wpath.find_last_of(L"\\/");
             rc.filename = (slash != std::wstring::npos) ? rc.wpath.substr(slash + 1) : rc.wpath;
+            rc.window_title = to_wide(e.window_title);
+            rc.process_name = to_wide(e.process_name);
+            if (!e.format.empty()) {
+                rc.format = to_wide(e.format);
+            } else if (e.kind == CaptureKind::Video) {
+                rc.format = L"MP4";
+            } else {
+                const size_t dot = rc.filename.find_last_of(L'.');
+                if (dot != std::wstring::npos && dot + 1 < rc.filename.size()) {
+                    rc.format = rc.filename.substr(dot + 1);
+                    CharUpperBuffW(rc.format.data(), static_cast<DWORD>(rc.format.size()));
+                }
+            }
+            rc.title_line = rc.window_title.empty() ? rc.filename : rc.window_title;
+
+            if (!rc.process_name.empty()) {
+                rc.line2 = rc.process_name;
+            }
             if (e.width > 0 && e.height > 0) {
-                rc.line2.assign(to_fixed_wstr<16>(e.width));
-                rc.line2.append(L"×");
-                rc.line2.append(to_fixed_wstr<16>(e.height));
+                if (!rc.line2.empty()) rc.line2 += L"  •  ";
+                append_to(rc.line2, to_fixed_wstr<16>(e.width), L"×", to_fixed_wstr<16>(e.height));
             }
             if (e.size_bytes > 0) {
-                if (!rc.line2.empty()) rc.line2.append(L"  •  ");
-                rc.line2.append(format_size(e.size_bytes));
+                if (!rc.line2.empty()) rc.line2 += L"  •  ";
+                rc.line2 += std::wstring_view{format_size(e.size_bytes)};
             }
             if (e.kind == CaptureKind::Video && e.duration_ms > 0) {
-                if (!rc.line2.empty()) rc.line2.append(L"  •  ");
-                rc.line2.append(format_duration_ms(e.duration_ms));
+                if (!rc.line2.empty()) rc.line2 += L"  •  ";
+                rc.line2 += std::wstring_view{format_duration_ms(e.duration_ms)};
             }
             rc.ts = format_timestamp(e.created_at);
-            row_cache_.push_back(std::move(rc));
+            rc.iso_ts = format_timestamp_iso(e.created_at);
+
+            std::wstring hay;
+            hay.reserve(rc.filename.size() + rc.window_title.size() + rc.process_name.size() + rc.wpath.size() + 64);
+            append_to(hay, rc.filename, L' ', rc.window_title, L' ', rc.process_name, L' ', rc.format, L' ',
+                      rc.ts, L' ', rc.iso_ts, L' ', rc.wpath);
+            if (e.mode == CaptureMode::Full) hay += L" full screen";
+            else if (e.mode == CaptureMode::Region) hay += L" region";
+            else hay += L" recording video";
+            rc.search_lower = lower(hay);
+            all_cache_.push_back(std::move(rc));
+        }
+
+        apply_search_filter(prev_id);
+    }
+
+    void apply_search_filter(int64_t preferred_id = -1) {
+        if (preferred_id < 0 && selected_idx_ >= 0 && std::cmp_less(selected_idx_, entries_.size())) {
+            preferred_id = entries_[static_cast<size_t>(selected_idx_)].id;
+        }
+        const std::wstring q = lower(trim(search_field_.text));
+
+        entries_.clear();
+        row_cache_.clear();
+        if (q.empty()) {
+            entries_ = all_entries_;
+            row_cache_ = all_cache_;
+        } else {
+            entries_.reserve(all_entries_.size());
+            row_cache_.reserve(all_cache_.size());
+            for (size_t i = 0; i < all_entries_.size(); ++i) {
+                if (matches_history_query_lower(all_cache_[i].search_lower, q)) {
+                    entries_.push_back(all_entries_[i]);
+                    row_cache_.push_back(all_cache_[i]);
+                }
+            }
         }
 
         selected_idx_ = -1;
-        if (prev_id >= 0) {
+        if (preferred_id >= 0) {
             for (size_t i = 0; i < entries_.size(); ++i) {
-                if (entries_[i].id == prev_id) {
+                if (entries_[i].id == preferred_id) {
                     selected_idx_ = static_cast<int>(i);
                     break;
                 }
@@ -187,17 +244,25 @@ public:
 
 private:
     static constexpr float HEADER_H = 54.0f;
-    static constexpr float SIDEBAR_W = 324.0f;
-    static constexpr float ROW_H = 74.0f;
+    static constexpr float SIDEBAR_W = 336.0f;
+    static constexpr float SIDEBAR_TOP_H = 86.0f;
+    static constexpr float ROW_H = 78.0f;
     static constexpr float ROW_GAP = 6.0f;
     static constexpr UINT_PTR TIMER_VIDEO = 2;
     static constexpr UINT_PTR TIMER_DROP = 3;
+    static constexpr UINT_PTR TIMER_CARET = 4;
 
     struct RowCache {
         std::wstring wpath;
         std::wstring filename;
-        FixedWString<64> line2;
+        std::wstring window_title;
+        std::wstring process_name;
+        std::wstring format;
+        std::wstring title_line;
+        std::wstring line2;
         FixedWString<64> ts;
+        FixedWString<32> iso_ts;
+        std::wstring search_lower;
     };
 
     enum class Filter : uint8_t { All = 0, Images, Videos };
@@ -208,6 +273,8 @@ private:
         IdBtnRegion,
         IdBtnRecord,
         IdBtnSettings,
+        IdSearchBox,
+        IdSearchClear,
         IdFilterAll,
         IdFilterImages,
         IdFilterVideos,
@@ -258,7 +325,7 @@ private:
     }
 
     [[nodiscard]] float max_scroll() const noexcept {
-        const float list_h = std::max(0.0f, target_.size().height - HEADER_H - 44.0f);
+        const float list_h = std::max(0.0f, target_.size().height - HEADER_H - SIDEBAR_TOP_H);
         const float total_h = entries_.empty() ? 0.0f : (static_cast<float>(entries_.size()) * (ROW_H + ROW_GAP) + 12.0f);
         return std::max(0.0f, total_h - list_h);
     }
@@ -271,13 +338,31 @@ private:
 
     void ensure_row_visible(int idx) noexcept {
         if (idx < 0) return;
-        const float list_h = std::max(1.0f, target_.size().height - HEADER_H - 44.0f);
+        const float list_h = std::max(1.0f, target_.size().height - HEADER_H - SIDEBAR_TOP_H);
         const float top = 6.0f + (static_cast<float>(idx) * (ROW_H + ROW_GAP));
         const float bot = top + ROW_H;
         if (top < target_scroll_) target_scroll_ = top - 6.0f;
         else if (bot > target_scroll_ + list_h) target_scroll_ = bot - list_h + 6.0f;
         clamp_scroll();
         start_anim();
+    }
+
+    void set_search_focus(bool focus) noexcept {
+        if (search_field_.focused == focus) return;
+        search_field_.focused = focus;
+        search_field_.caret_on = focus;
+        if (hwnd_) {
+            if (focus) SetTimer(hwnd_, TIMER_CARET, 530, nullptr);
+            else KillTimer(hwnd_, TIMER_CARET);
+        }
+        invalidate();
+    }
+
+    void reset_caret_blink() noexcept {
+        search_field_.caret_on = true;
+        if (hwnd_ && search_field_.focused) {
+            SetTimer(hwnd_, TIMER_CARET, 530, nullptr);
+        }
     }
 
     void start_anim() noexcept {
@@ -368,7 +453,11 @@ private:
 
         float rx = sz.width - 14.0f;
         rx -= set_w;
-        draw_button(cv, hover_.alpha(IdBtnSettings), rect(rx, 11.0f, set_w, 32.0f), glyph::settings, L"Settings", IdBtnSettings, 0, 3);
+        const D2D1_RECT_F set_r = rect(rx, 11.0f, set_w, 32.0f);
+        draw_button(cv, hover_.alpha(IdBtnSettings), set_r, glyph::settings, L"Settings", IdBtnSettings, 0, 3);
+        if (sh_.has_update_available()) {
+            cv.fill_circle({.x = set_r.right - 7.0f, .y = set_r.top + 7.0f}, 4.0f, cv.theme().primary);
+        }
         rx -= 8.0f + rec_w;
         draw_button(cv, hover_.alpha(IdBtnRecord), rect(rx, 11.0f, rec_w, 32.0f), sh_.recording_active ? glyph::stop : glyph::video, rec_lbl, IdBtnRecord, 0, sh_.recording_active ? 2 : 0);
         rx -= 8.0f + reg_w;
@@ -380,25 +469,54 @@ private:
     void draw_sidebar(Canvas& cv, D2D1_RECT_F area) {
         cv.fill(area, with_alpha(cv.theme().surface_low, 0.55f));
 
+        // Search bar
+        const float sx = area.left + 10.0f;
+        const float sy = area.top + 8.0f;
+        const float sw = std::max(80.0f, width(area) - 20.0f);
+        const D2D1_RECT_F sbox = rect(sx, sy, sw, 32.0f);
+        search_box_rect_ = sbox;
+        draw_well(cv, sbox, 9.0f, true, search_field_.focused, hover_.alpha(IdSearchBox));
+        cv.icon(glyph::search, rect(sbox.left + 8.0f, sbox.top, 18.0f, height(sbox)),
+                search_field_.focused ? cv.theme().primary : cv.theme().outline, Font::IconSmall);
+        const bool has_q = !search_field_.text.empty();
+        const float clear_space = has_q ? 28.0f : 8.0f;
+        search_text_rect_ = D2D1::RectF(sbox.left + 30.0f, sbox.top + 2.0f, sbox.right - clear_space, sbox.bottom - 2.0f);
+        search_field_.draw(cv, search_text_rect_, Font::Small, cv.theme().on_surface, cv.theme().outline);
+        cv.hit(sbox, IdSearchBox);
+        if (has_q) {
+            const D2D1_RECT_F cr = rect(sbox.right - 26.0f, sbox.top + 4.0f, 22.0f, 24.0f);
+            draw_button(cv, hover_.alpha(IdSearchClear), cr, glyph::close, L"", IdSearchClear, 0, 3);
+        }
+
         // Filter bar
-        const float fy = area.top + 8.0f;
+        const float fy = area.top + 48.0f;
         const float fx = area.left + 10.0f;
-        draw_button(cv, hover_.alpha(IdFilterAll), rect(fx, fy, 56.0f, 28.0f), 0, L"All", IdFilterAll, 0, filter_ == Filter::All ? 1 : 3);
-        draw_button(cv, hover_.alpha(IdFilterImages), rect(fx + 60.0f, fy, 74.0f, 28.0f), 0, L"Images", IdFilterImages, 0, filter_ == Filter::Images ? 1 : 3);
-        draw_button(cv, hover_.alpha(IdFilterVideos), rect(fx + 138.0f, fy, 74.0f, 28.0f), 0, L"Videos", IdFilterVideos, 0, filter_ == Filter::Videos ? 1 : 3);
+        draw_button(cv, hover_.alpha(IdFilterAll), rect(fx, fy, 54.0f, 28.0f), 0, L"All", IdFilterAll, 0, filter_ == Filter::All ? 1 : 3);
+        draw_button(cv, hover_.alpha(IdFilterImages), rect(fx + 58.0f, fy, 72.0f, 28.0f), 0, L"Images", IdFilterImages, 0, filter_ == Filter::Images ? 1 : 3);
+        draw_button(cv, hover_.alpha(IdFilterVideos), rect(fx + 134.0f, fy, 72.0f, 28.0f), 0, L"Videos", IdFilterVideos, 0, filter_ == Filter::Videos ? 1 : 3);
 
-        FixedWString<32> cnt = format_count(entries_.size());
-        cv.text(cnt, rect(area.right - 68.0f, fy, 56.0f, 28.0f), Font::Caption, cv.theme().outline, Align::Right);
-        cv.hline(area.left, area.right, area.top + 43.0f, with_alpha(cv.theme().outline_variant, 0.45f));
+        FixedWString<48> cnt;
+        if (has_q && entries_.size() != all_entries_.size()) {
+            cnt.assign(format_count(entries_.size()));
+            cnt.append(L" / ");
+            cnt.append(format_count(all_entries_.size()));
+        } else {
+            cnt.assign(format_count(entries_.size()));
+        }
+        cv.text(cnt, rect(area.right - 92.0f, fy, 80.0f, 28.0f), Font::Caption, cv.theme().outline, Align::Right);
+        cv.hline(area.left, area.right, area.top + SIDEBAR_TOP_H - 1.0f, with_alpha(cv.theme().outline_variant, 0.45f));
 
-        const D2D1_RECT_F list_r = D2D1::RectF(area.left, area.top + 44.0f, area.right, area.bottom);
+        const D2D1_RECT_F list_r = D2D1::RectF(area.left, area.top + SIDEBAR_TOP_H, area.right, area.bottom);
         list_rect_ = list_r;
         cv.push_clip(list_r);
 
         if (entries_.empty()) {
-            cv.icon(glyph::history, rect(list_r.left, list_r.top + 80.0f, width(list_r), 36.0f), cv.theme().outline, Font::IconLarge);
-            cv.text(L"No captures yet", rect(list_r.left, list_r.top + 120.0f, width(list_r), 24.0f), Font::BodySemi, cv.theme().on_surface_variant, Align::Center);
-            cv.text(L"Press your screenshot hotkey or click Full Screen / Region", rect(list_r.left + 20.0f, list_r.top + 146.0f, width(list_r) - 40.0f, 40.0f),
+            cv.icon(has_q ? glyph::search : glyph::history, rect(list_r.left, list_r.top + 80.0f, width(list_r), 36.0f), cv.theme().outline, Font::IconLarge);
+            cv.text(has_q ? L"No matching captures" : L"No captures yet", rect(list_r.left, list_r.top + 120.0f, width(list_r), 24.0f),
+                    Font::BodySemi, cv.theme().on_surface_variant, Align::Center);
+            cv.text(has_q ? L"Try searching by window title, app name, filename, or date (e.g. 2026-11)"
+                          : L"Press your screenshot hotkey or click Full Screen / Region",
+                    rect(list_r.left + 20.0f, list_r.top + 146.0f, width(list_r) - 40.0f, 44.0f),
                     Font::SmallWrap, cv.theme().outline, Align::Center);
             cv.pop_clip();
             return;
@@ -433,18 +551,19 @@ private:
                 sh_.thumbs.request(tid, rc.wpath, thumb_px);
                 cv.icon(e.kind == CaptureKind::Video ? glyph::video : glyph::photo, tr, cv.theme().outline, Font::Icon);
             }
-            if (e.kind == CaptureKind::Video) {
-                const D2D1_RECT_F vb = rect(tr.right - 36.0f, tr.bottom - 18.0f, 33.0f, 15.0f);
+            if (!rc.format.empty()) {
+                const float bw = std::max(30.0f, cv.measure(rc.format, Font::Label) + 8.0f);
+                const D2D1_RECT_F vb = rect(tr.right - bw - 3.0f, tr.bottom - 18.0f, bw, 15.0f);
                 cv.fill_round(vb, 4.0f, with_alpha(cv.theme().surface_lowest, 0.85f));
-                cv.text(L"MP4", vb, Font::Label, cv.theme().amber, Align::Center);
+                cv.text(rc.format, vb, Font::Label, e.kind == CaptureKind::Video ? cv.theme().amber : cv.theme().on_surface_variant, Align::Center);
             }
 
             // Text info (zero allocations per frame)
             const float tx = tr.right + 10.0f;
             const float tw = std::max(40.0f, rr.right - tx - 8.0f);
-            cv.text(rc.filename, rect(tx, rr.top + 10.0f, tw, 20.0f), Font::SmallSemi, sel ? cv.theme().on_primary_container : cv.theme().on_surface);
-            cv.text(rc.line2, rect(tx, rr.top + 31.0f, tw, 17.0f), Font::Caption, cv.theme().on_surface_variant);
-            cv.text(rc.ts, rect(tx, rr.top + 48.0f, tw, 17.0f), Font::Caption, cv.theme().outline);
+            cv.text(rc.title_line, rect(tx, rr.top + 10.0f, tw, 20.0f), Font::SmallSemi, sel ? cv.theme().on_primary_container : cv.theme().on_surface);
+            cv.text(rc.line2, rect(tx, rr.top + 32.0f, tw, 17.0f), Font::Caption, cv.theme().on_surface_variant);
+            cv.text(rc.ts, rect(tx, rr.top + 51.0f, tw, 17.0f), Font::Caption, cv.theme().outline);
 
             cv.hit(rr, IdRow, i);
         }
@@ -559,21 +678,32 @@ private:
         draw_button(cv, hover_.alpha(IdActCopy), rect(bx, by, copy_w, 32.0f), glyph::copy, L"Copy", IdActCopy, 0, 1);
 
         const float info_w = std::max(40.0f, bx - foot.left - 18.0f);
-        cv.text(row_cache_[static_cast<size_t>(selected_idx_)].filename, rect(foot.left + 12.0f, foot.top + 8.0f, info_w, 20.0f), Font::SmallSemi, cv.theme().on_surface);
+        const RowCache& sel_rc = row_cache_[static_cast<size_t>(selected_idx_)];
+        std::wstring top_line;
+        if (!sel_rc.window_title.empty()) {
+            top_line = ulp::str::concat_strings(sel_rc.window_title, L"  —  ", sel_rc.filename);
+        } else {
+            top_line = sel_rc.filename;
+        }
+        cv.text(top_line, rect(foot.left + 12.0f, foot.top + 8.0f, info_w, 20.0f), Font::SmallSemi, cv.theme().on_surface);
 
-        FixedWString<96> sub;
-        sub.assign(e->mode == CaptureMode::Full ? L"Full Screen" : (e->mode == CaptureMode::Region ? L"Region" : L"Recording"));
+        std::wstring sub;
+        if (!sel_rc.process_name.empty()) {
+            append_to(sub, sel_rc.process_name, L"  •  ");
+        }
+        sub += (e->mode == CaptureMode::Full ? L"Full Screen" : (e->mode == CaptureMode::Region ? L"Region" : L"Recording"));
+        if (!sel_rc.format.empty()) {
+            append_to(sub, L"  •  ", sel_rc.format);
+        }
         if (e->width > 0 && e->height > 0) {
-            sub.append(L"  •  ");
-            sub.append(to_fixed_wstr<16>(e->width));
-            sub.append(L"×");
-            sub.append(to_fixed_wstr<16>(e->height));
+            append_to(sub, L"  •  ", to_fixed_wstr<16>(e->width), L"×", to_fixed_wstr<16>(e->height));
         }
         if (e->size_bytes > 0) {
-            sub.append(L"  •  ");
-            sub.append(format_size(e->size_bytes));
+            append_to(sub, L"  •  ", format_size(e->size_bytes));
         }
-        sub.append(L"  •  Drag to drop into apps");
+        if (!sel_rc.ts.empty()) {
+            append_to(sub, L"  •  ", sel_rc.ts);
+        }
         cv.text(sub, rect(foot.left + 12.0f, foot.top + 28.0f, info_w, 18.0f), Font::Caption, cv.theme().on_surface_variant);
     }
 
@@ -690,9 +820,33 @@ private:
     void on_lbutton_down(LPARAM lp) {
         const D2D1_POINT_2F p = to_dip(lp);
         const Hit* h = hit_test(hits_, p);
-        if (!h) return;
+        if (!h) {
+            set_search_focus(false);
+            return;
+        }
+        if (h->id != IdSearchBox && h->id != IdSearchClear) {
+            set_search_focus(false);
+        }
 
         switch (h->id) {
+            case IdSearchBox: {
+                set_search_focus(true);
+                reset_caret_blink();
+                if (target_.ready()) {
+                    std::vector<Hit> dummy;
+                    Canvas cv{target_, sh_.fonts, dummy, default_theme(), std::nullopt};
+                    search_field_.click(cv, p.x, GetKeyState(VK_SHIFT) < 0);
+                }
+                dragging_search_ = true;
+                SetCapture(hwnd_);
+                invalidate();
+                return;
+            }
+            case IdSearchClear:
+                search_field_.set({});
+                reset_caret_blink();
+                apply_search_filter();
+                return;
             case IdBtnFull: if (sh_.on_capture_full) sh_.on_capture_full(); return;
             case IdBtnRegion: if (sh_.on_capture_region) sh_.on_capture_region(); return;
             case IdBtnRecord: if (sh_.on_toggle_record) sh_.on_toggle_record(); return;
@@ -775,6 +929,15 @@ private:
 
     void on_mouse_move(LPARAM lp) {
         const D2D1_POINT_2F p = to_dip(lp);
+        if (dragging_search_) {
+            if (target_.ready()) {
+                std::vector<Hit> dummy;
+                Canvas cv{target_, sh_.fonts, dummy, default_theme(), std::nullopt};
+                search_field_.click(cv, p.x, true);
+                invalidate();
+            }
+            return;
+        }
         if (scrubbing_video_) {
             scrub_to_x(p.x);
             return;
@@ -798,7 +961,8 @@ private:
         const int nid = h ? h->id : IdNone;
         const int nidx = h ? h->index : 0;
         if (hover_.set(nid, nidx, true)) start_anim();
-        SetCursor((h && h->id != IdPreviewArea) ? cursor_hand_ : cursor_arrow_);
+        if (h && h->id == IdSearchBox) SetCursor(cursor_ibeam_);
+        else SetCursor((h && h->id != IdPreviewArea) ? cursor_hand_ : cursor_arrow_);
         TRACKMOUSEEVENT tme{.cbSize = sizeof(tme), .dwFlags = TME_LEAVE, .hwndTrack = hwnd_};
         TrackMouseEvent(&tme);
     }
@@ -806,6 +970,7 @@ private:
     void on_lbutton_up() {
         drag_pending_ = false;
         dragging_scroll_ = false;
+        dragging_search_ = false;
         if (scrubbing_video_) {
             scrubbing_video_ = false;
             video_.end_scrub();
@@ -815,9 +980,25 @@ private:
         if (GetCapture() == hwnd_) ReleaseCapture();
     }
 
+    void on_char(wchar_t ch) {
+        if (!search_field_.focused) return;
+        if (ch < 0x20 || ch == 0x7F) return;
+        const std::wstring_view sv{&ch, 1};
+        if (search_field_.replace_selection(sv)) {
+            reset_caret_blink();
+            apply_search_filter();
+        }
+    }
+
     void on_key_down(UINT vk) {
         const bool ctrl = GetKeyState(VK_CONTROL) < 0;
-        if (vk == VK_ESCAPE) { hide(); return; }
+        if (ctrl && vk == 'F') {
+            set_search_focus(true);
+            search_field_.select_all();
+            reset_caret_blink();
+            invalidate();
+            return;
+        }
         if (vk == VK_UP && selected_idx_ > 0) {
             --selected_idx_;
             sync_preview_media();
@@ -832,6 +1013,30 @@ private:
             invalidate();
             return;
         }
+        if (search_field_.focused) {
+            if (vk == VK_ESCAPE) {
+                if (!search_field_.text.empty()) {
+                    search_field_.set({});
+                    apply_search_filter();
+                } else {
+                    set_search_focus(false);
+                }
+                return;
+            }
+            if (vk == VK_RETURN && selected_idx_ >= 0) {
+                open_entry(selected_idx_);
+                return;
+            }
+            bool handled = false;
+            const bool changed = search_field_.on_key(hwnd_, vk, handled);
+            if (handled) {
+                reset_caret_blink();
+                if (changed) apply_search_filter();
+                else invalidate();
+                return;
+            }
+        }
+        if (vk == VK_ESCAPE) { hide(); return; }
         if (vk == VK_RETURN && selected_idx_ >= 0) { open_entry(selected_idx_); return; }
         if (vk == VK_DELETE && selected_idx_ >= 0) { delete_entry(selected_idx_, true); return; }
         if (ctrl && vk == 'C' && selected_idx_ >= 0) { copy_entry(selected_idx_); return; }
@@ -923,6 +1128,13 @@ private:
                         return false;
                     });
                     if (async_drops_.empty()) KillTimer(hwnd, TIMER_DROP);
+                } else if (wp == TIMER_CARET) {
+                    if (search_field_.focused && visible()) {
+                        search_field_.caret_on = !search_field_.caret_on;
+                        invalidate();
+                    } else {
+                        KillTimer(hwnd, TIMER_CARET);
+                    }
                 }
                 return 0;
             case WM_MOUSEWHEEL: {
@@ -940,6 +1152,7 @@ private:
                 if (hover_.set(IdNone, 0, true)) start_anim();
                 return 0;
             case WM_KEYDOWN: on_key_down(static_cast<UINT>(wp)); return 0;
+            case WM_CHAR: on_char(static_cast<wchar_t>(wp)); return 0;
             case WM_SETCURSOR:
                 if (LOWORD(lp) == HTCLIENT) return TRUE;
                 break;
@@ -957,6 +1170,12 @@ private:
     VideoPlayer video_;
 
     Filter filter_ = Filter::All;
+    TextField search_field_;
+    D2D1_RECT_F search_box_rect_{};
+    D2D1_RECT_F search_text_rect_{};
+    bool dragging_search_ = false;
+    std::vector<CaptureEntry> all_entries_;
+    std::vector<RowCache> all_cache_;
     std::vector<CaptureEntry> entries_;
     std::vector<RowCache> row_cache_;
     int selected_idx_ = -1;
@@ -986,6 +1205,7 @@ private:
     std::chrono::steady_clock::time_point last_anim_{};
     HCURSOR cursor_arrow_ = nullptr;
     HCURSOR cursor_hand_ = nullptr;
+    HCURSOR cursor_ibeam_ = nullptr;
 };
 
 } // namespace capusy::ui

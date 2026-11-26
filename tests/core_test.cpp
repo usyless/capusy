@@ -1,8 +1,10 @@
 #include "check.hpp"
 
+#include <capusy/capture_logic.hpp>
 #include <capusy/history_store.hpp>
 #include <capusy/hotkeys.hpp>
 #include <capusy/startup_logic.hpp>
+#include <capusy/update_logic.hpp>
 #include <capusy/ui/anim.hpp>
 #include <capusy/ui/dirty_rects.hpp>
 #include <capusy/ui/fit.hpp>
@@ -82,7 +84,7 @@ static void test_history_store() {
     CHECK(store.opened());
 
     CaptureEntry e1{
-        .path = "C:\\Captures\\shot1.png",
+        .path = "C:\\Captures\\2026-11\\shot1.png",
         .kind = CaptureKind::Image,
         .mode = CaptureMode::Full,
         .created_at = 1000,
@@ -90,9 +92,12 @@ static void test_history_store() {
         .height = 1080,
         .size_bytes = 204800,
         .duration_ms = 0,
+        .window_title = "main.cpp - Visual Studio Code",
+        .process_name = "Code.exe",
+        .format = "PNG",
     };
     CaptureEntry e2{
-        .path = "C:\\Captures\\clip1.mp4",
+        .path = "C:\\Captures\\2026-11\\clip1.mp4",
         .kind = CaptureKind::Video,
         .mode = CaptureMode::Recording,
         .created_at = 2000,
@@ -100,6 +105,9 @@ static void test_history_store() {
         .height = 720,
         .size_bytes = 1048576,
         .duration_ms = 5400,
+        .window_title = "YouTube - Chrome",
+        .process_name = "chrome.exe",
+        .format = "MP4",
     };
     CHECK(store.insert(e1, &err));
     CHECK(e1.id > 0);
@@ -108,8 +116,14 @@ static void test_history_store() {
 
     const auto all = store.list_recent(100);
     CHECK(all.has_value() && all->size() == 2);
-    CHECK((*all)[0].path == "C:\\Captures\\clip1.mp4"); // newest first
-    CHECK((*all)[1].path == "C:\\Captures\\shot1.png");
+    CHECK((*all)[0].path == "C:\\Captures\\2026-11\\clip1.mp4"); // newest first
+    CHECK((*all)[0].window_title == "YouTube - Chrome");
+    CHECK((*all)[0].process_name == "chrome.exe");
+    CHECK((*all)[0].format == "MP4");
+    CHECK((*all)[1].path == "C:\\Captures\\2026-11\\shot1.png");
+    CHECK((*all)[1].window_title == "main.cpp - Visual Studio Code");
+    CHECK((*all)[1].process_name == "Code.exe");
+    CHECK((*all)[1].format == "PNG");
 
     const auto imgs = store.list_recent(100, CaptureKind::Image);
     CHECK(imgs.has_value() && imgs->size() == 1);
@@ -127,6 +141,96 @@ static void test_history_store() {
     fs::remove(tmp, ec);
     fs::remove(tmp.wstring() + L"-wal", ec);
     fs::remove(tmp.wstring() + L"-shm", ec);
+
+    // Verify legacy schema migration (existing DB without window_title / process_name / format)
+    sqlite3* legacy = nullptr;
+    const auto u8 = tmp.u8string();
+    const std::string utf8{reinterpret_cast<const char*>(u8.data()), u8.size()};
+    CHECK(sqlite3_open(utf8.c_str(), &legacy) == SQLITE_OK);
+    CHECK(sqlite3_exec(legacy,
+                       "CREATE TABLE captures ("
+                       "id INTEGER PRIMARY KEY AUTOINCREMENT, path TEXT NOT NULL UNIQUE, "
+                       "kind INTEGER NOT NULL DEFAULT 0, mode INTEGER NOT NULL DEFAULT 0, "
+                       "created_at INTEGER NOT NULL, width INTEGER NOT NULL DEFAULT 0, "
+                       "height INTEGER NOT NULL DEFAULT 0, size_bytes INTEGER NOT NULL DEFAULT 0, "
+                       "duration_ms INTEGER NOT NULL DEFAULT 0);"
+                       "INSERT INTO captures(path, created_at) VALUES('C:\\old.png', 500);",
+                       nullptr, nullptr, nullptr) == SQLITE_OK);
+    sqlite3_close(legacy);
+
+    CHECK(store.open(tmp, &err));
+    const auto migrated = store.list_recent(10);
+    CHECK(migrated.has_value() && migrated->size() == 1 && (*migrated)[0].path == "C:\\old.png" && (*migrated)[0].window_title.empty());
+    CHECK(store.insert(e1, &err));
+    store.close();
+    fs::remove(tmp, ec);
+    fs::remove(tmp.wstring() + L"-wal", ec);
+    fs::remove(tmp.wstring() + L"-shm", ec);
+}
+
+static void test_capture_paths_and_formats() {
+    using namespace capusy;
+    CHECK(format_year_month(2026, 3) == L"2026-03");
+    CHECK(format_year_month(2026, 11) == L"2026-11");
+
+    const CaptureDateTime dt{.year = 2026, .month = 4, .day = 7, .hour = 9, .minute = 5, .second = 3, .millisecond = 42};
+    const fs::path split = make_capture_path_for_time(fs::path{L"C:\\Caps"}, L".png", dt, 1, true);
+    CHECK(split == fs::path{L"C:\\Caps"} / L"2026-04" / L"capusy_2026-04-07_09-05-03_042_1.png");
+
+    const fs::path flat = make_capture_path_for_time(fs::path{L"C:\\Caps"}, L".jpg", dt, 2, false);
+    CHECK(flat == fs::path{L"C:\\Caps"} / L"capusy_2026-04-07_09-05-03_042_2.jpg");
+
+    CHECK(parse_image_format("png") == ImageFormat::Png);
+    CHECK(parse_image_format("jpg") == ImageFormat::Jpeg);
+    CHECK(parse_image_format("JPEG") == ImageFormat::Jpeg);
+    CHECK(parse_image_format("bmp") == ImageFormat::Bmp);
+    CHECK(parse_image_format("tiff") == ImageFormat::Tiff);
+    CHECK(parse_image_format("unknown") == ImageFormat::Png);
+    CHECK(image_format_ext(ImageFormat::Jpeg) == L".jpg");
+    CHECK(image_format_supports_quality(ImageFormat::Jpeg));
+    CHECK(!image_format_supports_quality(ImageFormat::Png));
+}
+
+static void test_history_search() {
+    using namespace capusy;
+    const std::wstring hay = L"capusy_2026-11-26_23-40-10_001_1.jpg main.cpp - visual studio code code.exe jpeg 26 nov 2026 • 23:40 2026-11-26 23:40:10";
+    CHECK(matches_history_query_lower(hay, L""));
+    CHECK(matches_history_query_lower(hay, L"   "));
+    CHECK(matches_history_query_lower(hay, L"visual studio"));
+    CHECK(matches_history_query_lower(hay, L"code 2026-11"));
+    CHECK(matches_history_query_lower(hay, L"23:40 jpeg"));
+    CHECK(matches_history_query_lower(hay, L"nov 2026"));
+    CHECK(!matches_history_query_lower(hay, L"code firefox"));
+}
+
+static void test_update_logic() {
+    using namespace capusy;
+    CHECK(is_newer_version("v0.2.0", "0.1.0"));
+    CHECK(is_newer_version("1.0.0", "1.0.0-rc1"));
+    CHECK(!is_newer_version("0.1.0", "0.1.0"));
+    CHECK(!is_newer_version("0.0.9", "0.1.0"));
+    CHECK(normalize_version_string(" v0.3.1 ") == "0.3.1");
+
+    CHECK(should_auto_check_updates(true, 0, 1000));
+    CHECK(!should_auto_check_updates(false, 0, 1000));
+    CHECK(!should_auto_check_updates(true, 1000, 1000 + UPDATE_CHECK_INTERVAL_S - 1));
+    CHECK(should_auto_check_updates(true, 1000, 1000 + UPDATE_CHECK_INTERVAL_S));
+
+    CHECK(parse_tar_supports_7z("bsdtar 3.7.7 - libarchive 3.7.7 zlib/1.3.1 liblzma/5.4.5"));
+    CHECK(!parse_tar_supports_7z("bsdtar 3.5.2 - libarchive 3.5.2 zlib/1.2.11"));
+
+    const std::string good_sha = "sha256:ABCDEF0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+    CHECK(extract_sha256_digest(good_sha).size() == 64);
+    CHECK(extract_sha256_digest("sha256:short").empty());
+
+    const std::array<GithubAsset, 2> assets = {{
+        {.name = "capusy.zip", .browser_download_url = "https://example.test/capusy.zip", .size = 100},
+        {.name = "capusy.7z", .browser_download_url = "https://example.test/capusy.7z", .size = 80},
+    }};
+    const auto a7 = pick_release_asset(assets, true);
+    CHECK(a7.has_value() && a7->name == "capusy.7z");
+    const auto az = pick_release_asset(assets, false);
+    CHECK(az.has_value() && az->name == "capusy.zip");
 }
 
 static void test_ui_primitives() {
@@ -161,6 +265,9 @@ int main() {
     test_startup_logic();
     test_hotkey_collisions();
     test_history_store();
+    test_capture_paths_and_formats();
+    test_history_search();
+    test_update_logic();
     test_ui_primitives();
     return capusy::test::failures == 0 ? 0 : 1;
 }

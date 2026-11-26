@@ -26,17 +26,37 @@ enum class CaptureMode : int32_t {
 
 struct CaptureEntry {
     int64_t id = 0;
-    std::string path; // UTF-8 full file path
+    std::string path;         // UTF-8 full file path
     CaptureKind kind = CaptureKind::Image;
     CaptureMode mode = CaptureMode::Full;
-    int64_t created_at = 0; // unix seconds
+    int64_t created_at = 0;   // unix seconds
     uint32_t width = 0;
     uint32_t height = 0;
     uint64_t size_bytes = 0;
     uint64_t duration_ms = 0;
+    std::string window_title; // UTF-8 captured/foreground window title
+    std::string process_name; // UTF-8 executable name (e.g. "Code.exe")
+    std::string format;       // UTF-8 uppercase format tag (e.g. "PNG", "JPEG", "MP4")
 
     bool operator==(const CaptureEntry&) const = default;
 };
+
+/// Case-insensitive multi-token AND search across screenshot name/path, window title,
+/// process name, format, capture mode, and formatted timestamps (display + ISO).
+[[nodiscard]] inline bool matches_history_query_lower(std::wstring_view haystack_lower, std::wstring_view query_lower) noexcept {
+    size_t pos = 0;
+    while (pos < query_lower.size()) {
+        while (pos < query_lower.size() && (query_lower[pos] == L' ' || query_lower[pos] == L'\t')) ++pos;
+        if (pos >= query_lower.size()) break;
+        const size_t start = pos;
+        while (pos < query_lower.size() && query_lower[pos] != L' ' && query_lower[pos] != L'\t') ++pos;
+        const std::wstring_view token = query_lower.substr(start, pos - start);
+        if (!token.empty() && haystack_lower.find(token) == std::wstring_view::npos) {
+            return false;
+        }
+    }
+    return true;
+}
 
 struct HistoryStats {
     uint64_t total_count = 0;
@@ -82,19 +102,26 @@ public:
             PRAGMA journal_mode=WAL;
             PRAGMA synchronous=NORMAL;
             CREATE TABLE IF NOT EXISTS captures (
-                id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                path        TEXT NOT NULL UNIQUE,
-                kind        INTEGER NOT NULL DEFAULT 0,
-                mode        INTEGER NOT NULL DEFAULT 0,
-                created_at  INTEGER NOT NULL,
-                width       INTEGER NOT NULL DEFAULT 0,
-                height      INTEGER NOT NULL DEFAULT 0,
-                size_bytes  INTEGER NOT NULL DEFAULT 0,
-                duration_ms INTEGER NOT NULL DEFAULT 0
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                path         TEXT NOT NULL UNIQUE,
+                kind         INTEGER NOT NULL DEFAULT 0,
+                mode         INTEGER NOT NULL DEFAULT 0,
+                created_at   INTEGER NOT NULL,
+                width        INTEGER NOT NULL DEFAULT 0,
+                height       INTEGER NOT NULL DEFAULT 0,
+                size_bytes   INTEGER NOT NULL DEFAULT 0,
+                duration_ms  INTEGER NOT NULL DEFAULT 0,
+                window_title TEXT NOT NULL DEFAULT '',
+                process_name TEXT NOT NULL DEFAULT '',
+                format       TEXT NOT NULL DEFAULT ''
             );
             CREATE INDEX IF NOT EXISTS idx_captures_created_at ON captures(created_at DESC, id DESC);
         )sql";
         if (!exec_locked(INIT_SQL, error)) {
+            close_locked();
+            return false;
+        }
+        if (!migrate_schema_locked(error)) {
             close_locked();
             return false;
         }
@@ -118,12 +145,13 @@ public:
 
         Stmt st;
         if (!prepare_locked(
-                "INSERT INTO captures(path, kind, mode, created_at, width, height, size_bytes, duration_ms) "
-                "VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) "
+                "INSERT INTO captures(path, kind, mode, created_at, width, height, size_bytes, duration_ms, window_title, process_name, format) "
+                "VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) "
                 "ON CONFLICT(path) DO UPDATE SET "
                 "kind=excluded.kind, mode=excluded.mode, created_at=excluded.created_at, "
                 "width=excluded.width, height=excluded.height, size_bytes=excluded.size_bytes, "
-                "duration_ms=excluded.duration_ms;",
+                "duration_ms=excluded.duration_ms, window_title=excluded.window_title, "
+                "process_name=excluded.process_name, format=excluded.format;",
                 st, error)) {
             return false;
         }
@@ -135,6 +163,9 @@ public:
         sqlite3_bind_int64(st.s, 6, static_cast<int64_t>(entry.height));
         sqlite3_bind_int64(st.s, 7, static_cast<int64_t>(entry.size_bytes));
         sqlite3_bind_int64(st.s, 8, static_cast<int64_t>(entry.duration_ms));
+        sqlite3_bind_text(st.s, 9, entry.window_title.data(), static_cast<int>(entry.window_title.size()), SQLITE_TRANSIENT);
+        sqlite3_bind_text(st.s, 10, entry.process_name.data(), static_cast<int>(entry.process_name.size()), SQLITE_TRANSIENT);
+        sqlite3_bind_text(st.s, 11, entry.format.data(), static_cast<int>(entry.format.size()), SQLITE_TRANSIENT);
         if (!step_done_locked(st.s, error)) return false;
 
         entry.id = sqlite3_last_insert_rowid(db_);
@@ -156,9 +187,9 @@ public:
         if (!require_open_locked(error)) return std::nullopt;
 
         const char* sql = filter_kind
-            ? "SELECT id, path, kind, mode, created_at, width, height, size_bytes, duration_ms "
+            ? "SELECT id, path, kind, mode, created_at, width, height, size_bytes, duration_ms, window_title, process_name, format "
               "FROM captures WHERE kind = ?1 ORDER BY created_at DESC, id DESC LIMIT ?2;"
-            : "SELECT id, path, kind, mode, created_at, width, height, size_bytes, duration_ms "
+            : "SELECT id, path, kind, mode, created_at, width, height, size_bytes, duration_ms, window_title, process_name, format "
               "FROM captures ORDER BY created_at DESC, id DESC LIMIT ?1;";
 
         Stmt st;
@@ -170,6 +201,12 @@ public:
             sqlite3_bind_int(st.s, 1, limit);
         }
 
+        const auto read_str = [](sqlite3_stmt* stmt, int col, std::string& dst) {
+            const auto* txt = reinterpret_cast<const char*>(sqlite3_column_text(stmt, col));
+            const int len = sqlite3_column_bytes(stmt, col);
+            if (txt && len > 0) dst.assign(txt, static_cast<size_t>(len));
+        };
+
         std::vector<CaptureEntry> out;
         for (;;) {
             const int rc = sqlite3_step(st.s);
@@ -180,9 +217,7 @@ public:
             }
             CaptureEntry e;
             e.id = sqlite3_column_int64(st.s, 0);
-            const auto* p_txt = reinterpret_cast<const char*>(sqlite3_column_text(st.s, 1));
-            const int p_len = sqlite3_column_bytes(st.s, 1);
-            if (p_txt && p_len > 0) e.path.assign(p_txt, static_cast<size_t>(p_len));
+            read_str(st.s, 1, e.path);
             e.kind = static_cast<CaptureKind>(sqlite3_column_int(st.s, 2));
             e.mode = static_cast<CaptureMode>(sqlite3_column_int(st.s, 3));
             e.created_at = sqlite3_column_int64(st.s, 4);
@@ -190,6 +225,9 @@ public:
             e.height = static_cast<uint32_t>(sqlite3_column_int64(st.s, 6));
             e.size_bytes = static_cast<uint64_t>(sqlite3_column_int64(st.s, 7));
             e.duration_ms = static_cast<uint64_t>(sqlite3_column_int64(st.s, 8));
+            read_str(st.s, 9, e.window_title);
+            read_str(st.s, 10, e.process_name);
+            read_str(st.s, 11, e.format);
             out.push_back(std::move(e));
         }
         return out;
@@ -248,6 +286,26 @@ private:
             if (s) sqlite3_finalize(s);
         }
     };
+
+    bool migrate_schema_locked(std::string* error) {
+        bool has_window_title = false;
+        bool has_process_name = false;
+        bool has_format = false;
+        Stmt st;
+        if (!prepare_locked("PRAGMA table_info(captures);", st, error)) return false;
+        while (sqlite3_step(st.s) == SQLITE_ROW) {
+            const auto* name = reinterpret_cast<const char*>(sqlite3_column_text(st.s, 1));
+            if (!name) continue;
+            const std::string_view col{name};
+            if (col == "window_title") has_window_title = true;
+            else if (col == "process_name") has_process_name = true;
+            else if (col == "format") has_format = true;
+        }
+        if (!has_window_title && !exec_locked("ALTER TABLE captures ADD COLUMN window_title TEXT NOT NULL DEFAULT '';", error)) return false;
+        if (!has_process_name && !exec_locked("ALTER TABLE captures ADD COLUMN process_name TEXT NOT NULL DEFAULT '';", error)) return false;
+        if (!has_format && !exec_locked("ALTER TABLE captures ADD COLUMN format TEXT NOT NULL DEFAULT '';", error)) return false;
+        return true;
+    }
 
     void close_locked() noexcept {
         if (db_) {

@@ -36,6 +36,7 @@ enum TrayMenuId : UINT {
     IdTrayRecord,
     IdTrayHistory,
     IdTraySettings,
+    IdTrayUpdate,
     IdTrayQuit,
 };
 
@@ -43,14 +44,19 @@ struct SaveJob {
     Raster raster;
     CaptureMode mode = CaptureMode::Full;
     fs::path save_dir;
+    bool split_by_month = true;
+    ImageFormat image_format = ImageFormat::Png;
+    int image_quality = 90;
     bool auto_copy = true;
+    WindowInfo window_info;
 };
 
 class CapusyApp {
 public:
-    bool init(HINSTANCE inst) {
+    bool init(HINSTANCE inst, bool open_about_on_start = false) {
         inst_ = inst;
         sh_.settings = load_settings();
+        sh_.update_state = load_update_state();
         (void)sh_.history.open(history_db_path());
 
         if (!sh_.gfx.init()) {
@@ -87,6 +93,11 @@ public:
         add_tray();
         register_hotkeys(true);
 
+        if (open_about_on_start) {
+            settings_win_->show(2);
+        }
+        settings_win_->maybe_auto_check_updates();
+
         // Start lean: drop initial GPU device until first UI window or capture opens.
         schedule_idle_trim();
         return true;
@@ -103,6 +114,7 @@ public:
 
     void shutdown() {
         sh_.call_hwnd.store(nullptr, std::memory_order_release);
+        if (settings_win_) settings_win_->stop_background_jobs();
         unregister_hotkeys();
         remove_tray();
         if (region_overlay_) region_overlay_->cancel();
@@ -138,8 +150,14 @@ private:
         sh_.on_capture_full = [this] { trigger_full_screenshot(); };
         sh_.on_capture_region = [this] { trigger_region_screenshot(); };
         sh_.on_toggle_record = [this] { trigger_toggle_recording(); };
-        sh_.on_open_history = [this] { history_win_->show(); };
-        sh_.on_open_settings = [this](int tab) { settings_win_->show(tab); };
+        sh_.on_open_history = [this] {
+            history_win_->show();
+            settings_win_->maybe_auto_check_updates();
+        };
+        sh_.on_open_settings = [this](int tab) {
+            settings_win_->show(tab);
+            settings_win_->maybe_auto_check_updates();
+        };
         sh_.on_reload_hotkeys = [this] { register_hotkeys(false); };
         sh_.on_suspend_hotkeys = [this](bool suspend) {
             if (suspend) unregister_hotkeys();
@@ -151,16 +169,24 @@ private:
             }
         };
         sh_.on_visibility_changed = [this] { schedule_idle_trim(); };
+        sh_.on_redraw_all = [this] {
+            if (history_win_ && history_win_->visible()) history_win_->invalidate();
+            if (settings_win_ && settings_win_->visible()) settings_win_->invalidate();
+        };
+        sh_.on_update_balloon = [this](std::wstring_view ver_label) {
+            balloon_opens_about_ = true;
+            show_balloon(ulp::str::concat_strings(L"Update available: capusy ", ver_label, L". Click to open Settings -> About."), NIIF_INFO);
+        };
 
         toast_win_->on_clicked = [this](const std::wstring& path) {
             if (!path.empty()) (void)open_file(path);
         };
 
-        region_overlay_->on_screenshot_captured = [this](Raster&& raster) {
-            enqueue_save(std::move(raster), CaptureMode::Region);
+        region_overlay_->on_screenshot_captured = [this](Raster&& raster, WindowInfo&& win_info) {
+            enqueue_save(std::move(raster), CaptureMode::Region, std::move(win_info));
         };
-        region_overlay_->on_record_region_selected = [this](RECT region) {
-            start_region_recording(region);
+        region_overlay_->on_record_region_selected = [this](RECT region, WindowInfo&& win_info) {
+            start_region_recording(region, std::move(win_info));
         };
         region_overlay_->on_closed = [this] { schedule_idle_trim(); };
 
@@ -179,9 +205,10 @@ private:
 
     void trigger_full_screenshot() {
         // Immediate capture with zero rate limits! Every press snapshots right now and saves asynchronously.
+        WindowInfo win_info = foreground_window_info();
         auto cap = capture_virtual_screen(sh_.settings.capture_cursor);
         if (!cap) return;
-        enqueue_save(std::move(cap->raster), CaptureMode::Full);
+        enqueue_save(std::move(cap->raster), CaptureMode::Full, std::move(win_info));
     }
 
     void trigger_region_screenshot() {
@@ -204,16 +231,19 @@ private:
         (void)region_overlay_->start(inst_, OverlayMode::RecordRegion, false);
     }
 
-    void start_region_recording(RECT region) {
+    void start_region_recording(RECT region, WindowInfo win_info) {
         if (recorder_.recording()) return;
-        const fs::path out = make_capture_path(resolve_save_dir(sh_.settings), L".mp4");
+        const fs::path out = make_capture_path(resolve_save_dir(sh_.settings), L".mp4", sh_.settings.split_by_month);
         if (!recorder_.start(region, out, sh_.settings.record_fps, sh_.settings.record_bitrate_mbps, sh_.settings.record_cursor)) {
+            balloon_opens_about_ = false;
             show_balloon(L"Failed to start region recording.", NIIF_ERROR);
             return;
         }
+        pending_record_window_ = std::move(win_info);
         sh_.recording_active = true;
         (void)rec_overlay_->show(inst_, recorder_.region(), &recorder_);
         if (history_win_->visible()) history_win_->invalidate();
+        if (settings_win_->visible()) settings_win_->invalidate();
     }
 
     void stop_region_recording() {
@@ -225,8 +255,14 @@ private:
     void on_recording_finished(RecordingResult&& res) {
         sh_.recording_active = false;
         rec_overlay_->hide();
+        WindowInfo win_info = std::move(pending_record_window_);
+        pending_record_window_ = {};
+        if (settings_win_->visible()) settings_win_->invalidate();
         if (!res.ok) {
-            if (!res.error.empty()) show_balloon(to_wide(res.error), NIIF_ERROR);
+            if (!res.error.empty()) {
+                balloon_opens_about_ = false;
+                show_balloon(to_wide(res.error), NIIF_ERROR);
+            }
             schedule_idle_trim();
             return;
         }
@@ -240,6 +276,9 @@ private:
         entry.height = res.height;
         entry.size_bytes = res.size_bytes;
         entry.duration_ms = res.duration_ms;
+        entry.window_title = std::move(win_info.title);
+        entry.process_name = std::move(win_info.process_name);
+        entry.format = "MP4";
         (void)sh_.history.insert(entry);
 
         bool copied = false;
@@ -270,9 +309,9 @@ private:
                     saver_queue_.pop_front();
                 }
 
-                const fs::path path = make_capture_path(job.save_dir, L".png");
+                const fs::path path = make_capture_path(job.save_dir, image_format_ext(job.image_format), job.split_by_month);
                 uint64_t bytes = 0;
-                if (!save_raster_png(job.raster, path, &bytes, wic.get())) continue;
+                if (!save_raster_image(job.raster, path, job.image_format, job.image_quality, &bytes, wic.get())) continue;
 
                 CaptureEntry entry;
                 entry.path = to_utf8(path.wstring());
@@ -282,6 +321,9 @@ private:
                 entry.width = job.raster.w;
                 entry.height = job.raster.h;
                 entry.size_bytes = bytes;
+                entry.window_title = std::move(job.window_info.title);
+                entry.process_name = std::move(job.window_info.process_name);
+                entry.format = std::string{image_format_label_utf8(job.image_format)};
                 (void)sh_.history.insert(entry);
 
                 // Prepare clipboard DIB + PNG bytes off the UI thread so clipboard update is instant
@@ -319,12 +361,16 @@ private:
         if (saver_thread_.joinable()) saver_thread_.join();
     }
 
-    void enqueue_save(Raster&& raster, CaptureMode mode) {
+    void enqueue_save(Raster&& raster, CaptureMode mode, WindowInfo&& win_info = {}) {
         SaveJob job{
             .raster = std::move(raster),
             .mode = mode,
             .save_dir = resolve_save_dir(sh_.settings),
+            .split_by_month = sh_.settings.split_by_month,
+            .image_format = sh_.settings.resolved_image_format(),
+            .image_quality = sh_.settings.image_quality,
             .auto_copy = sh_.settings.auto_copy_clipboard,
+            .window_info = std::move(win_info),
         };
         {
             const std::scoped_lock lk{saver_mx_};
@@ -371,6 +417,7 @@ private:
             }
         }
         if (notify_conflicts && !conflicts.empty()) {
+            balloon_opens_about_ = false;
             show_balloon(ulp::str::concat_strings(L"Some hotkeys are already in use by another app: ", conflicts, L". Open Settings to change them."), NIIF_WARNING);
         }
         if (settings_win_ && settings_win_->visible()) settings_win_->invalidate();
@@ -481,6 +528,14 @@ private:
         AppendMenuW(menu.get(), MF_SEPARATOR, 0, nullptr);
         AppendMenuW(menu.get(), MF_STRING, IdTrayHistory, menu_label(L"Open History", HotkeyAction::OpenHistory).c_str());
         AppendMenuW(menu.get(), MF_STRING, IdTraySettings, L"Settings");
+        if (sh_.has_update_available()) {
+            const std::wstring upd_lbl = ulp::str::concat_strings(
+                L"Update Available (",
+                sh_.update_state.latest_tag.empty() ? L"v" : L"",
+                to_wide(sh_.update_state.latest_tag.empty() ? sh_.update_state.latest_version : sh_.update_state.latest_tag),
+                L")…");
+            AppendMenuW(menu.get(), MF_STRING, IdTrayUpdate, upd_lbl.c_str());
+        }
         AppendMenuW(menu.get(), MF_SEPARATOR, 0, nullptr);
         AppendMenuW(menu.get(), MF_STRING, IdTrayQuit, L"Quit capusy");
         SetMenuDefaultItem(menu.get(), IdTrayHistory, FALSE);
@@ -495,8 +550,17 @@ private:
             case IdTrayFull: trigger_full_screenshot(); break;
             case IdTrayRegion: trigger_region_screenshot(); break;
             case IdTrayRecord: trigger_toggle_recording(); break;
-            case IdTrayHistory: history_win_->show(); break;
-            case IdTraySettings: settings_win_->show(0); break;
+            case IdTrayHistory:
+                history_win_->show();
+                settings_win_->maybe_auto_check_updates();
+                break;
+            case IdTraySettings:
+                settings_win_->show(0);
+                settings_win_->maybe_auto_check_updates();
+                break;
+            case IdTrayUpdate:
+                settings_win_->show(2);
+                break;
             case IdTrayQuit: PostQuitMessage(0); break;
             default: break;
         }
@@ -551,13 +615,15 @@ private:
                     case NIN_KEYSELECT:
                     case WM_LBUTTONDBLCLK:
                         history_win_->show();
+                        settings_win_->maybe_auto_check_updates();
                         break;
                     case WM_CONTEXTMENU:
                     case WM_RBUTTONUP:
                         show_tray_menu();
                         break;
                     case NIN_BALLOONUSERCLICK:
-                        settings_win_->show(0);
+                        settings_win_->show(balloon_opens_about_ ? 2 : 0);
+                        balloon_opens_about_ = false;
                         break;
                     default:
                         break;
@@ -594,6 +660,8 @@ private:
 
     Shared sh_;
     RegionRecorder recorder_;
+    WindowInfo pending_record_window_;
+    bool balloon_opens_about_ = false;
     std::unique_ptr<HistoryWindow> history_win_;
     std::unique_ptr<SettingsWindow> settings_win_;
     std::unique_ptr<ToastWindow> toast_win_;
@@ -607,10 +675,128 @@ private:
     std::jthread saver_thread_;
 };
 
+int run_apply_update(DWORD wait_pid, const fs::path& staging_root, const fs::path& target_dir, bool open_about) {
+    if (wait_pid != 0) {
+        if (const wil::unique_handle proc{OpenProcess(SYNCHRONIZE, FALSE, wait_pid)}) {
+            WaitForSingleObject(proc.get(), 15'000);
+        }
+    }
+
+    std::error_code ec;
+    const auto copy_one = [&](const fs::path& src, const fs::path& dst) -> bool {
+        for (int attempt = 0; attempt < 30; ++attempt) {
+            if (CopyFileW(src.c_str(), dst.c_str(), FALSE)) return true;
+            const DWORD err = GetLastError();
+            if (err == ERROR_SHARING_VIOLATION || err == ERROR_LOCK_VIOLATION || err == ERROR_ACCESS_DENIED) {
+                if (attempt >= 5) {
+                    const fs::path backup = ulp::str::concat_strings(dst.wstring(), L".old");
+                    if (MoveFileExW(dst.c_str(), backup.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+                        MoveFileExW(backup.c_str(), nullptr, MOVEFILE_DELAY_UNTIL_REBOOT);
+                        if (CopyFileW(src.c_str(), dst.c_str(), FALSE)) return true;
+                    }
+                }
+                Sleep(150);
+                continue;
+            }
+            return false;
+        }
+        return false;
+    };
+
+    for (const auto& entry : fs::recursive_directory_iterator(staging_root, ec)) {
+        if (ec) {
+            MessageBoxW(nullptr, concat_wide(L"Failed to read update staging directory: ", ec.message()).c_str(),
+                        APP_NAME, MB_ICONERROR | MB_OK);
+            return 1;
+        }
+        const fs::path rel = fs::relative(entry.path(), staging_root, ec);
+        if (ec || rel.empty()) continue;
+        // Never overwrite user data/
+        if (_wcsicmp(rel.begin()->c_str(), L"data") == 0) continue;
+
+        const fs::path dst = target_dir / rel;
+        if (entry.is_directory(ec)) {
+            fs::create_directories(dst, ec);
+            if (ec) {
+                MessageBoxW(nullptr, concat_wide(L"Could not create directory ", dst).c_str(), APP_NAME, MB_ICONERROR | MB_OK);
+                return 1;
+            }
+        } else if (entry.is_regular_file(ec)) {
+            fs::create_directories(dst.parent_path(), ec);
+            if (!copy_one(entry.path(), dst)) {
+                const std::wstring msg = concat_wide(
+                    L"Could not update ", dst.filename(),
+                    L" (", win32_error_utf8(GetLastError()), L").");
+                MessageBoxW(nullptr, msg.c_str(), APP_NAME, MB_ICONERROR | MB_OK);
+                return 1;
+            }
+        }
+    }
+
+    const fs::path next_exe = target_dir / L"capusy.exe";
+    const fs::path update_dir = target_dir / L"data" / L"update";
+    std::wstring cmd = concat_wide(
+        L"\"", next_exe, L"\" --cleanup-update \"", update_dir, L"\"",
+        open_about ? L" --open-about" : L"");
+    STARTUPINFOW si{.cb = sizeof(STARTUPINFOW)};
+    wil::unique_process_information pi;
+    if (!CreateProcessW(next_exe.c_str(), cmd.data(), nullptr, nullptr, FALSE,
+                        CREATE_UNICODE_ENVIRONMENT, nullptr, target_dir.c_str(), &si, &pi)) {
+        MessageBoxW(nullptr, concat_wide(L"Update was installed, but capusy.exe could not restart: ", win32_error_utf8(GetLastError())).c_str(),
+                    APP_NAME, MB_ICONWARNING | MB_OK);
+        return 1;
+    }
+    return 0;
+}
+
+void cleanup_update_artifacts(const fs::path& update_dir, const fs::path& target_dir) {
+    std::error_code ec;
+    for (int attempt = 0; attempt < 20 && fs::exists(update_dir, ec); ++attempt) {
+        fs::remove_all(update_dir, ec);
+        if (!fs::exists(update_dir, ec)) break;
+        Sleep(150);
+    }
+    for (const auto& entry : fs::recursive_directory_iterator(target_dir, ec)) {
+        if (ec) break;
+        if (entry.is_regular_file(ec) && entry.path().extension() == L".old") {
+            fs::remove(entry.path(), ec);
+        }
+    }
+}
+
 } // namespace
 
 int WINAPI wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE, _In_ LPWSTR, _In_ int) {
-    SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    int argc = 0;
+    LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+    if (argv && argc >= 5 && std::wstring_view{argv[1]} == L"--apply-update") {
+        const auto wait_pid = static_cast<DWORD>(_wtol(argv[2]));
+        const fs::path staging_root{argv[3]};
+        const fs::path target_dir{argv[4]};
+        bool open_about = false;
+        for (int i = 5; i < argc; ++i) {
+            if (std::wstring_view{argv[i]} == L"--open-about") open_about = true;
+        }
+        LocalFree(static_cast<HLOCAL>(argv));
+        return run_apply_update(wait_pid, staging_root, target_dir, open_about);
+    }
+
+    fs::path cleanup_dir;
+    bool open_about = false;
+    if (argv) {
+        for (int i = 1; i < argc; ++i) {
+            const std::wstring_view a{argv[i]};
+            if (a == L"--cleanup-update" && i + 1 < argc) {
+                cleanup_dir = fs::path{argv[++i]};
+            } else if (a == L"--open-about") {
+                open_about = true;
+            }
+        }
+        LocalFree(static_cast<HLOCAL>(argv));
+    }
+    if (!cleanup_dir.empty()) {
+        cleanup_update_artifacts(cleanup_dir, exe_dir());
+    }
 
     struct OleScope {
         HRESULT hr = OleInitialize(nullptr);
@@ -636,7 +822,7 @@ int WINAPI wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE, _In_ LPWSTR, _
     }
 
     const auto app = std::make_unique<CapusyApp>();
-    if (!app->init(hInstance)) return 1;
+    if (!app->init(hInstance, open_about)) return 1;
     const int code = app->run();
     app->shutdown();
     return code;

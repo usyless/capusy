@@ -193,6 +193,7 @@ endif()
 add_executable(capusy WIN32
     src/main.cpp
     resources/app.rc
+    resources/app.manifest
 )
 set_target_properties(capusy PROPERTIES CXX_SCAN_FOR_MODULES OFF)
 target_link_libraries(capusy PRIVATE
@@ -200,11 +201,5 @@ target_link_libraries(capusy PRIVATE
     capusy_sqlite3
     d2d1 dwrite d3d11 dxgi dxguid dcomp dwmapi windowscodecs
     mfplat mfreadwrite mfuuid
-    shell32 shlwapi shcore ole32 oleaut32 user32 gdi32 imm32 uxtheme comdlg32 propsys
+    shell32 shlwapi shcore ole32 oleaut32 user32 gdi32 imm32 uxtheme comdlg32 propsys winhttp bcrypt
 )
-if(MSVC)
-    target_link_options(capusy PRIVATE
-        /MANIFEST:EMBED
-        "/MANIFESTINPUT:${PROJECT_SOURCE_DIR}/resources/capusy.manifest"
-    )
-endif()

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "capture_logic.hpp"
 #include "common.hpp"
 #include "hotkeys.hpp"
 #include "startup_logic.hpp"
@@ -21,8 +22,11 @@ struct Settings {
     HotkeyBinding hk_record = default_hotkey(HotkeyAction::RegionRecord);
     HotkeyBinding hk_history = default_hotkey(HotkeyAction::OpenHistory);
 
-    // Capture behavior
+    // Capture behavior & output format
     std::string save_dir;
+    bool split_by_month = true;         // Organize into YYYY-MM folders (ShareX-compatible)
+    std::string image_format = "png";   // "png", "jpeg", "bmp", "tiff"
+    int image_quality = 90;             // 10 .. 100 (applies to JPEG)
     bool auto_copy_clipboard = true;
     bool capture_cursor = false;
 
@@ -39,6 +43,13 @@ struct Settings {
     // History window audio state for reused VideoPlayer
     double video_volume = 1.0;
     bool video_muted = false;
+
+    // Updates
+    bool auto_check_updates = true;
+
+    [[nodiscard]] ImageFormat resolved_image_format() const noexcept {
+        return parse_image_format(image_format);
+    }
 
     [[nodiscard]] HotkeyBinding& hotkey(HotkeyAction a) noexcept {
         switch (a) {
@@ -118,6 +129,8 @@ inline Settings load_settings(bool* corrupt_recovered = nullptr) {
     if (s.save_dir.empty()) {
         s.save_dir = to_utf8(default_captures_dir().wstring());
     }
+    s.image_format = std::string{image_format_key(parse_image_format(s.image_format))};
+    s.image_quality = std::clamp(s.image_quality, 10, 100);
     s.toast_timeout_s = std::clamp(s.toast_timeout_s, 1.0f, 15.0f);
     s.toast_width_dip = std::clamp(s.toast_width_dip, 160.0f, 420.0f);
     if (s.record_fps != 30 && s.record_fps != 60) s.record_fps = 30;

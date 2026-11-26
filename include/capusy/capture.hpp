@@ -1,9 +1,11 @@
 #pragma once
 
 #include "common.hpp"
+#include "settings.hpp"
 #include "ui/thumbs.hpp"
 
 #include <dwmapi.h>
+#include <propidl.h>
 #include <shellscalingapi.h>
 #include <wincodec.h>
 #include <wil/com.h>
@@ -41,6 +43,7 @@ struct SnapWindow {
     RECT client{};              // inner client area (may equal outer)
     std::vector<RECT> children; // visible child control rects inside this window
     int z_order = 0;            // 0 = frontmost
+    WindowInfo info{};          // window title & executable name for history metadata
 };
 
 struct SnapTargets {
@@ -257,6 +260,7 @@ inline SnapTargets enumerate_snap_targets(const std::vector<MonitorInfo>& monito
         SnapWindow sw;
         sw.outer = outer;
         sw.z_order = c->z++;
+        sw.info = query_window_info(hwnd);
 
         RECT cr{};
         if (GetClientRect(hwnd, &cr) && cr.right > cr.left && cr.bottom > cr.top) {
@@ -424,46 +428,54 @@ inline std::optional<ui::Raster> crop_virtual_capture(const VirtualCapture& cap,
     return out;
 }
 
-/// Generates a unique timestamped filename in `dir` with an atomic sequence suffix so unlimited
-/// rapid-fire screenshots never collide.
-inline fs::path make_capture_path(const fs::path& dir, std::wstring_view ext) {
+/// Resolves the most relevant window title & process name for a captured region `r`.
+/// Prefers the frontmost visible window containing the region's center, then largest overlap, falling back to `fallback`.
+[[nodiscard]] inline WindowInfo window_info_for_rect(const SnapTargets& targets, RECT r, const WindowInfo& fallback = {}) {
+    if (rect_valid(r)) {
+        const POINT center{.x = (r.left + r.right) / 2, .y = (r.top + r.bottom) / 2};
+        for (const SnapWindow& win : targets.windows) {
+            if (rect_contains_pt(win.outer, center) && (!win.info.title.empty() || !win.info.process_name.empty())) {
+                return win.info;
+            }
+        }
+        int64_t best_area = 0;
+        const WindowInfo* best_info = nullptr;
+        for (const SnapWindow& win : targets.windows) {
+            if (win.info.title.empty() && win.info.process_name.empty()) continue;
+            const int64_t a = rect_area(rect_intersect(win.outer, r));
+            if (a > best_area) {
+                best_area = a;
+                best_info = &win.info;
+            }
+        }
+        if (best_info) return *best_info;
+    }
+    return fallback;
+}
+
+/// Generates a unique timestamped filename in `dir` (optionally nested in `YYYY-MM`) with an atomic sequence suffix
+/// so unlimited rapid-fire screenshots never collide.
+inline fs::path make_capture_path(const fs::path& dir, std::wstring_view ext, bool split_by_month = true) {
     static std::atomic<uint64_t> seq{0};
     const uint64_t n = ++seq;
     SYSTEMTIME st{};
     GetLocalTime(&st);
-
-    FixedWString<96> name{L"capusy_"};
-    const auto push2 = [&](WORD v) noexcept {
-        name.push_back(static_cast<wchar_t>(L'0' + ((v / 10) % 10)));
-        name.push_back(static_cast<wchar_t>(L'0' + (v % 10)));
+    const CaptureDateTime dt{
+        .year = st.wYear,
+        .month = st.wMonth,
+        .day = st.wDay,
+        .hour = st.wHour,
+        .minute = st.wMinute,
+        .second = st.wSecond,
+        .millisecond = st.wMilliseconds,
     };
-    const auto push3 = [&](WORD v) noexcept {
-        name.push_back(static_cast<wchar_t>(L'0' + ((v / 100) % 10)));
-        name.push_back(static_cast<wchar_t>(L'0' + ((v / 10) % 10)));
-        name.push_back(static_cast<wchar_t>(L'0' + (v % 10)));
-    };
-    name.append(to_fixed_wstr<8>(st.wYear));
-    name.push_back(L'-');
-    push2(st.wMonth);
-    name.push_back(L'-');
-    push2(st.wDay);
-    name.push_back(L'_');
-    push2(st.wHour);
-    name.push_back(L'-');
-    push2(st.wMinute);
-    name.push_back(L'-');
-    push2(st.wSecond);
-    name.push_back(L'_');
-    push3(st.wMilliseconds);
-    name.push_back(L'_');
-    name.append(to_fixed_wstr<16>(n));
-    name.append(ext);
-    return dir / std::wstring_view{name};
+    return make_capture_path_for_time(dir, ext, dt, n, split_by_month);
 }
 
-/// Encodes a 32bpp BGRA raster to PNG via WIC, optionally returning file size in bytes.
-inline bool save_raster_png(const ui::Raster& raster, const fs::path& path, uint64_t* out_size = nullptr,
-                            IWICImagingFactory* shared_wic = nullptr) {
+/// Encodes a 32bpp BGRA raster to the chosen WIC container format (PNG, JPEG, BMP, TIFF),
+/// applying JPEG quality (10..100) when applicable and optionally returning file size in bytes.
+inline bool save_raster_image(const ui::Raster& raster, const fs::path& path, ImageFormat format = ImageFormat::Png,
+                              int quality = 90, uint64_t* out_size = nullptr, IWICImagingFactory* shared_wic = nullptr) {
     if (raster.w == 0 || raster.h == 0 || raster.pixels.size() < static_cast<size_t>(raster.w) * raster.h * 4u) {
         return false;
     }
@@ -477,20 +489,72 @@ inline bool save_raster_png(const ui::Raster& raster, const fs::path& path, uint
     std::error_code ec;
     if (path.has_parent_path()) fs::create_directories(path.parent_path(), ec);
 
+    GUID container = GUID_ContainerFormatPng;
+    switch (format) {
+        case ImageFormat::Png: container = GUID_ContainerFormatPng; break;
+        case ImageFormat::Jpeg: container = GUID_ContainerFormatJpeg; break;
+        case ImageFormat::Bmp: container = GUID_ContainerFormatBmp; break;
+        case ImageFormat::Tiff: container = GUID_ContainerFormatTiff; break;
+    }
+
     wil::com_ptr<IWICStream> stream;
     if (FAILED(wic->CreateStream(&stream)) || FAILED(stream->InitializeFromFilename(path.c_str(), GENERIC_WRITE))) return false;
     wil::com_ptr<IWICBitmapEncoder> enc;
-    if (FAILED(wic->CreateEncoder(GUID_ContainerFormatPng, nullptr, &enc)) || FAILED(enc->Initialize(stream.get(), WICBitmapEncoderNoCache))) return false;
+    if (FAILED(wic->CreateEncoder(container, nullptr, &enc)) || FAILED(enc->Initialize(stream.get(), WICBitmapEncoderNoCache))) return false;
+
     wil::com_ptr<IWICBitmapFrameEncode> frame;
-    if (FAILED(enc->CreateNewFrame(&frame, nullptr)) || FAILED(frame->Initialize(nullptr))) return false;
+    wil::com_ptr<IPropertyBag2> props;
+    if (FAILED(enc->CreateNewFrame(&frame, &props))) return false;
+
+    if (format == ImageFormat::Jpeg && props) {
+        const float q = std::clamp(static_cast<float>(quality) / 100.0f, 0.1f, 1.0f);
+        PROPBAG2 opt{};
+        opt.pstrName = const_cast<LPOLESTR>(L"ImageQuality");
+        VARIANT var{};
+        VariantInit(&var);
+        var.vt = VT_R4;
+        var.fltVal = q;
+        (void)props->Write(1, &opt, &var);
+
+        if (quality >= 90) {
+            PROPBAG2 sub{};
+            sub.pstrName = const_cast<LPOLESTR>(L"JpegYCrCbSubsampling");
+            VARIANT svar{};
+            VariantInit(&svar);
+            svar.vt = VT_UI1;
+            svar.bVal = WICJpegYCrCbSubsampling444;
+            (void)props->Write(1, &sub, &svar);
+        }
+    }
+
+    if (FAILED(frame->Initialize(props.get()))) return false;
     if (FAILED(frame->SetSize(raster.w, raster.h))) return false;
-    WICPixelFormatGUID fmt = GUID_WICPixelFormat32bppBGRA;
-    if (FAILED(frame->SetPixelFormat(&fmt))) return false;
+
+    WICPixelFormatGUID desired = (format == ImageFormat::Jpeg) ? GUID_WICPixelFormat24bppBGR : GUID_WICPixelFormat32bppBGRA;
+    WICPixelFormatGUID negotiated = desired;
+    if (FAILED(frame->SetPixelFormat(&negotiated))) return false;
 
     const UINT stride = raster.w * 4u;
     const UINT buf_size = static_cast<UINT>(static_cast<size_t>(stride) * raster.h);
-    // IWICBitmapFrameEncode::WritePixels takes non-const BYTE* even though it only reads.
-    if (FAILED(frame->WritePixels(raster.h, stride, buf_size, const_cast<BYTE*>(raster.pixels.data())))) return false;
+
+    if (negotiated == GUID_WICPixelFormat32bppBGRA) {
+        // Direct zero-copy write for 32bpp BGRA encoders (PNG, BMP, TIFF).
+        if (FAILED(frame->WritePixels(raster.h, stride, buf_size, const_cast<BYTE*>(raster.pixels.data())))) return false;
+    } else {
+        // Convert on-the-fly from 32bpp BGRA to the encoder's negotiated format (e.g., 24bpp BGR for JPEG).
+        wil::com_ptr<IWICBitmap> src_bmp;
+        if (FAILED(wic->CreateBitmapFromMemory(raster.w, raster.h, GUID_WICPixelFormat32bppBGRA, stride, buf_size,
+                                               const_cast<BYTE*>(raster.pixels.data()), &src_bmp))) {
+            return false;
+        }
+        wil::com_ptr<IWICFormatConverter> conv;
+        if (FAILED(wic->CreateFormatConverter(&conv)) ||
+            FAILED(conv->Initialize(src_bmp.get(), negotiated, WICBitmapDitherTypeNone, nullptr, 0.0, WICBitmapPaletteTypeCustom))) {
+            return false;
+        }
+        if (FAILED(frame->WriteSource(conv.get(), nullptr))) return false;
+    }
+
     if (FAILED(frame->Commit()) || FAILED(enc->Commit())) return false;
     stream.reset();
 
@@ -499,6 +563,12 @@ inline bool save_raster_png(const ui::Raster& raster, const fs::path& path, uint
         if (ec) *out_size = 0;
     }
     return true;
+}
+
+/// Encodes a 32bpp BGRA raster to PNG via WIC, optionally returning file size in bytes.
+inline bool save_raster_png(const ui::Raster& raster, const fs::path& path, uint64_t* out_size = nullptr,
+                            IWICImagingFactory* shared_wic = nullptr) {
+    return save_raster_image(raster, path, ImageFormat::Png, 100, out_size, shared_wic);
 }
 
 } // namespace capusy

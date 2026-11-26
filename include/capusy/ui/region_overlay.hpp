@@ -130,8 +130,8 @@ public:
     RegionOverlay& operator=(RegionOverlay&&) = delete;
     ~RegionOverlay() { cancel(); }
 
-    std::function<void(Raster&&)> on_screenshot_captured;
-    std::function<void(RECT)> on_record_region_selected;
+    std::function<void(Raster&&, WindowInfo&&)> on_screenshot_captured;
+    std::function<void(RECT, WindowInfo&&)> on_record_region_selected;
     std::function<void()> on_closed;
 
     [[nodiscard]] bool active() const noexcept { return !monitors_.empty(); }
@@ -141,7 +141,8 @@ public:
         inst_ = inst;
         mode_ = mode;
 
-        // 1. Snapshot the instant freezeframe & Z-ordered snap targets BEFORE creating any overlay windows!
+        // 1. Snapshot foreground window info, instant freezeframe & Z-ordered snap targets BEFORE creating any overlay windows!
+        foreground_info_ = foreground_window_info();
         auto cap = capture_virtual_screen(include_cursor);
         if (!cap || cap->monitors.empty()) return false;
         snaps_ = enumerate_snap_targets(cap->monitors);
@@ -269,6 +270,7 @@ public:
         monitors_.clear();
         capture_.reset();
         snaps_ = {};
+        foreground_info_ = {};
         annotations_.clear();
         redo_stack_.clear();
         active_annotation_.reset();
@@ -689,17 +691,18 @@ private:
 
     void confirm_capture() {
         if (!has_selection_ || !rect_valid(selection_)) return;
+        WindowInfo win_info = window_info_for_rect(snaps_, selection_, foreground_info_);
         if (mode_ == OverlayMode::RecordRegion) {
             const RECT r = selection_;
             auto cb = on_record_region_selected;
             cancel();
-            if (cb) cb(r);
+            if (cb) cb(r, std::move(win_info));
             return;
         }
         auto raster = compose_final_raster();
         auto cb = on_screenshot_captured;
         cancel();
-        if (raster && cb) cb(std::move(*raster));
+        if (raster && cb) cb(std::move(*raster), std::move(win_info));
     }
 
     // ------------------------------------------------------------------------------------------
@@ -1084,6 +1087,7 @@ private:
     OverlayMode mode_ = OverlayMode::Screenshot;
     std::optional<VirtualCapture> capture_;
     SnapTargets snaps_;
+    WindowInfo foreground_info_;
     std::vector<std::unique_ptr<MonitorWindow>> monitors_;
     wil::com_ptr<ID2D1StrokeStyle1> round_stroke_;
 

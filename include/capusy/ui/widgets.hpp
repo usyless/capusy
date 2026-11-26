@@ -157,6 +157,14 @@ inline void draw_button(Canvas& cv, float ha, D2D1_RECT_F r, wchar_t icon_g, std
     cv.hit(r, id, idx);
 }
 
+inline void draw_disabled_button(Canvas& cv, D2D1_RECT_F r, wchar_t icon_g, std::wstring_view label, int id = 0, int idx = 0) {
+    const float rad = std::min(cv.theme().button_radius, height(r) * 0.5f);
+    cv.fill_round(r, rad, with_alpha(cv.theme().surface_high, 0.45f));
+    cv.stroke_round(r, rad, with_alpha(cv.theme().outline_variant, 0.45f));
+    draw_button_content(cv, r, icon_g, label, with_alpha(cv.theme().on_surface_variant, 0.5f));
+    if (id != 0) cv.hit(r, id, idx);
+}
+
 inline void draw_switch(Canvas& cv, float ha, float t, float right_x, float cy, int id, int idx = 0) {
     const D2D1_RECT_F r = rect(right_x - 44.0f, cy - 12.0f, 44.0f, 24.0f);
     const float kx = lerp(r.left + 12.0f, r.right - 12.0f, t);
