@@ -1,0 +1,955 @@
+#pragma once
+
+#include "canvas.hpp"
+#include "preview_math.hpp"
+#include "shared.hpp"
+#include "textfield.hpp"
+#include "video_player.hpp"
+#include "widgets.hpp"
+#include "window_lifecycle.hpp"
+
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <optional>
+#include <string>
+#include <vector>
+
+namespace capusy::ui {
+
+/// Screenshot & recording history window:
+/// - Left scrollable list of captures stored in SQLite (newest first)
+/// - Right preview pane (high-res WIC image preview + reused Media Foundation VideoPlayer for MP4s)
+/// - Double-click to open in default app
+/// - Right-click context menu to copy, reveal, remove, or delete file
+/// - OLE async drag-and-drop OUT of the window (from either list or preview), matching usyseek
+class HistoryWindow {
+public:
+    explicit HistoryWindow(Shared& sh) : sh_{sh} {}
+    HistoryWindow(const HistoryWindow&) = delete;
+    HistoryWindow& operator=(const HistoryWindow&) = delete;
+    HistoryWindow(HistoryWindow&&) = delete;
+    HistoryWindow& operator=(HistoryWindow&&) = delete;
+    ~HistoryWindow() {
+        video_.shutdown();
+        target_.release();
+        if (hwnd_) DestroyWindow(hwnd_);
+    }
+
+    bool create(HINSTANCE inst) {
+        inst_ = inst;
+        WNDCLASSEXW wc{.cbSize = sizeof(wc)};
+        wc.style = CS_DBLCLKS;
+        wc.lpfnWndProc = &HistoryWindow::wndproc;
+        wc.hInstance = inst;
+        wc.hIcon = LoadIconW(inst, MAKEINTRESOURCEW(101));
+        wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+        wc.lpszClassName = HISTORY_CLASS;
+        RegisterClassExW(&wc);
+
+        const DWORD style = WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN;
+        const UINT sys_dpi = GetDpiForSystem();
+        const float s = (sys_dpi > 0 ? static_cast<float>(sys_dpi) : 96.0f) / 96.0f;
+        RECT rc{.left = 0, .top = 0, .right = static_cast<LONG>(1040 * s), .bottom = static_cast<LONG>(680 * s)};
+        AdjustWindowRectExForDpi(&rc, style, FALSE, 0, sys_dpi);
+
+        hwnd_ = CreateWindowExW(
+            WS_EX_NOREDIRECTIONBITMAP, HISTORY_CLASS, L"capusy — History",
+            style, CW_USEDEFAULT, CW_USEDEFAULT, rc.right - rc.left, rc.bottom - rc.top,
+            nullptr, nullptr, inst, this);
+        if (!hwnd_) return false;
+
+        icons_.apply(hwnd_, inst, 101);
+        cloak_window(hwnd_, true);
+        video_.set_notify(hwnd_, WM_APP_VIDEO);
+        video_.set_muted(sh_.settings.video_muted);
+
+        cursor_arrow_ = LoadCursorW(nullptr, IDC_ARROW);
+        cursor_hand_ = LoadCursorW(nullptr, IDC_HAND);
+        return true;
+    }
+
+    [[nodiscard]] HWND hwnd() const noexcept { return hwnd_; }
+    [[nodiscard]] bool visible() const noexcept { return hwnd_ && IsWindowVisible(hwnd_) != FALSE; }
+
+    void show() {
+        if (!hwnd_) return;
+        if (!sh_.gfx.ensure_device(hwnd_)) return;
+        if (!target_.ready() && !target_.attach(sh_.gfx, hwnd_)) return;
+        sh_.thumbs.start(hwnd_, WM_APP_THUMBS, 2);
+        sh_.previews.start(hwnd_, WM_APP_THUMBS, 1);
+
+        reload_entries(true);
+        apply_dark_window(hwnd_, DWMSBT_MAINWINDOW, true);
+        cloak_window(hwnd_, false);
+        if (IsIconic(hwnd_)) ShowWindow(hwnd_, SW_RESTORE);
+        else ShowWindow(hwnd_, SW_SHOWNORMAL);
+        SetForegroundWindow(hwnd_);
+        SetFocus(hwnd_);
+        full_dirty_ = true;
+        render();
+        ValidateRect(hwnd_, nullptr);
+        if (sh_.on_visibility_changed) sh_.on_visibility_changed();
+    }
+
+    void hide() {
+        if (!hwnd_ || dragging_out_) return;
+        KillTimer(hwnd_, TIMER_ANIM);
+        KillTimer(hwnd_, TIMER_VIDEO);
+        KillTimer(hwnd_, TIMER_DROP);
+        video_.close();
+        sh_.previews.clear();
+        sh_.thumbs.clear();
+        target_.release();
+        dragging_scroll_ = false;
+        scrubbing_video_ = false;
+        drag_pending_ = false;
+        hover_.set(IdNone, 0, false);
+        cloak_window(hwnd_, true);
+        ShowWindow(hwnd_, SW_HIDE);
+        if (sh_.on_visibility_changed) sh_.on_visibility_changed();
+    }
+
+    void reload_entries(bool keep_selection = true) {
+        const int64_t prev_id = (keep_selection && selected_idx_ >= 0 && std::cmp_less(selected_idx_, entries_.size()))
+            ? entries_[static_cast<size_t>(selected_idx_)].id : -1;
+
+        std::optional<CaptureKind> filter;
+        if (filter_ == Filter::Images) filter = CaptureKind::Image;
+        else if (filter_ == Filter::Videos) filter = CaptureKind::Video;
+
+        if (auto list = sh_.history.list_recent(1000, filter)) {
+            entries_ = std::move(*list);
+        } else {
+            entries_.clear();
+        }
+
+        selected_idx_ = -1;
+        if (prev_id >= 0) {
+            for (size_t i = 0; i < entries_.size(); ++i) {
+                if (entries_[i].id == prev_id) {
+                    selected_idx_ = static_cast<int>(i);
+                    break;
+                }
+            }
+        }
+        if (selected_idx_ < 0 && !entries_.empty()) selected_idx_ = 0;
+
+        sync_preview_media();
+        clamp_scroll();
+        invalidate();
+    }
+
+    void on_thumbs_ready() {
+        if (!visible() || !target_.ready()) return;
+        bool changed = false;
+        if (sh_.thumbs.process(target_.dc())) changed = true;
+        if (sh_.previews.process(target_.dc())) changed = true;
+        if (changed) invalidate();
+    }
+
+    void reset_gpu() noexcept {
+        video_.reset_gpu();
+        target_.release();
+    }
+
+    void invalidate() noexcept {
+        full_dirty_ = true;
+        if (visible()) InvalidateRect(hwnd_, nullptr, FALSE);
+    }
+
+private:
+    static constexpr float HEADER_H = 54.0f;
+    static constexpr float SIDEBAR_W = 324.0f;
+    static constexpr float ROW_H = 74.0f;
+    static constexpr float ROW_GAP = 6.0f;
+    static constexpr UINT_PTR TIMER_ANIM = 1;
+    static constexpr UINT_PTR TIMER_VIDEO = 2;
+    static constexpr UINT_PTR TIMER_DROP = 3;
+
+    enum class Filter : uint8_t { All = 0, Images, Videos };
+
+    enum HitId : int {
+        IdNone = 0,
+        IdBtnFull,
+        IdBtnRegion,
+        IdBtnRecord,
+        IdBtnSettings,
+        IdFilterAll,
+        IdFilterImages,
+        IdFilterVideos,
+        IdRow,
+        IdScrollbar,
+        IdPreviewArea,
+        IdActCopy,
+        IdActOpen,
+        IdActExplorer,
+        IdActDelete,
+        IdVideoPlay,
+        IdVideoMute,
+        IdVideoScrub,
+    };
+
+    enum CtxCmd : UINT {
+        CmdOpen = 1001,
+        CmdCopy,
+        CmdCopyPath,
+        CmdExplorer,
+        CmdRemoveHistory,
+        CmdDeleteFile,
+    };
+
+    [[nodiscard]] const CaptureEntry* selected_entry() const noexcept {
+        if (selected_idx_ < 0 || std::cmp_greater_equal(selected_idx_, entries_.size())) return nullptr;
+        return &entries_[static_cast<size_t>(selected_idx_)];
+    }
+
+    void sync_preview_media() {
+        const CaptureEntry* e = selected_entry();
+        if (!e) {
+            video_.close();
+            if (hwnd_) KillTimer(hwnd_, TIMER_VIDEO);
+            return;
+        }
+        const std::wstring wpath = to_wide(e->path);
+        if (e->kind == CaptureKind::Video) {
+            if (visible() && sh_.gfx.d3d()) {
+                video_.open(wpath, sh_.gfx.d3d(), sh_.gfx.epoch(), true);
+                SetTimer(hwnd_, TIMER_VIDEO, 16, nullptr);
+            }
+        } else {
+            video_.close();
+            if (hwnd_) KillTimer(hwnd_, TIMER_VIDEO);
+            sh_.previews.request(static_cast<uint64_t>(e->id), wpath, 2048);
+        }
+    }
+
+    [[nodiscard]] float max_scroll() const noexcept {
+        const float list_h = std::max(0.0f, target_.size().height - HEADER_H - 44.0f);
+        const float total_h = entries_.empty() ? 0.0f : (static_cast<float>(entries_.size()) * (ROW_H + ROW_GAP) + 12.0f);
+        return std::max(0.0f, total_h - list_h);
+    }
+
+    void clamp_scroll() noexcept {
+        const float ms = max_scroll();
+        target_scroll_ = std::clamp(target_scroll_, 0.0f, ms);
+        scroll_ = std::clamp(scroll_, 0.0f, ms);
+    }
+
+    void ensure_row_visible(int idx) noexcept {
+        if (idx < 0) return;
+        const float list_h = std::max(1.0f, target_.size().height - HEADER_H - 44.0f);
+        const float top = 6.0f + (static_cast<float>(idx) * (ROW_H + ROW_GAP));
+        const float bot = top + ROW_H;
+        if (top < target_scroll_) target_scroll_ = top - 6.0f;
+        else if (bot > target_scroll_ + list_h) target_scroll_ = bot - list_h + 6.0f;
+        clamp_scroll();
+        start_anim();
+    }
+
+    void start_anim() noexcept {
+        if (!anim_running_ && visible()) {
+            anim_running_ = true;
+            last_anim_ = std::chrono::steady_clock::now();
+            SetTimer(hwnd_, TIMER_ANIM, 16, nullptr);
+        }
+    }
+
+    void step_anim() {
+        const auto now = std::chrono::steady_clock::now();
+        const float dt = std::clamp(std::chrono::duration<float>(now - last_anim_).count(), 0.001f, 0.05f);
+        last_anim_ = now;
+
+        bool moving = hover_.step(dt);
+        if (std::abs(target_scroll_ - scroll_) >= 0.4f) {
+            scroll_ += (target_scroll_ - scroll_) * (1.0f - std::exp(-dt * 20.0f));
+            moving = true;
+        } else {
+            scroll_ = target_scroll_;
+        }
+
+        if (!moving) {
+            anim_running_ = false;
+            KillTimer(hwnd_, TIMER_ANIM);
+        }
+        render();
+    }
+
+    void render() {
+        if (!visible() || rendering_) return;
+        if (!target_.ready()) {
+            if (!sh_.gfx.ensure_device(hwnd_) || !target_.rebuild()) return;
+        }
+        rendering_ = true;
+        const auto clear_r = wil::scope_exit([&] { rendering_ = false; });
+
+        if (video_.active() && target_.dc()) {
+            (void)video_.tick(sh_.gfx.d3d(), sh_.gfx.epoch(), target_.dc());
+        }
+
+        const bool ok = target_.render_frame(true, {}, WindowTarget::PresentMode::Vsync, [&](std::optional<D2D1_RECT_F> clip, bool) {
+            hits_.clear();
+            Canvas cv{target_, sh_.fonts, hits_, default_theme(), clip};
+            draw(cv);
+        });
+        full_dirty_ = false;
+        if (!ok) {
+            target_.release();
+            sh_.gfx.recover(hwnd_);
+            sh_.thumbs.reset_gpu();
+            sh_.previews.reset_gpu();
+            video_.reset_gpu();
+            invalidate();
+        }
+    }
+
+    void draw(Canvas& cv) {
+        const D2D1_SIZE_F sz = target_.size();
+        cv.fill(D2D1::RectF(0.0f, 0.0f, sz.width, sz.height), with_alpha(cv.theme().bg, cv.theme().window_bg_alpha));
+
+        draw_header(cv, sz);
+
+        const float body_top = HEADER_H;
+        const float sidebar_w = std::min(SIDEBAR_W, sz.width * 0.45f);
+        draw_sidebar(cv, D2D1::RectF(0.0f, body_top, sidebar_w, sz.height));
+        cv.vline(sidebar_w, body_top, sz.height, with_alpha(cv.theme().outline_variant, 0.65f));
+        draw_preview_pane(cv, D2D1::RectF(sidebar_w + 1.0f, body_top, sz.width, sz.height));
+    }
+
+    void draw_header(Canvas& cv, D2D1_SIZE_F sz) {
+        cv.fill(D2D1::RectF(0.0f, 0.0f, sz.width, HEADER_H), with_alpha(cv.theme().surface_lowest, 0.78f));
+        cv.hline(0.0f, sz.width, HEADER_H, with_alpha(cv.theme().outline_variant, 0.65f));
+
+        cv.icon(glyph::camera, rect(14.0f, 11.0f, 32.0f, 32.0f), cv.theme().primary, Font::IconLarge);
+        cv.text(L"capusy", rect(50.0f, 0.0f, 90.0f, HEADER_H), Font::Title, cv.theme().on_surface);
+
+        // Action buttons on right
+        const float set_w = button_width(cv, L"Settings", true, 98.0f);
+        const wchar_t* rec_lbl = sh_.recording_active ? L"Stop Rec" : L"Record";
+        const float rec_w = button_width(cv, rec_lbl, true, 96.0f);
+        const float reg_w = button_width(cv, L"Region", true, 92.0f);
+        const float full_w = button_width(cv, L"Full Screen", true, 112.0f);
+
+        float rx = sz.width - 14.0f;
+        rx -= set_w;
+        draw_button(cv, hover_.alpha(IdBtnSettings), rect(rx, 11.0f, set_w, 32.0f), glyph::settings, L"Settings", IdBtnSettings, 0, 3);
+        rx -= 8.0f + rec_w;
+        draw_button(cv, hover_.alpha(IdBtnRecord), rect(rx, 11.0f, rec_w, 32.0f), sh_.recording_active ? glyph::stop : glyph::video, rec_lbl, IdBtnRecord, 0, sh_.recording_active ? 2 : 0);
+        rx -= 8.0f + reg_w;
+        draw_button(cv, hover_.alpha(IdBtnRegion), rect(rx, 11.0f, reg_w, 32.0f), glyph::crop, L"Region", IdBtnRegion, 0, 0);
+        rx -= 8.0f + full_w;
+        draw_button(cv, hover_.alpha(IdBtnFull), rect(rx, 11.0f, full_w, 32.0f), glyph::monitor, L"Full Screen", IdBtnFull, 0, 1);
+    }
+
+    void draw_sidebar(Canvas& cv, D2D1_RECT_F area) {
+        cv.fill(area, with_alpha(cv.theme().surface_low, 0.55f));
+
+        // Filter bar
+        const float fy = area.top + 8.0f;
+        const float fx = area.left + 10.0f;
+        draw_button(cv, hover_.alpha(IdFilterAll), rect(fx, fy, 56.0f, 28.0f), 0, L"All", IdFilterAll, 0, filter_ == Filter::All ? 1 : 3);
+        draw_button(cv, hover_.alpha(IdFilterImages), rect(fx + 60.0f, fy, 74.0f, 28.0f), 0, L"Images", IdFilterImages, 0, filter_ == Filter::Images ? 1 : 3);
+        draw_button(cv, hover_.alpha(IdFilterVideos), rect(fx + 138.0f, fy, 74.0f, 28.0f), 0, L"Videos", IdFilterVideos, 0, filter_ == Filter::Videos ? 1 : 3);
+
+        FixedWString<32> cnt = format_count(entries_.size());
+        cv.text(cnt, rect(area.right - 68.0f, fy, 56.0f, 28.0f), Font::Caption, cv.theme().outline, Align::Right);
+        cv.hline(area.left, area.right, area.top + 43.0f, with_alpha(cv.theme().outline_variant, 0.45f));
+
+        const D2D1_RECT_F list_r = D2D1::RectF(area.left, area.top + 44.0f, area.right, area.bottom);
+        list_rect_ = list_r;
+        cv.push_clip(list_r);
+
+        if (entries_.empty()) {
+            cv.icon(glyph::history, rect(list_r.left, list_r.top + 80.0f, width(list_r), 36.0f), cv.theme().outline, Font::IconLarge);
+            cv.text(L"No captures yet", rect(list_r.left, list_r.top + 120.0f, width(list_r), 24.0f), Font::BodySemi, cv.theme().on_surface_variant, Align::Center);
+            cv.text(L"Press your screenshot hotkey or click Full Screen / Region", rect(list_r.left + 20.0f, list_r.top + 146.0f, width(list_r) - 40.0f, 40.0f),
+                    Font::SmallWrap, cv.theme().outline, Align::Center);
+            cv.pop_clip();
+            return;
+        }
+
+        const float step = ROW_H + ROW_GAP;
+        const int first = std::max(0, static_cast<int>(std::floor((scroll_ - 6.0f) / step)));
+        const int last = std::min(static_cast<int>(entries_.size()) - 1, static_cast<int>(std::ceil((scroll_ + height(list_r)) / step)));
+        const UINT thumb_px = static_cast<UINT>(std::lround(112.0f * target_.scale()));
+
+        for (int i = first; i <= last; ++i) {
+            const CaptureEntry& e = entries_[static_cast<size_t>(i)];
+            const float ry = list_r.top + 6.0f + (static_cast<float>(i) * step) - scroll_;
+            const D2D1_RECT_F rr = rect(list_r.left + 8.0f, ry, width(list_r) - 20.0f, ROW_H);
+            const bool sel = (i == selected_idx_);
+            const float ha = hover_.alpha(IdRow, i);
+
+            const D2D1_COLOR_F bg = sel
+                ? lerp_color(with_alpha(cv.theme().primary_container, 0.55f), with_alpha(cv.theme().primary_container, 0.72f), ha)
+                : with_alpha(cv.theme().surface_high, 0.45f * ha);
+            if (bg.a > 0.002f) cv.fill_round(rr, 10.0f, bg);
+            if (sel) cv.stroke_round(rr, 10.0f, with_alpha(cv.theme().primary, 0.75f), 1.2f);
+
+            // Thumbnail box
+            const D2D1_RECT_F tr = rect(rr.left + 8.0f, rr.top + 8.0f, 84.0f, ROW_H - 16.0f);
+            cv.fill_round(tr, 7.0f, cv.theme().surface_lowest);
+            const uint64_t tid = static_cast<uint64_t>(e.id);
+            if (ID2D1Bitmap1* bmp = sh_.thumbs.get(tid)) {
+                cv.fill_bitmap_round(bmp, tr, 7.0f, ThumbFit::Crop);
+            } else {
+                sh_.thumbs.request(tid, to_wide(e.path), thumb_px);
+                cv.icon(e.kind == CaptureKind::Video ? glyph::video : glyph::photo, tr, cv.theme().outline, Font::Icon);
+            }
+            if (e.kind == CaptureKind::Video) {
+                const D2D1_RECT_F vb = rect(tr.right - 36.0f, tr.bottom - 18.0f, 33.0f, 15.0f);
+                cv.fill_round(vb, 4.0f, with_alpha(cv.theme().surface_lowest, 0.85f));
+                cv.text(L"MP4", vb, Font::Label, cv.theme().amber, Align::Center);
+            }
+
+            // Text info
+            const float tx = tr.right + 10.0f;
+            const float tw = std::max(40.0f, rr.right - tx - 8.0f);
+            const std::wstring wpath = to_wide(e.path);
+            const fs::path fp{wpath};
+            const std::wstring fname = fp.filename().wstring();
+            cv.text(fname, rect(tx, rr.top + 10.0f, tw, 20.0f), Font::SmallSemi, sel ? cv.theme().on_primary_container : cv.theme().on_surface);
+
+            FixedWString<64> line2;
+            if (e.width > 0 && e.height > 0) {
+                line2.assign(to_fixed_wstr<16>(e.width));
+                line2.append(L"×");
+                line2.append(to_fixed_wstr<16>(e.height));
+            }
+            if (e.size_bytes > 0) {
+                if (!line2.empty()) line2.append(L"  •  ");
+                line2.append(format_size(e.size_bytes));
+            }
+            if (e.kind == CaptureKind::Video && e.duration_ms > 0) {
+                if (!line2.empty()) line2.append(L"  •  ");
+                line2.append(format_duration_ms(e.duration_ms));
+            }
+            cv.text(line2, rect(tx, rr.top + 31.0f, tw, 17.0f), Font::Caption, cv.theme().on_surface_variant);
+            cv.text(format_timestamp(e.created_at), rect(tx, rr.top + 48.0f, tw, 17.0f), Font::Caption, cv.theme().outline);
+
+            cv.hit(rr, IdRow, i);
+        }
+        cv.pop_clip();
+
+        // Scrollbar
+        const float ms = max_scroll();
+        if (ms > 0.0f) {
+            const float track_h = height(list_r) - 8.0f;
+            const float total_h = static_cast<float>(entries_.size()) * step + 12.0f;
+            const float thumb_h = std::max(28.0f, track_h * height(list_r) / total_h);
+            const float ty = list_r.top + 4.0f + ((track_h - thumb_h) * (scroll_ / ms));
+            const float ha = dragging_scroll_ ? 1.0f : hover_.alpha(IdScrollbar);
+            scroll_thumb_ = D2D1::RectF(list_r.right - lerp(6.0f, 8.0f, ha), ty, list_r.right - 2.0f, ty + thumb_h);
+            cv.fill_round(scroll_thumb_, 3.0f, with_alpha(cv.theme().on_surface_variant, lerp(0.28f, 0.55f, ha)));
+            cv.hit(D2D1::RectF(list_r.right - 12.0f, list_r.top, list_r.right, list_r.bottom), IdScrollbar);
+        }
+    }
+
+    void draw_preview_pane(Canvas& cv, D2D1_RECT_F area) {
+        const CaptureEntry* e = selected_entry();
+        if (!e) {
+            cv.icon(glyph::photo, rect(area.left, area.top + (height(area) * 0.5f) - 42.0f, width(area), 36.0f), cv.theme().outline, Font::IconLarge);
+            cv.text(L"Select a capture to preview", rect(area.left, area.top + (height(area) * 0.5f), width(area), 24.0f),
+                    Font::Body, cv.theme().outline, Align::Center);
+            return;
+        }
+
+        const float footer_h = 68.0f;
+        const float video_bar_h = (e->kind == CaptureKind::Video) ? 44.0f : 0.0f;
+        const D2D1_RECT_F stage = D2D1::RectF(area.left + 18.0f, area.top + 18.0f, area.right - 18.0f, area.bottom - footer_h - video_bar_h - 12.0f);
+        preview_rect_ = stage;
+
+        cv.fill_round(stage, 12.0f, with_alpha(cv.theme().surface_lowest, 0.85f));
+        cv.stroke_round(stage, 12.0f, with_alpha(cv.theme().outline_variant, 0.55f));
+
+        const D2D1_RECT_F media_box = inset(stage, 10.0f, 10.0f);
+        if (e->kind == CaptureKind::Video) {
+            if (video_.has_frame() && video_.bitmap()) {
+                const FitBox fb = compute_preview_box(video_.native_width(), video_.native_height(), e->width, e->height, target_.scale(),
+                                                      {.left = media_box.left, .top = media_box.top, .width = width(media_box), .height = height(media_box)});
+                video_.set_output_size(static_cast<uint32_t>(std::lround(fb.width * target_.scale())),
+                                       static_cast<uint32_t>(std::lround(fb.height * target_.scale())));
+                cv.bitmap(video_.bitmap(), rect(fb.left, fb.top, fb.width, fb.height));
+            } else if (ID2D1Bitmap1* tb = sh_.thumbs.get(static_cast<uint64_t>(e->id))) {
+                cv.fill_bitmap_round(tb, media_box, 8.0f, ThumbFit::Contain);
+            } else {
+                cv.text(video_.failed() ? L"Video preview unavailable — double-click to open externally" : L"Loading video…",
+                        media_box, Font::Body, cv.theme().outline, Align::Center);
+            }
+            cv.hit(stage, IdPreviewArea);
+
+            // Video controls bar
+            const D2D1_RECT_F vb = D2D1::RectF(area.left + 18.0f, stage.bottom + 8.0f, area.right - 18.0f, stage.bottom + 44.0f);
+            cv.fill_round(vb, 10.0f, with_alpha(cv.theme().surface, 0.92f));
+            cv.stroke_round(vb, 10.0f, with_alpha(cv.theme().outline_variant, 0.6f));
+
+            draw_button(cv, hover_.alpha(IdVideoPlay), rect(vb.left + 6.0f, vb.top + 4.0f, 32.0f, 28.0f),
+                        video_.is_playing() ? glyph::pause : glyph::play, L"", IdVideoPlay, 0, 3);
+            draw_button(cv, hover_.alpha(IdVideoMute), rect(vb.right - 38.0f, vb.top + 4.0f, 32.0f, 28.0f),
+                        video_.is_muted() ? glyph::mute : glyph::volume, L"", IdVideoMute, 0, 3);
+
+            const double dur = video_.duration();
+            const double cur = video_.current_time();
+            const float ratio = dur > 0.0 ? static_cast<float>(std::clamp(cur / dur, 0.0, 1.0)) : 0.0f;
+
+            FixedWString<48> time_lbl = format_duration_ms(static_cast<uint64_t>(cur * 1000.0));
+            time_lbl.append(L" / ");
+            time_lbl.append(format_duration_ms(static_cast<uint64_t>(dur * 1000.0)));
+            const float time_w = 96.0f;
+            cv.text(time_lbl, rect(vb.right - 44.0f - time_w, vb.top, time_w, height(vb)), Font::MonoSmall, cv.theme().on_surface_variant, Align::Right);
+
+            scrub_rect_ = D2D1::RectF(vb.left + 46.0f, vb.top + 4.0f, vb.right - 52.0f - time_w, vb.bottom - 4.0f);
+            if (width(scrub_rect_) > 30.0f) {
+                draw_slider(cv, hover_.alpha(IdVideoScrub), scrub_rect_, ratio, scrubbing_video_, IdVideoScrub);
+            }
+        } else {
+            const uint64_t tid = static_cast<uint64_t>(e->id);
+            ID2D1Bitmap1* bmp = sh_.previews.get(tid);
+            if (!bmp) {
+                sh_.previews.request(tid, to_wide(e->path), 2048);
+                bmp = sh_.thumbs.get(tid);
+            }
+            if (bmp) {
+                cv.fill_bitmap_round(bmp, media_box, 8.0f, ThumbFit::Contain);
+            } else {
+                const bool missing = sh_.previews.failed(tid);
+                cv.text(missing ? L"Image file not found on disk" : L"Loading preview…", media_box, Font::Body, cv.theme().outline, Align::Center);
+            }
+            cv.hit(stage, IdPreviewArea);
+        }
+
+        // Bottom metadata & action footer
+        const D2D1_RECT_F foot = D2D1::RectF(area.left + 18.0f, area.bottom - footer_h, area.right - 18.0f, area.bottom - 12.0f);
+        cv.fill_round(foot, 10.0f, with_alpha(cv.theme().surface, 0.90f));
+        cv.stroke_round(foot, 10.0f, with_alpha(cv.theme().outline_variant, 0.6f));
+
+        const float del_w = button_width(cv, L"Delete", true, 84.0f);
+        const float exp_w = button_width(cv, L"Folder", true, 84.0f);
+        const float open_w = button_width(cv, L"Open", true, 78.0f);
+        const float copy_w = button_width(cv, L"Copy", true, 78.0f);
+
+        float bx = foot.right - 10.0f;
+        const float by = foot.top + ((height(foot) - 32.0f) * 0.5f);
+        bx -= del_w;
+        draw_button(cv, hover_.alpha(IdActDelete), rect(bx, by, del_w, 32.0f), glyph::del, L"Delete", IdActDelete, 0, 2);
+        bx -= 6.0f + exp_w;
+        draw_button(cv, hover_.alpha(IdActExplorer), rect(bx, by, exp_w, 32.0f), glyph::folder, L"Folder", IdActExplorer, 0, 3);
+        bx -= 6.0f + open_w;
+        draw_button(cv, hover_.alpha(IdActOpen), rect(bx, by, open_w, 32.0f), glyph::open, L"Open", IdActOpen, 0, 0);
+        bx -= 6.0f + copy_w;
+        draw_button(cv, hover_.alpha(IdActCopy), rect(bx, by, copy_w, 32.0f), glyph::copy, L"Copy", IdActCopy, 0, 1);
+
+        const float info_w = std::max(40.0f, bx - foot.left - 18.0f);
+        const std::wstring wpath = to_wide(e->path);
+        const std::wstring fname = fs::path{wpath}.filename().wstring();
+        cv.text(fname, rect(foot.left + 12.0f, foot.top + 8.0f, info_w, 20.0f), Font::SmallSemi, cv.theme().on_surface);
+
+        FixedWString<96> sub;
+        sub.assign(e->mode == CaptureMode::Full ? L"Full Screen" : (e->mode == CaptureMode::Region ? L"Region" : L"Recording"));
+        if (e->width > 0 && e->height > 0) {
+            sub.append(L"  •  ");
+            sub.append(to_fixed_wstr<16>(e->width));
+            sub.append(L"×");
+            sub.append(to_fixed_wstr<16>(e->height));
+        }
+        if (e->size_bytes > 0) {
+            sub.append(L"  •  ");
+            sub.append(format_size(e->size_bytes));
+        }
+        sub.append(L"  •  Drag to drop into apps");
+        cv.text(sub, rect(foot.left + 12.0f, foot.top + 28.0f, info_w, 18.0f), Font::Caption, cv.theme().on_surface_variant);
+    }
+
+    // ------------------------------------------------------------------------------------------
+    // Actions, Context Menu & OLE Drag-and-Drop
+    // ------------------------------------------------------------------------------------------
+
+    void open_entry(int idx) {
+        if (idx < 0 || std::cmp_greater_equal(idx, entries_.size())) return;
+        (void)open_file(to_wide(entries_[static_cast<size_t>(idx)].path));
+    }
+
+    void copy_entry(int idx) {
+        if (idx < 0 || std::cmp_greater_equal(idx, entries_.size())) return;
+        const CaptureEntry& e = entries_[static_cast<size_t>(idx)];
+        (void)copy_capture_to_clipboard(to_wide(e.path), e.kind == CaptureKind::Image);
+    }
+
+    void delete_entry(int idx, bool delete_file) {
+        if (idx < 0 || std::cmp_greater_equal(idx, entries_.size())) return;
+        const CaptureEntry e = entries_[static_cast<size_t>(idx)];
+        const std::wstring wpath = to_wide(e.path);
+        if (e.kind == CaptureKind::Video && video_.path() == wpath) {
+            video_.close();
+        }
+        if (delete_file) {
+            (void)delete_file_to_recycle_bin(wpath);
+        }
+        (void)sh_.history.remove(e.id);
+        sh_.thumbs.evict(static_cast<uint64_t>(e.id));
+        sh_.previews.evict(static_cast<uint64_t>(e.id));
+
+        const int next_sel = std::min(idx, static_cast<int>(entries_.size()) - 2);
+        reload_entries(false);
+        if (next_sel >= 0 && std::cmp_less(next_sel, entries_.size())) {
+            selected_idx_ = next_sel;
+            sync_preview_media();
+        }
+        invalidate();
+    }
+
+    void show_context_menu(int idx) {
+        if (idx < 0 || std::cmp_greater_equal(idx, entries_.size())) return;
+        selected_idx_ = idx;
+        sync_preview_media();
+        render();
+
+        const CaptureEntry& e = entries_[static_cast<size_t>(idx)];
+        const wil::unique_hmenu menu{CreatePopupMenu()};
+        AppendMenuW(menu.get(), MF_STRING, CmdOpen, L"Open in Default App");
+        AppendMenuW(menu.get(), MF_STRING, CmdCopy, e.kind == CaptureKind::Image ? L"Copy Image" : L"Copy Video File");
+        AppendMenuW(menu.get(), MF_STRING, CmdCopyPath, L"Copy File Path");
+        AppendMenuW(menu.get(), MF_STRING, CmdExplorer, L"Show in Explorer");
+        AppendMenuW(menu.get(), MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(menu.get(), MF_STRING, CmdRemoveHistory, L"Remove from History");
+        AppendMenuW(menu.get(), MF_STRING, CmdDeleteFile, L"Delete File & History");
+        SetMenuDefaultItem(menu.get(), CmdOpen, FALSE);
+
+        POINT pt{};
+        GetCursorPos(&pt);
+        SetForegroundWindow(hwnd_);
+        const UINT cmd = static_cast<UINT>(TrackPopupMenuEx(menu.get(), TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY, pt.x, pt.y, hwnd_, nullptr));
+        PostMessageW(hwnd_, WM_NULL, 0, 0);
+
+        switch (cmd) {
+            case CmdOpen: open_entry(idx); break;
+            case CmdCopy: copy_entry(idx); break;
+            case CmdCopyPath: (void)set_clipboard_text(hwnd_, to_wide(e.path)); break;
+            case CmdExplorer: (void)reveal_in_explorer(to_wide(e.path)); break;
+            case CmdRemoveHistory: delete_entry(idx, false); break;
+            case CmdDeleteFile: delete_entry(idx, true); break;
+            default: break;
+        }
+    }
+
+    void start_drag_out(int idx) {
+        if (dragging_out_ || idx < 0 || std::cmp_greater_equal(idx, entries_.size())) return;
+        drag_pending_ = false;
+        if (GetCapture() == hwnd_) ReleaseCapture();
+
+        const std::array<std::wstring, 1> paths = {to_wide(entries_[static_cast<size_t>(idx)].path)};
+        wil::com_ptr<AsyncDataObject> async_drop;
+        {
+            dragging_out_ = true;
+            const auto guard = wil::scope_exit([&] { dragging_out_ = false; });
+            async_drop = drag_media(hwnd_, paths);
+        }
+        if (async_drop) {
+            async_drops_.push_back(std::move(async_drop));
+            ++sh_.background_jobs;
+            SetTimer(hwnd_, TIMER_DROP, 250, nullptr);
+        }
+        invalidate();
+    }
+
+    // ------------------------------------------------------------------------------------------
+    // Input
+    // ------------------------------------------------------------------------------------------
+
+    [[nodiscard]] D2D1_POINT_2F to_dip(LPARAM lp) const noexcept {
+        const float s = target_.scale();
+        return {.x = GET_X_LPARAM(lp) / s, .y = GET_Y_LPARAM(lp) / s};
+    }
+
+    void scrub_to_x(float x) noexcept {
+        const float pad = 8.0f;
+        const float l = scrub_rect_.left + pad;
+        const float r = std::max(l + 4.0f, scrub_rect_.right - pad);
+        const float ratio = std::clamp((x - l) / (r - l), 0.0f, 1.0f);
+        video_.seek(static_cast<double>(ratio) * video_.duration());
+        invalidate();
+    }
+
+    void on_lbutton_down(LPARAM lp) {
+        const D2D1_POINT_2F p = to_dip(lp);
+        const Hit* h = hit_test(hits_, p);
+        if (!h) return;
+
+        switch (h->id) {
+            case IdBtnFull: if (sh_.on_capture_full) sh_.on_capture_full(); return;
+            case IdBtnRegion: if (sh_.on_capture_region) sh_.on_capture_region(); return;
+            case IdBtnRecord: if (sh_.on_toggle_record) sh_.on_toggle_record(); return;
+            case IdBtnSettings: if (sh_.on_open_settings) sh_.on_open_settings(0); return;
+            case IdFilterAll: filter_ = Filter::All; reload_entries(true); return;
+            case IdFilterImages: filter_ = Filter::Images; reload_entries(true); return;
+            case IdFilterVideos: filter_ = Filter::Videos; reload_entries(true); return;
+            case IdActCopy: copy_entry(selected_idx_); return;
+            case IdActOpen: open_entry(selected_idx_); return;
+            case IdActExplorer:
+                if (const auto* e = selected_entry()) (void)reveal_in_explorer(to_wide(e->path));
+                return;
+            case IdActDelete: delete_entry(selected_idx_, true); return;
+            case IdVideoPlay:
+                video_.toggle_play();
+                if (video_.needs_timer()) SetTimer(hwnd_, TIMER_VIDEO, 16, nullptr);
+                invalidate();
+                return;
+            case IdVideoMute:
+                video_.toggle_mute();
+                sh_.settings.video_muted = video_.is_muted();
+                sh_.save();
+                invalidate();
+                return;
+            case IdVideoScrub:
+                scrubbing_video_ = true;
+                video_.begin_scrub();
+                SetCapture(hwnd_);
+                scrub_to_x(p.x);
+                return;
+            case IdScrollbar: {
+                dragging_scroll_ = true;
+                SetCapture(hwnd_);
+                scroll_drag_offset_ = p.y - scroll_thumb_.top;
+                return;
+            }
+            case IdRow: {
+                selected_idx_ = h->index;
+                sync_preview_media();
+                drag_pending_ = true;
+                drag_idx_ = h->index;
+                drag_start_px_ = {GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+                SetCapture(hwnd_);
+                invalidate();
+                return;
+            }
+            case IdPreviewArea: {
+                if (selected_idx_ >= 0) {
+                    drag_pending_ = true;
+                    drag_idx_ = selected_idx_;
+                    drag_start_px_ = {GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+                    SetCapture(hwnd_);
+                }
+                return;
+            }
+            default:
+                break;
+        }
+    }
+
+    void on_lbutton_dblclk(LPARAM lp) {
+        const Hit* h = hit_test(hits_, to_dip(lp));
+        if (!h) return;
+        if (h->id == IdRow) {
+            open_entry(h->index);
+        } else if (h->id == IdPreviewArea) {
+            open_entry(selected_idx_);
+        }
+    }
+
+    void on_rbutton_up(LPARAM lp) {
+        const Hit* h = hit_test(hits_, to_dip(lp));
+        if (!h) return;
+        if (h->id == IdRow) {
+            show_context_menu(h->index);
+        } else if (h->id == IdPreviewArea && selected_idx_ >= 0) {
+            show_context_menu(selected_idx_);
+        }
+    }
+
+    void on_mouse_move(LPARAM lp) {
+        const D2D1_POINT_2F p = to_dip(lp);
+        if (scrubbing_video_) {
+            scrub_to_x(p.x);
+            return;
+        }
+        if (dragging_scroll_) {
+            const float track_h = std::max(1.0f, height(list_rect_) - 8.0f - height(scroll_thumb_));
+            const float rel = std::clamp((p.y - scroll_drag_offset_ - (list_rect_.top + 4.0f)) / track_h, 0.0f, 1.0f);
+            scroll_ = target_scroll_ = rel * max_scroll();
+            render();
+            return;
+        }
+        if (drag_pending_) {
+            const int dx = std::abs(GET_X_LPARAM(lp) - drag_start_px_.x);
+            const int dy = std::abs(GET_Y_LPARAM(lp) - drag_start_px_.y);
+            if (dx >= GetSystemMetrics(SM_CXDRAG) || dy >= GetSystemMetrics(SM_CYDRAG)) {
+                start_drag_out(drag_idx_);
+                return;
+            }
+        }
+        const Hit* h = hit_test(hits_, p);
+        const int nid = h ? h->id : IdNone;
+        const int nidx = h ? h->index : 0;
+        if (hover_.set(nid, nidx, true)) start_anim();
+        SetCursor((h && h->id != IdPreviewArea) ? cursor_hand_ : cursor_arrow_);
+        TRACKMOUSEEVENT tme{.cbSize = sizeof(tme), .dwFlags = TME_LEAVE, .hwndTrack = hwnd_};
+        TrackMouseEvent(&tme);
+    }
+
+    void on_lbutton_up() {
+        drag_pending_ = false;
+        dragging_scroll_ = false;
+        if (scrubbing_video_) {
+            scrubbing_video_ = false;
+            video_.end_scrub();
+            if (video_.needs_timer()) SetTimer(hwnd_, TIMER_VIDEO, 16, nullptr);
+            invalidate();
+        }
+        if (GetCapture() == hwnd_) ReleaseCapture();
+    }
+
+    void on_key_down(UINT vk) {
+        const bool ctrl = GetKeyState(VK_CONTROL) < 0;
+        if (vk == VK_ESCAPE) { hide(); return; }
+        if (vk == VK_UP && selected_idx_ > 0) {
+            --selected_idx_;
+            sync_preview_media();
+            ensure_row_visible(selected_idx_);
+            invalidate();
+            return;
+        }
+        if (vk == VK_DOWN && selected_idx_ + 1 < static_cast<int>(entries_.size())) {
+            ++selected_idx_;
+            sync_preview_media();
+            ensure_row_visible(selected_idx_);
+            invalidate();
+            return;
+        }
+        if (vk == VK_RETURN && selected_idx_ >= 0) { open_entry(selected_idx_); return; }
+        if (vk == VK_DELETE && selected_idx_ >= 0) { delete_entry(selected_idx_, true); return; }
+        if (ctrl && vk == 'C' && selected_idx_ >= 0) { copy_entry(selected_idx_); return; }
+        if (vk == VK_SPACE && selected_entry() && selected_entry()->kind == CaptureKind::Video) {
+            video_.toggle_play();
+            if (video_.needs_timer()) SetTimer(hwnd_, TIMER_VIDEO, 16, nullptr);
+            invalidate();
+        }
+    }
+
+    static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+        if (msg == WM_NCCREATE) {
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(reinterpret_cast<CREATESTRUCTW*>(lp)->lpCreateParams));
+        }
+        auto* self = reinterpret_cast<HistoryWindow*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+        if (!self) return DefWindowProcW(hwnd, msg, wp, lp);
+        return self->handle(hwnd, msg, wp, lp);
+    }
+
+    LRESULT handle(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+        switch (msg) {
+            case WM_ERASEBKGND: return 1;
+            case WM_CLOSE:
+                hide();
+                return 0;
+            case WM_SIZE:
+                if (wp != SIZE_MINIMIZED && visible()) {
+                    (void)target_.resize(LOWORD(lp), HIWORD(lp));
+                    clamp_scroll();
+                    render();
+                }
+                return 0;
+            case WM_DPICHANGED: {
+                const auto* suggested = reinterpret_cast<const RECT*>(lp);
+                SetWindowPos(hwnd, nullptr, suggested->left, suggested->top,
+                             suggested->right - suggested->left, suggested->bottom - suggested->top,
+                             SWP_NOZORDER | SWP_NOACTIVATE);
+                icons_.apply(hwnd, inst_, 101);
+                (void)target_.sync_dpi();
+                invalidate();
+                return 0;
+            }
+            case WM_PAINT:
+                render();
+                ValidateRect(hwnd, nullptr);
+                return 0;
+            case WM_APP_THUMBS:
+                on_thumbs_ready();
+                return 0;
+            case WM_APP_VIDEO:
+                if (video_.process_events()) {
+                    if (video_.needs_timer()) SetTimer(hwnd, TIMER_VIDEO, 16, nullptr);
+                    invalidate();
+                }
+                return 0;
+            case WM_TIMER:
+                if (wp == TIMER_ANIM) step_anim();
+                else if (wp == TIMER_VIDEO) {
+                    if (!visible() || !video_.active()) {
+                        KillTimer(hwnd, TIMER_VIDEO);
+                    } else if (target_.ready()) {
+                        const auto st = video_.tick(sh_.gfx.d3d(), sh_.gfx.epoch(), target_.dc());
+                        if (st == MediaTickStatus::FrameReady || video_.is_playing()) render();
+                        if (!video_.needs_timer()) KillTimer(hwnd, TIMER_VIDEO);
+                    }
+                } else if (wp == TIMER_DROP) {
+                    std::erase_if(async_drops_, [&](const wil::com_ptr<AsyncDataObject>& o) {
+                        if (!o || !o->is_operation_active()) {
+                            if (sh_.background_jobs > 0) --sh_.background_jobs;
+                            return true;
+                        }
+                        return false;
+                    });
+                    if (async_drops_.empty()) KillTimer(hwnd, TIMER_DROP);
+                }
+                return 0;
+            case WM_MOUSEWHEEL: {
+                const float delta = static_cast<float>(GET_WHEEL_DELTA_WPARAM(wp)) / 120.0f;
+                target_scroll_ = std::clamp(target_scroll_ - (delta * 96.0f), 0.0f, max_scroll());
+                start_anim();
+                return 0;
+            }
+            case WM_LBUTTONDOWN: on_lbutton_down(lp); return 0;
+            case WM_LBUTTONDBLCLK: on_lbutton_dblclk(lp); return 0;
+            case WM_LBUTTONUP: on_lbutton_up(); return 0;
+            case WM_RBUTTONUP: on_rbutton_up(lp); return 0;
+            case WM_MOUSEMOVE: on_mouse_move(lp); return 0;
+            case WM_MOUSELEAVE:
+                if (hover_.set(IdNone, 0, true)) start_anim();
+                return 0;
+            case WM_KEYDOWN: on_key_down(static_cast<UINT>(wp)); return 0;
+            case WM_SETCURSOR:
+                if (LOWORD(lp) == HTCLIENT) return TRUE;
+                break;
+            default:
+                break;
+        }
+        return DefWindowProcW(hwnd, msg, wp, lp);
+    }
+
+    Shared& sh_;
+    HINSTANCE inst_ = nullptr;
+    HWND hwnd_ = nullptr;
+    WindowIcons icons_;
+    WindowTarget target_;
+    VideoPlayer video_;
+
+    Filter filter_ = Filter::All;
+    std::vector<CaptureEntry> entries_;
+    int selected_idx_ = -1;
+
+    std::vector<Hit> hits_;
+    HoverTracker hover_;
+    float scroll_ = 0.0f;
+    float target_scroll_ = 0.0f;
+    D2D1_RECT_F list_rect_{};
+    D2D1_RECT_F scroll_thumb_{};
+    D2D1_RECT_F preview_rect_{};
+    D2D1_RECT_F scrub_rect_{};
+
+    bool dragging_scroll_ = false;
+    float scroll_drag_offset_ = 0.0f;
+    bool scrubbing_video_ = false;
+    bool drag_pending_ = false;
+    bool dragging_out_ = false;
+    int drag_idx_ = -1;
+    POINT drag_start_px_{};
+    std::vector<wil::com_ptr<AsyncDataObject>> async_drops_;
+
+    bool anim_running_ = false;
+    bool rendering_ = false;
+    bool full_dirty_ = true;
+    std::chrono::steady_clock::time_point last_anim_{};
+    HCURSOR cursor_arrow_ = nullptr;
+    HCURSOR cursor_hand_ = nullptr;
+};
+
+} // namespace capusy::ui

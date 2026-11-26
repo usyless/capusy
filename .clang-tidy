@@ -4,7 +4,7 @@ Checks: >
   performance-*,
   modernize-*,
   readability-*,
-  
+
   misc-use-after-move,
   misc-redundant-expression,
   misc-definitions-in-headers,
@@ -34,7 +34,7 @@ Checks: >
   -performance-no-int-to-ptr
 
 WarningsAsErrors: ''
-HeaderFilterRegex: 'usyseek[/\\](src|include)[/\\]'
+HeaderFilterRegex: 'capusy[/\\](src|include)[/\\]'
 CheckOptions:
   readability-identifier-naming.VariableCase: lower_case
   readability-braces-around-statements.ShortStatementLines: 1
