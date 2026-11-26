@@ -20,6 +20,6 @@ Guidelines for working in the `capusy` repository (C++23, Win32, Direct2D).
 - Write code with performance and allocation efficiency in mind:
   - Minimize heap allocations where practical (e.g., reuse buffers, use fixed-size stack arrays when sizes are bounded).
   - Prefer the stack-allocated string helpers in `<usylibpp/strings.hpp>` over allocating standard utilities — e.g., `to_fixed_str` / `to_fixed_wstr` instead of `std::to_string` / `std::to_wstring`, and `FixedString` / `FixedWString` for bounded stack strings.
-  - Avoid `std::string + std::string` concatenation. Use `usylibpp::strings::concat_strings` when constructing a new string from multiple parts, and `usyseek::append_to` (or pre-reserved in-place appending) when appending to an existing string.
+  - Avoid `std::string + std::string` concatenation. Use `usylibpp::strings::concat_strings` when constructing a new string from multiple parts, and `usylibpp::strings::append_to` (or pre-reserved in-place appending) when appending to an existing string.
   - Continue this pattern when adding new utilities or code paths: prefer non-allocating or single-allocation helpers over chained temporaries.
 - Never trade away correctness for micro-optimizations: keep **thread safety** and **avoiding undefined behavior** strictly in mind when reusing buffers, skipping initialization, or manipulating low-level memory.
