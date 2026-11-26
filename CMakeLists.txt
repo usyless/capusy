@@ -157,8 +157,8 @@ if(MSVC)
     )
 endif()
 
-# mimalloc Configuration
-if(CAPUSY_USE_MIMALLOC)
+# mimalloc Configuration (static CRT override is only supported in non-Debug builds on MSVC)
+if(CAPUSY_USE_MIMALLOC AND NOT (MSVC AND CMAKE_BUILD_TYPE STREQUAL "Debug"))
     target_compile_definitions(capusy_common INTERFACE
         CAPUSY_USE_MIMALLOC
     )

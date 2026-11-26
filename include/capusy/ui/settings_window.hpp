@@ -81,6 +81,7 @@ public:
         else ShowWindow(hwnd_, SW_SHOWNORMAL);
         SetForegroundWindow(hwnd_);
         SetFocus(hwnd_);
+        anim_active_ = false;
         render();
         ValidateRect(hwnd_, nullptr);
         if (sh_.on_visibility_changed) sh_.on_visibility_changed();
@@ -89,10 +90,10 @@ public:
     void hide() {
         if (!hwnd_) return;
         stop_recording_hotkey();
-        KillTimer(hwnd_, TIMER_ANIM);
         dragging_scroll_ = false;
+        in_sizemove_ = false;
         dragging_slider_ = IdNone;
-        anim_running_ = false;
+        anim_active_ = false;
         hover_.set(IdNone, 0, false);
         app_icon_.reset();
         target_.release();
@@ -114,7 +115,6 @@ private:
     static constexpr float TABS_H = 52.0f;
     static constexpr float PAD = 24.0f;
     static constexpr float CARD_GAP = 14.0f;
-    static constexpr UINT_PTR TIMER_ANIM = 1;
 
     enum HitId : int {
         IdNone = 0,
@@ -144,6 +144,7 @@ private:
 
     void sync_state(bool animate) {
         startup_enabled_ = is_startup_enabled();
+        save_dir_w_ = resolve_save_dir(sh_.settings).wstring();
         if (auto st = sh_.history.stats()) stats_ = *st;
         for (size_t i = 0; i < HOTKEY_COUNT; ++i) {
             sw_hotkeys_[i].set(sh_.settings.hotkey(static_cast<HotkeyAction>(i)).enabled ? 1.0f : 0.0f, animate);
@@ -156,14 +157,13 @@ private:
     }
 
     void start_anim() noexcept {
-        if (!anim_running_ && visible()) {
-            anim_running_ = true;
-            last_anim_ = std::chrono::steady_clock::now();
-            SetTimer(hwnd_, TIMER_ANIM, 16, nullptr);
-        }
+        if (!visible()) return;
+        if (!anim_active_) last_anim_ = std::chrono::steady_clock::now();
+        anim_active_ = true;
+        InvalidateRect(hwnd_, nullptr, FALSE);
     }
 
-    void step_anim() {
+    bool step_anim() noexcept {
         const auto now = std::chrono::steady_clock::now();
         const float dt = std::clamp(std::chrono::duration<float>(now - last_anim_).count(), 0.001f, 0.05f);
         last_anim_ = now;
@@ -176,18 +176,18 @@ private:
         if (sw_cap_cursor_.step(dt, 22.0f, 0.004f)) moving = true;
         if (sw_toast_.step(dt, 22.0f, 0.004f)) moving = true;
         if (sw_rec_cursor_.step(dt, 22.0f, 0.004f)) moving = true;
-        if (std::abs(target_scroll_ - scroll_) >= 0.4f) {
-            scroll_ += (target_scroll_ - scroll_) * (1.0f - std::exp(-dt * 20.0f));
-            moving = true;
-        } else {
+        const float d = target_scroll_ - scroll_;
+        if (std::abs(d) < 0.5f) {
             scroll_ = target_scroll_;
+        } else {
+            scroll_ += d * (1.0f - std::exp(-dt * 22.0f));
+            if (std::abs(target_scroll_ - scroll_) < 0.5f) {
+                scroll_ = target_scroll_;
+            } else {
+                moving = true;
+            }
         }
-
-        if (!moving) {
-            anim_running_ = false;
-            KillTimer(hwnd_, TIMER_ANIM);
-        }
-        render();
+        return moving;
     }
 
     void stop_recording_hotkey() noexcept {
@@ -210,11 +210,14 @@ private:
         rendering_ = true;
         const auto guard = wil::scope_exit([&] { rendering_ = false; });
 
-        const bool ok = target_.render_frame(true, {}, WindowTarget::PresentMode::Vsync, [&](std::optional<D2D1_RECT_F> clip, bool) {
+        const bool anim = step_anim();
+        const auto mode = in_sizemove_ ? WindowTarget::PresentMode::Immediate : WindowTarget::PresentMode::Vsync;
+        const bool ok = target_.render_frame(true, {}, mode, [&](std::optional<D2D1_RECT_F> clip, bool) {
             hits_.clear();
             Canvas cv{target_, sh_.fonts, hits_, default_theme(), clip};
             draw(cv);
         });
+        anim_active_ = visible() && anim;
         if (!ok) {
             target_.release();
             sh_.gfx.recover(hwnd_);
@@ -357,7 +360,7 @@ private:
         {
             const CardHeader hd = make_header(cv, rw, L"Startup & Capture", cv.theme().on_surface,
                                               L"Windows sign-in launch, clipboard copy, and save directory");
-            const std::wstring save_dir_w = resolve_save_dir(sh_.settings).wstring();
+            const std::wstring_view save_dir_w = save_dir_w_;
             const float browse_w = button_width(cv, L"Browse", true, 98.0f);
             const float open_w = button_width(cv, L"Open", true, 84.0f);
 
@@ -547,7 +550,7 @@ private:
             sh_.settings.toast_timeout_s = std::round((1.0f + (k * 14.0f)) * 2.0f) / 2.0f;
         }
         sh_.save();
-        render();
+        invalidate();
     }
 
     void on_lbutton_down(LPARAM lp) {
@@ -622,6 +625,7 @@ private:
             case IdBrowseSaveDir:
                 if (auto dir = browse_folder_dialog(hwnd_, L"Choose capture save folder", resolve_save_dir(sh_.settings).wstring())) {
                     sh_.settings.save_dir = to_utf8(*dir);
+                    save_dir_w_ = *dir;
                     sh_.save();
                     invalidate();
                 }
@@ -714,6 +718,13 @@ private:
         switch (msg) {
             case WM_ERASEBKGND: return 1;
             case WM_CLOSE: hide(); return 0;
+            case WM_ENTERSIZEMOVE:
+                in_sizemove_ = true;
+                return 0;
+            case WM_EXITSIZEMOVE:
+                in_sizemove_ = false;
+                invalidate();
+                return 0;
             case WM_SIZE:
                 if (wp != SIZE_MINIMIZED && visible()) {
                     (void)target_.resize(LOWORD(lp), HIWORD(lp));
@@ -731,13 +742,20 @@ private:
                 invalidate();
                 return 0;
             }
-            case WM_PAINT:
+            case WM_PAINT: {
+                PAINTSTRUCT ps;
+                BeginPaint(hwnd, &ps);
                 render();
-                ValidateRect(hwnd, nullptr);
+                EndPaint(hwnd, &ps);
+                if (visible() && anim_active_) {
+                    MSG m;
+                    while (PeekMessageW(&m, nullptr, WM_TIMER, WM_TIMER, PM_REMOVE)) {
+                        DispatchMessageW(&m);
+                    }
+                    if (visible() && anim_active_) InvalidateRect(hwnd, nullptr, FALSE);
+                }
                 return 0;
-            case WM_TIMER:
-                if (wp == TIMER_ANIM) step_anim();
-                return 0;
+            }
             case WM_MOUSEWHEEL: {
                 const float delta = static_cast<float>(GET_WHEEL_DELTA_WPARAM(wp)) / 120.0f;
                 target_scroll_ = std::clamp(target_scroll_ - (delta * 90.0f), 0.0f, max_scroll());
@@ -761,7 +779,7 @@ private:
                     const float track_h = std::max(1.0f, height(view_rect_) - 8.0f - height(scroll_thumb_));
                     const float rel = std::clamp((p.y - scroll_drag_offset_ - (view_rect_.top + 4.0f)) / track_h, 0.0f, 1.0f);
                     scroll_ = target_scroll_ = rel * max_scroll();
-                    render();
+                    invalidate();
                     return 0;
                 }
                 const Hit* h = hit_test(hits_, p);
@@ -804,6 +822,7 @@ private:
     AnimFloat sw_rec_cursor_;
 
     bool startup_enabled_ = false;
+    std::wstring save_dir_w_;
     HistoryStats stats_{};
     std::optional<HotkeyAction> recording_action_;
     std::wstring record_conflict_msg_;
@@ -821,9 +840,10 @@ private:
     D2D1_RECT_F slider_size_r_{};
     D2D1_RECT_F slider_timeout_r_{};
     bool dragging_scroll_ = false;
+    bool in_sizemove_ = false;
     float scroll_drag_offset_ = 0.0f;
     int dragging_slider_ = IdNone;
-    bool anim_running_ = false;
+    bool anim_active_ = false;
     bool rendering_ = false;
     std::chrono::steady_clock::time_point last_anim_{};
     HCURSOR cursor_arrow_ = nullptr;

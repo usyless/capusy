@@ -86,6 +86,7 @@ public:
         else ShowWindow(hwnd_, SW_SHOWNORMAL);
         SetForegroundWindow(hwnd_);
         SetFocus(hwnd_);
+        anim_active_ = false;
         full_dirty_ = true;
         render();
         ValidateRect(hwnd_, nullptr);
@@ -94,7 +95,6 @@ public:
 
     void hide() {
         if (!hwnd_ || dragging_out_) return;
-        KillTimer(hwnd_, TIMER_ANIM);
         KillTimer(hwnd_, TIMER_VIDEO);
         KillTimer(hwnd_, TIMER_DROP);
         video_.close();
@@ -102,8 +102,10 @@ public:
         sh_.thumbs.clear();
         target_.release();
         dragging_scroll_ = false;
+        in_sizemove_ = false;
         scrubbing_video_ = false;
         drag_pending_ = false;
+        anim_active_ = false;
         hover_.set(IdNone, 0, false);
         cloak_window(hwnd_, true);
         ShowWindow(hwnd_, SW_HIDE);
@@ -122,6 +124,31 @@ public:
             entries_ = std::move(*list);
         } else {
             entries_.clear();
+        }
+
+        // Precompute display strings once so scrolling does zero heap/filesystem conversions per frame.
+        row_cache_.clear();
+        row_cache_.reserve(entries_.size());
+        for (const CaptureEntry& e : entries_) {
+            RowCache rc;
+            rc.wpath = to_wide(e.path);
+            const size_t slash = rc.wpath.find_last_of(L"\\/");
+            rc.filename = (slash != std::wstring::npos) ? rc.wpath.substr(slash + 1) : rc.wpath;
+            if (e.width > 0 && e.height > 0) {
+                rc.line2.assign(to_fixed_wstr<16>(e.width));
+                rc.line2.append(L"×");
+                rc.line2.append(to_fixed_wstr<16>(e.height));
+            }
+            if (e.size_bytes > 0) {
+                if (!rc.line2.empty()) rc.line2.append(L"  •  ");
+                rc.line2.append(format_size(e.size_bytes));
+            }
+            if (e.kind == CaptureKind::Video && e.duration_ms > 0) {
+                if (!rc.line2.empty()) rc.line2.append(L"  •  ");
+                rc.line2.append(format_duration_ms(e.duration_ms));
+            }
+            rc.ts = format_timestamp(e.created_at);
+            row_cache_.push_back(std::move(rc));
         }
 
         selected_idx_ = -1;
@@ -163,9 +190,15 @@ private:
     static constexpr float SIDEBAR_W = 324.0f;
     static constexpr float ROW_H = 74.0f;
     static constexpr float ROW_GAP = 6.0f;
-    static constexpr UINT_PTR TIMER_ANIM = 1;
     static constexpr UINT_PTR TIMER_VIDEO = 2;
     static constexpr UINT_PTR TIMER_DROP = 3;
+
+    struct RowCache {
+        std::wstring wpath;
+        std::wstring filename;
+        FixedWString<64> line2;
+        FixedWString<64> ts;
+    };
 
     enum class Filter : uint8_t { All = 0, Images, Videos };
 
@@ -248,31 +281,30 @@ private:
     }
 
     void start_anim() noexcept {
-        if (!anim_running_ && visible()) {
-            anim_running_ = true;
-            last_anim_ = std::chrono::steady_clock::now();
-            SetTimer(hwnd_, TIMER_ANIM, 16, nullptr);
-        }
+        if (!visible()) return;
+        if (!anim_active_) last_anim_ = std::chrono::steady_clock::now();
+        anim_active_ = true;
+        InvalidateRect(hwnd_, nullptr, FALSE);
     }
 
-    void step_anim() {
+    bool step_anim() noexcept {
         const auto now = std::chrono::steady_clock::now();
         const float dt = std::clamp(std::chrono::duration<float>(now - last_anim_).count(), 0.001f, 0.05f);
         last_anim_ = now;
 
         bool moving = hover_.step(dt);
-        if (std::abs(target_scroll_ - scroll_) >= 0.4f) {
-            scroll_ += (target_scroll_ - scroll_) * (1.0f - std::exp(-dt * 20.0f));
-            moving = true;
-        } else {
+        const float d = target_scroll_ - scroll_;
+        if (std::abs(d) < 0.5f) {
             scroll_ = target_scroll_;
+        } else {
+            scroll_ += d * (1.0f - std::exp(-dt * 22.0f));
+            if (std::abs(target_scroll_ - scroll_) < 0.5f) {
+                scroll_ = target_scroll_;
+            } else {
+                moving = true;
+            }
         }
-
-        if (!moving) {
-            anim_running_ = false;
-            KillTimer(hwnd_, TIMER_ANIM);
-        }
-        render();
+        return moving;
     }
 
     void render() {
@@ -283,16 +315,20 @@ private:
         rendering_ = true;
         const auto clear_r = wil::scope_exit([&] { rendering_ = false; });
 
+        const bool anim = step_anim();
+
         if (video_.active() && target_.dc()) {
             (void)video_.tick(sh_.gfx.d3d(), sh_.gfx.epoch(), target_.dc());
         }
 
-        const bool ok = target_.render_frame(true, {}, WindowTarget::PresentMode::Vsync, [&](std::optional<D2D1_RECT_F> clip, bool) {
+        const auto mode = in_sizemove_ ? WindowTarget::PresentMode::Immediate : WindowTarget::PresentMode::Vsync;
+        const bool ok = target_.render_frame(true, {}, mode, [&](std::optional<D2D1_RECT_F> clip, bool) {
             hits_.clear();
             Canvas cv{target_, sh_.fonts, hits_, default_theme(), clip};
             draw(cv);
         });
         full_dirty_ = false;
+        anim_active_ = visible() && anim;
         if (!ok) {
             target_.release();
             sh_.gfx.recover(hwnd_);
@@ -387,13 +423,14 @@ private:
             if (sel) cv.stroke_round(rr, 10.0f, with_alpha(cv.theme().primary, 0.75f), 1.2f);
 
             // Thumbnail box
+            const RowCache& rc = row_cache_[static_cast<size_t>(i)];
             const D2D1_RECT_F tr = rect(rr.left + 8.0f, rr.top + 8.0f, 84.0f, ROW_H - 16.0f);
             cv.fill_round(tr, 7.0f, cv.theme().surface_lowest);
             const uint64_t tid = static_cast<uint64_t>(e.id);
             if (ID2D1Bitmap1* bmp = sh_.thumbs.get(tid)) {
                 cv.fill_bitmap_round(bmp, tr, 7.0f, ThumbFit::Crop);
             } else {
-                sh_.thumbs.request(tid, to_wide(e.path), thumb_px);
+                sh_.thumbs.request(tid, rc.wpath, thumb_px);
                 cv.icon(e.kind == CaptureKind::Video ? glyph::video : glyph::photo, tr, cv.theme().outline, Font::Icon);
             }
             if (e.kind == CaptureKind::Video) {
@@ -402,30 +439,12 @@ private:
                 cv.text(L"MP4", vb, Font::Label, cv.theme().amber, Align::Center);
             }
 
-            // Text info
+            // Text info (zero allocations per frame)
             const float tx = tr.right + 10.0f;
             const float tw = std::max(40.0f, rr.right - tx - 8.0f);
-            const std::wstring wpath = to_wide(e.path);
-            const fs::path fp{wpath};
-            const std::wstring fname = fp.filename().wstring();
-            cv.text(fname, rect(tx, rr.top + 10.0f, tw, 20.0f), Font::SmallSemi, sel ? cv.theme().on_primary_container : cv.theme().on_surface);
-
-            FixedWString<64> line2;
-            if (e.width > 0 && e.height > 0) {
-                line2.assign(to_fixed_wstr<16>(e.width));
-                line2.append(L"×");
-                line2.append(to_fixed_wstr<16>(e.height));
-            }
-            if (e.size_bytes > 0) {
-                if (!line2.empty()) line2.append(L"  •  ");
-                line2.append(format_size(e.size_bytes));
-            }
-            if (e.kind == CaptureKind::Video && e.duration_ms > 0) {
-                if (!line2.empty()) line2.append(L"  •  ");
-                line2.append(format_duration_ms(e.duration_ms));
-            }
-            cv.text(line2, rect(tx, rr.top + 31.0f, tw, 17.0f), Font::Caption, cv.theme().on_surface_variant);
-            cv.text(format_timestamp(e.created_at), rect(tx, rr.top + 48.0f, tw, 17.0f), Font::Caption, cv.theme().outline);
+            cv.text(rc.filename, rect(tx, rr.top + 10.0f, tw, 20.0f), Font::SmallSemi, sel ? cv.theme().on_primary_container : cv.theme().on_surface);
+            cv.text(rc.line2, rect(tx, rr.top + 31.0f, tw, 17.0f), Font::Caption, cv.theme().on_surface_variant);
+            cv.text(rc.ts, rect(tx, rr.top + 48.0f, tw, 17.0f), Font::Caption, cv.theme().outline);
 
             cv.hit(rr, IdRow, i);
         }
@@ -506,7 +525,7 @@ private:
             const uint64_t tid = static_cast<uint64_t>(e->id);
             ID2D1Bitmap1* bmp = sh_.previews.get(tid);
             if (!bmp) {
-                sh_.previews.request(tid, to_wide(e->path), 2048);
+                sh_.previews.request(tid, row_cache_[static_cast<size_t>(selected_idx_)].wpath, 2048);
                 bmp = sh_.thumbs.get(tid);
             }
             if (bmp) {
@@ -540,9 +559,7 @@ private:
         draw_button(cv, hover_.alpha(IdActCopy), rect(bx, by, copy_w, 32.0f), glyph::copy, L"Copy", IdActCopy, 0, 1);
 
         const float info_w = std::max(40.0f, bx - foot.left - 18.0f);
-        const std::wstring wpath = to_wide(e->path);
-        const std::wstring fname = fs::path{wpath}.filename().wstring();
-        cv.text(fname, rect(foot.left + 12.0f, foot.top + 8.0f, info_w, 20.0f), Font::SmallSemi, cv.theme().on_surface);
+        cv.text(row_cache_[static_cast<size_t>(selected_idx_)].filename, rect(foot.left + 12.0f, foot.top + 8.0f, info_w, 20.0f), Font::SmallSemi, cv.theme().on_surface);
 
         FixedWString<96> sub;
         sub.assign(e->mode == CaptureMode::Full ? L"Full Screen" : (e->mode == CaptureMode::Region ? L"Region" : L"Recording"));
@@ -766,7 +783,7 @@ private:
             const float track_h = std::max(1.0f, height(list_rect_) - 8.0f - height(scroll_thumb_));
             const float rel = std::clamp((p.y - scroll_drag_offset_ - (list_rect_.top + 4.0f)) / track_h, 0.0f, 1.0f);
             scroll_ = target_scroll_ = rel * max_scroll();
-            render();
+            invalidate();
             return;
         }
         if (drag_pending_) {
@@ -840,6 +857,13 @@ private:
             case WM_CLOSE:
                 hide();
                 return 0;
+            case WM_ENTERSIZEMOVE:
+                in_sizemove_ = true;
+                return 0;
+            case WM_EXITSIZEMOVE:
+                in_sizemove_ = false;
+                invalidate();
+                return 0;
             case WM_SIZE:
                 if (wp != SIZE_MINIMIZED && visible()) {
                     (void)target_.resize(LOWORD(lp), HIWORD(lp));
@@ -857,10 +881,21 @@ private:
                 invalidate();
                 return 0;
             }
-            case WM_PAINT:
+            case WM_PAINT: {
+                PAINTSTRUCT ps;
+                BeginPaint(hwnd, &ps);
                 render();
-                ValidateRect(hwnd, nullptr);
+                EndPaint(hwnd, &ps);
+                if (visible() && anim_active_) {
+                    // Drain due timers while QS_PAINT is clear so VSync frames never starve timers.
+                    MSG m;
+                    while (PeekMessageW(&m, nullptr, WM_TIMER, WM_TIMER, PM_REMOVE)) {
+                        DispatchMessageW(&m);
+                    }
+                    if (visible() && anim_active_) InvalidateRect(hwnd, nullptr, FALSE);
+                }
                 return 0;
+            }
             case WM_APP_THUMBS:
                 on_thumbs_ready();
                 return 0;
@@ -871,13 +906,12 @@ private:
                 }
                 return 0;
             case WM_TIMER:
-                if (wp == TIMER_ANIM) step_anim();
-                else if (wp == TIMER_VIDEO) {
+                if (wp == TIMER_VIDEO) {
                     if (!visible() || !video_.active()) {
                         KillTimer(hwnd, TIMER_VIDEO);
                     } else if (target_.ready()) {
                         const auto st = video_.tick(sh_.gfx.d3d(), sh_.gfx.epoch(), target_.dc());
-                        if (st == MediaTickStatus::FrameReady || video_.is_playing()) render();
+                        if (st == MediaTickStatus::FrameReady || video_.is_playing()) invalidate();
                         if (!video_.needs_timer()) KillTimer(hwnd, TIMER_VIDEO);
                     }
                 } else if (wp == TIMER_DROP) {
@@ -924,6 +958,7 @@ private:
 
     Filter filter_ = Filter::All;
     std::vector<CaptureEntry> entries_;
+    std::vector<RowCache> row_cache_;
     int selected_idx_ = -1;
 
     std::vector<Hit> hits_;
@@ -936,6 +971,7 @@ private:
     D2D1_RECT_F scrub_rect_{};
 
     bool dragging_scroll_ = false;
+    bool in_sizemove_ = false;
     float scroll_drag_offset_ = 0.0f;
     bool scrubbing_video_ = false;
     bool drag_pending_ = false;
@@ -944,7 +980,7 @@ private:
     POINT drag_start_px_{};
     std::vector<wil::com_ptr<AsyncDataObject>> async_drops_;
 
-    bool anim_running_ = false;
+    bool anim_active_ = false;
     bool rendering_ = false;
     bool full_dirty_ = true;
     std::chrono::steady_clock::time_point last_anim_{};
