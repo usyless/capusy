@@ -1,0 +1,12 @@
+relevant_files/
+__pycache__/
+*.pyc
+build/
+build-*/
+dist/
+.vscode/
+.idea/
+.claude
+open-vscode.bat
+build.bat
+compile_commands.json
