@@ -1,6 +1,6 @@
 # AGENTS.md
 
-Guidelines for working in the `capusy` repository (C++23).
+Guidelines for working in the `capusy` repository (C++23, Win32, Direct2D).
 
 ## Versioning
 
