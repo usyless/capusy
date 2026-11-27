@@ -143,17 +143,16 @@ public:
         inst_ = inst;
         mode_ = mode;
 
-        // 1. Snapshot foreground window info, instant freezeframe & Z-ordered snap targets BEFORE creating any overlay windows!
+        // 1. Ensure shared D3D11 device is warm so WGC reuses it directly, then snapshot foreground window,
+        //    instant freezeframe & Z-ordered snap targets BEFORE creating any overlay windows!
+        if (!sh_.gfx.ensure_device(nullptr)) {
+            return false;
+        }
         foreground_info_ = foreground_window_info();
-        auto cap = capture_virtual_screen(include_cursor);
+        auto cap = capture_virtual_screen(include_cursor, sh_.gfx.d3d());
         if (!cap || cap->monitors.empty()) return false;
         snaps_ = enumerate_snap_targets(cap->monitors);
         capture_ = std::move(*cap);
-
-        if (!sh_.gfx.ensure_device(nullptr)) {
-            capture_.reset();
-            return false;
-        }
         ensure_stroke_style();
 
         // Register window class once

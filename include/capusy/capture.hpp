@@ -3,6 +3,7 @@
 #include "common.hpp"
 #include "settings.hpp"
 #include "ui/thumbs.hpp"
+#include "wgc_capture.hpp"
 
 #include <dwmapi.h>
 #include <propidl.h>
@@ -304,22 +305,12 @@ inline SnapTargets enumerate_snap_targets(const std::vector<MonitorInfo>& monito
     return targets;
 }
 
-/// Draws the current mouse cursor onto `hdc` shifted by `(-origin_x, -origin_y)`.
-inline void draw_cursor_into_dc(HDC hdc, int origin_x, int origin_y) noexcept {
-    CURSORINFO ci{.cbSize = sizeof(ci)};
-    if (!GetCursorInfo(&ci) || !(ci.flags & CURSOR_SHOWING) || !ci.hCursor) return;
-    ICONINFO ii{};
-    if (!GetIconInfo(ci.hCursor, &ii)) return;
-    const wil::unique_hbitmap mask{ii.hbmMask};
-    const wil::unique_hbitmap color{ii.hbmColor};
-    const int x = ci.ptScreenPos.x - static_cast<int>(ii.xHotspot) - origin_x;
-    const int y = ci.ptScreenPos.y - static_cast<int>(ii.yHotspot) - origin_y;
-    DrawIconEx(hdc, x, y, ci.hCursor, 0, 0, 0, nullptr, DI_NORMAL | DI_DEFAULTSIZE);
-}
-
-/// Captures the entire virtual screen across ALL monitors instantaneously.
+/// Captures the entire virtual screen across ALL monitors in parallel via Windows.Graphics.Capture
+/// (borderless on Windows 11, native DWM cursor composition & HDR-to-SDR tone mapping).
 /// Any dead space / blank gaps outside monitors are guaranteed filled with solid opaque black (0, 0, 0, 255).
-inline std::optional<VirtualCapture> capture_virtual_screen(bool include_cursor = false) {
+/// Passing an existing multithread-protected `shared_d3d` avoids creating a temporary D3D11 device.
+inline std::optional<VirtualCapture> capture_virtual_screen(bool include_cursor = false,
+                                                            ID3D11Device* shared_d3d = nullptr) {
     const int vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
     const int vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
     const int vw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
@@ -327,68 +318,25 @@ inline std::optional<VirtualCapture> capture_virtual_screen(bool include_cursor 
     if (vw <= 0 || vh <= 0) return std::nullopt;
 
     auto monitors = enumerate_monitors();
-    if (monitors.empty()) {
-        monitors.push_back(MonitorInfo{
-            .hmon = nullptr,
-            .rect = RECT{.left = vx, .top = vy, .right = vx + vw, .bottom = vy + vh},
-            .work = RECT{.left = vx, .top = vy, .right = vx + vw, .bottom = vy + vh},
-            .dpi = 96,
-            .primary = true,
-        });
-    }
+    if (monitors.empty()) return std::nullopt;
 
-    const wil::unique_hdc_window screen_dc{GetDC(nullptr)};
-    if (!screen_dc) return std::nullopt;
-    const wil::unique_hdc mem_dc{CreateCompatibleDC(screen_dc.get())};
-    if (!mem_dc) return std::nullopt;
-
-    BITMAPINFO bmi{};
-    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-    bmi.bmiHeader.biWidth = vw;
-    bmi.bmiHeader.biHeight = -vh; // top-down BGRA
-    bmi.bmiHeader.biPlanes = 1;
-    bmi.bmiHeader.biBitCount = 32;
-    bmi.bmiHeader.biCompression = BI_RGB;
-
-    void* bits = nullptr;
-    const wil::unique_hbitmap dib{CreateDIBSection(mem_dc.get(), &bmi, DIB_RGB_COLORS, &bits, nullptr, 0)};
-    if (!dib || !bits) return std::nullopt;
-
-    const auto old_bmp = wil::SelectObject(mem_dc.get(), dib.get());
-
-    const size_t pixel_count = static_cast<size_t>(vw) * static_cast<size_t>(vh);
-    const size_t byte_count = pixel_count * 4u;
-    // Zero-fill entire canvas (black RGB) so any blank space between monitors is solid black!
-    std::memset(bits, 0, byte_count);
-
-    // Blit each physical monitor strictly within its monitor rectangle so dead regions stay pure black.
+    std::vector<WgcMonitorRect> wgc_mons;
+    wgc_mons.reserve(monitors.size());
     for (const MonitorInfo& m : monitors) {
-        const int mw = m.rect.right - m.rect.left;
-        const int mh = m.rect.bottom - m.rect.top;
-        if (mw <= 0 || mh <= 0) continue;
-        const int dst_x = m.rect.left - vx;
-        const int dst_y = m.rect.top - vy;
-        BitBlt(mem_dc.get(), dst_x, dst_y, mw, mh, screen_dc.get(), m.rect.left, m.rect.top, SRCCOPY | CAPTUREBLT);
+        if (m.hmon) {
+            wgc_mons.push_back(WgcMonitorRect{.hmon = m.hmon, .rect = m.rect});
+        }
     }
+    if (wgc_mons.empty()) return std::nullopt;
 
-    if (include_cursor) {
-        draw_cursor_into_dc(mem_dc.get(), vx, vy);
-    }
-    GdiFlush();
+    const RECT bounds{.left = vx, .top = vy, .right = vx + vw, .bottom = vy + vh};
+    auto raster = wgc_capture_monitors_to_raster(wgc_mons, bounds, include_cursor, shared_d3d);
+    if (!raster) return std::nullopt;
 
     VirtualCapture out;
-    out.bounds = RECT{.left = vx, .top = vy, .right = vx + vw, .bottom = vy + vh};
+    out.bounds = bounds;
     out.monitors = std::move(monitors);
-    out.raster.w = static_cast<UINT>(vw);
-    out.raster.h = static_cast<UINT>(vh);
-    out.raster.pixels.resize(byte_count);
-    std::memcpy(out.raster.pixels.data(), bits, byte_count);
-
-    // Force opaque alpha = 255 across every pixel (GDI BitBlt leaves alpha = 0 on many windows).
-    auto* px32 = reinterpret_cast<uint32_t*>(out.raster.pixels.data());
-    for (size_t i = 0; i < pixel_count; ++i) {
-        px32[i] |= 0xFF000000u;
-    }
+    out.raster = std::move(*raster);
     return out;
 }
 

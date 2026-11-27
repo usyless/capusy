@@ -164,7 +164,7 @@ private:
             else register_hotkeys(false);
         };
         sh_.on_test_toast = [this] {
-            if (auto cap = capture_virtual_screen(false)) {
+            if (auto cap = capture_virtual_screen(false, sh_.gfx.d3d())) {
                 toast_win_->show_capture(L"", &cap->raster, cap->raster.w, cap->raster.h, false, false);
             }
         };
@@ -206,7 +206,7 @@ private:
     void trigger_full_screenshot() {
         // Immediate capture with zero rate limits! Every press snapshots right now and saves asynchronously.
         WindowInfo win_info = foreground_window_info();
-        auto cap = capture_virtual_screen(sh_.settings.capture_cursor);
+        auto cap = capture_virtual_screen(sh_.settings.capture_cursor, sh_.gfx.d3d());
         if (!cap) return;
         enqueue_save(std::move(cap->raster), CaptureMode::Full, std::move(win_info));
     }

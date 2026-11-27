@@ -101,7 +101,8 @@ struct RecordingResult {
 }
 
 /// Native Windows Media Foundation (MP4 H.264/HEVC + AAC, WMV9 + WMA) and WIC Animated GIF region screen recorder.
-/// Zero external binaries; captures video via persistent DIB section(s) and desktop/mic audio via WASAPI.
+/// Zero external binaries; captures video via Windows.Graphics.Capture + Direct3D 11 GPU pipeline (zero-copy DXGI NV12
+/// for hardware MP4 encoding, GPU-scaled staging readback for SW/WMV/GIF) and desktop/mic audio via WASAPI.
 class RegionRecorder {
 public:
     RegionRecorder() = default;
@@ -188,120 +189,15 @@ public:
     }
 
 private:
-    /// Persistent GDI capture surface with zero per-frame allocations and optional HALFTONE downscaling.
-    class CaptureSurface {
-    public:
-        bool init(uint32_t src_w, uint32_t src_h, uint32_t out_w, uint32_t out_h, std::string& err) {
-            src_w_ = src_w;
-            src_h_ = src_h;
-            out_w_ = out_w;
-            out_h_ = out_h;
-            scaled_ = (src_w_ != out_w_ || src_h_ != out_h_);
-
-            screen_dc_.reset(GetDC(nullptr));
-            out_dc_.reset(screen_dc_ ? CreateCompatibleDC(screen_dc_.get()) : nullptr);
-            if (!screen_dc_ || !out_dc_) {
-                err = "Failed to create capture DC";
-                return false;
-            }
-
-            BITMAPINFO out_bmi{};
-            out_bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-            out_bmi.bmiHeader.biWidth = static_cast<LONG>(out_w_);
-            out_bmi.bmiHeader.biHeight = -static_cast<LONG>(out_h_); // negative = top-down RGB32
-            out_bmi.bmiHeader.biPlanes = 1;
-            out_bmi.bmiHeader.biBitCount = 32;
-            out_bmi.bmiHeader.biCompression = BI_RGB;
-
-            out_dib_.reset(CreateDIBSection(out_dc_.get(), &out_bmi, DIB_RGB_COLORS, &out_bits_, nullptr, 0));
-            if (!out_dib_ || !out_bits_) {
-                err = "CreateDIBSection failed";
-                return false;
-            }
-            old_out_bmp_ = SelectObject(out_dc_.get(), out_dib_.get());
-
-            if (scaled_) {
-                src_dc_.reset(CreateCompatibleDC(screen_dc_.get()));
-                if (!src_dc_) {
-                    err = "Failed to create scaling source DC";
-                    return false;
-                }
-                BITMAPINFO src_bmi{};
-                src_bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-                src_bmi.bmiHeader.biWidth = static_cast<LONG>(src_w_);
-                src_bmi.bmiHeader.biHeight = -static_cast<LONG>(src_h_);
-                src_bmi.bmiHeader.biPlanes = 1;
-                src_bmi.bmiHeader.biBitCount = 32;
-                src_bmi.bmiHeader.biCompression = BI_RGB;
-
-                void* src_bits = nullptr;
-                src_dib_.reset(CreateDIBSection(src_dc_.get(), &src_bmi, DIB_RGB_COLORS, &src_bits, nullptr, 0));
-                if (!src_dib_ || !src_bits) {
-                    err = "CreateDIBSection (source) failed";
-                    return false;
-                }
-                old_src_bmp_ = SelectObject(src_dc_.get(), src_dib_.get());
-                SetStretchBltMode(out_dc_.get(), HALFTONE);
-                SetBrushOrgEx(out_dc_.get(), 0, 0, nullptr);
-            }
-            return true;
+    static std::vector<WgcMonitorRect> enumerate_wgc_monitors() {
+        auto mons = enumerate_monitors();
+        std::vector<WgcMonitorRect> out;
+        out.reserve(mons.size());
+        for (const MonitorInfo& m : mons) {
+            if (m.hmon) out.push_back(WgcMonitorRect{.hmon = m.hmon, .rect = m.rect});
         }
-
-        ~CaptureSurface() {
-            if (src_dc_ && old_src_bmp_) SelectObject(src_dc_.get(), old_src_bmp_);
-            if (out_dc_ && old_out_bmp_) SelectObject(out_dc_.get(), old_out_bmp_);
-        }
-
-        void grab(RECT region, bool include_cursor) noexcept {
-            if (!scaled_) {
-                BitBlt(out_dc_.get(), 0, 0, static_cast<int>(out_w_), static_cast<int>(out_h_),
-                       screen_dc_.get(), region.left, region.top, SRCCOPY | CAPTUREBLT);
-                if (include_cursor) {
-                    draw_cursor_into_dc(out_dc_.get(), region.left, region.top);
-                }
-            } else {
-                BitBlt(src_dc_.get(), 0, 0, static_cast<int>(src_w_), static_cast<int>(src_h_),
-                       screen_dc_.get(), region.left, region.top, SRCCOPY | CAPTUREBLT);
-                if (include_cursor) {
-                    draw_cursor_into_dc(src_dc_.get(), region.left, region.top);
-                }
-                StretchBlt(out_dc_.get(), 0, 0, static_cast<int>(out_w_), static_cast<int>(out_h_),
-                           src_dc_.get(), 0, 0, static_cast<int>(src_w_), static_cast<int>(src_h_), SRCCOPY);
-            }
-            GdiFlush();
-        }
-
-        [[nodiscard]] const void* bits() const noexcept { return out_bits_; }
-        [[nodiscard]] DWORD frame_bytes() const noexcept { return out_w_ * out_h_ * 4u; }
-
-        [[nodiscard]] ui::Raster copy_first_frame() const {
-            ui::Raster thumb;
-            thumb.w = out_w_;
-            thumb.h = out_h_;
-            const DWORD bytes = frame_bytes();
-            thumb.pixels.resize(bytes);
-            std::memcpy(thumb.pixels.data(), out_bits_, bytes);
-            const size_t pixel_count = static_cast<size_t>(out_w_) * out_h_;
-            auto* px32 = reinterpret_cast<uint32_t*>(thumb.pixels.data());
-            for (size_t i = 0; i < pixel_count; ++i) px32[i] |= 0xFF000000u;
-            return thumb;
-        }
-
-    private:
-        uint32_t src_w_ = 0;
-        uint32_t src_h_ = 0;
-        uint32_t out_w_ = 0;
-        uint32_t out_h_ = 0;
-        bool scaled_ = false;
-        wil::unique_hdc_window screen_dc_;
-        wil::unique_hdc src_dc_;
-        wil::unique_hbitmap src_dib_;
-        HGDIOBJ old_src_bmp_ = nullptr;
-        wil::unique_hdc out_dc_;
-        wil::unique_hbitmap out_dib_;
-        HGDIOBJ old_out_bmp_ = nullptr;
-        void* out_bits_ = nullptr;
-    };
+        return out;
+    }
 
     static UINT32 to_mf_h264_profile(H264Profile p) noexcept {
         switch (p) {
@@ -343,7 +239,7 @@ private:
     }
 
     static bool configure_video_stream(IMFSinkWriter* writer, uint32_t w, uint32_t h, uint32_t fps,
-                                       const RecordingConfig& cfg, VideoCodec effective_codec,
+                                       const RecordingConfig& cfg, VideoCodec effective_codec, bool use_nv12_dxgi,
                                        DWORD& out_stream_idx, std::string& err) {
         const uint32_t target_bitrate = (cfg.rate_control == RateControlMode::Quality)
             ? estimate_quality_hint_bitrate_bps(cfg.quality, cfg.bitrate_mbps)
@@ -365,6 +261,12 @@ private:
         }
         out_type->SetUINT32(MF_MT_AVG_BITRATE, target_bitrate);
         out_type->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
+        if (use_nv12_dxgi) {
+            out_type->SetUINT32(MF_MT_YUV_MATRIX, MFVideoTransferMatrix_BT709);
+            out_type->SetUINT32(MF_MT_VIDEO_NOMINAL_RANGE, MFNominalRange_16_235);
+            out_type->SetUINT32(MF_MT_VIDEO_PRIMARIES, MFVideoPrimaries_BT709);
+            out_type->SetUINT32(MF_MT_TRANSFER_FUNCTION, MFVideoTransFunc_709);
+        }
         MFSetAttributeSize(out_type.get(), MF_MT_FRAME_SIZE, w, h);
         MFSetAttributeRatio(out_type.get(), MF_MT_FRAME_RATE, fps, 1);
         MFSetAttributeRatio(out_type.get(), MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
@@ -376,16 +278,25 @@ private:
             return false;
         }
 
-        // Input stream: top-down 32bpp RGB32 (positive MF_MT_DEFAULT_STRIDE = top-down, universally accepted by HW & SW MFTs)
+        // Input stream: GPU NV12 surface (zero-copy HW path) or top-down 32bpp RGB32 (SW / WMV fallback).
         wil::com_ptr<IMFMediaType> in_type;
         if (FAILED(MFCreateMediaType(&in_type)) || !in_type) {
             err = "MFCreateMediaType (video input) failed";
             return false;
         }
         in_type->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
-        in_type->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_RGB32);
+        if (use_nv12_dxgi) {
+            in_type->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_NV12);
+            in_type->SetUINT32(MF_MT_DEFAULT_STRIDE, w);
+            in_type->SetUINT32(MF_MT_YUV_MATRIX, MFVideoTransferMatrix_BT709);
+            in_type->SetUINT32(MF_MT_VIDEO_NOMINAL_RANGE, MFNominalRange_16_235);
+            in_type->SetUINT32(MF_MT_VIDEO_PRIMARIES, MFVideoPrimaries_BT709);
+            in_type->SetUINT32(MF_MT_TRANSFER_FUNCTION, MFVideoTransFunc_709);
+        } else {
+            in_type->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_RGB32);
+            in_type->SetUINT32(MF_MT_DEFAULT_STRIDE, w * 4u);
+        }
         in_type->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
-        in_type->SetUINT32(MF_MT_DEFAULT_STRIDE, w * 4u);
         MFSetAttributeSize(in_type.get(), MF_MT_FRAME_SIZE, w, h);
         MFSetAttributeRatio(in_type.get(), MF_MT_FRAME_RATE, fps, 1);
         MFSetAttributeRatio(in_type.get(), MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
@@ -404,7 +315,7 @@ private:
         if (FAILED(writer->SetInputMediaType(out_stream_idx, in_type.get(), enc_params.get()))) {
             // Some hardware or WMV MFTs reject CodecAPI attributes during SetInputMediaType; retry cleanly and apply best-effort.
             if (FAILED(writer->SetInputMediaType(out_stream_idx, in_type.get(), nullptr))) {
-                err = "Failed to configure RGB32 input media type";
+                err = use_nv12_dxgi ? "Failed to configure NV12 DXGI input media type" : "Failed to configure RGB32 input media type";
                 return false;
             }
             apply_codec_api_best_effort(writer, out_stream_idx, cfg, fps, target_bitrate);
@@ -558,7 +469,11 @@ private:
 
         const uint32_t fps = cfg.fps;
 
-        const ulp::win::COMWrapper<false> com{static_cast<DWORD>(COINIT_MULTITHREADED)};
+        const wgc_detail::RoScope ro{RO_INIT_MULTITHREADED};
+        if (!ro.ok()) {
+            res.error = "WinRT initialization failed";
+            return res;
+        }
         if (FAILED(MFStartup(MF_VERSION))) {
             res.error = "MFStartup failed";
             return res;
@@ -567,6 +482,26 @@ private:
 
         std::error_code ec;
         if (output_path.has_parent_path()) fs::create_directories(output_path.parent_path(), ec);
+
+        // Initialize Windows.Graphics.Capture + D3D11 device up front so HW MF can share the device via IMFDXGIDeviceManager.
+        WgcRegionSurface surface;
+        const auto wgc_mons = enumerate_wgc_monitors();
+        if (!surface.init(region, wgc_mons, src_w, src_h, w, h, cfg.include_cursor, fps, res.error)) {
+            return res;
+        }
+
+        wil::com_ptr<IMFDXGIDeviceManager> dxgi_mgr;
+        bool dxgi_nv12_ready = false;
+        if (cfg.hw_accel && cfg.format == RecordFormat::Mp4 && surface.d3d_device()) {
+            UINT reset_token = 0;
+            if (SUCCEEDED(MFCreateDXGIDeviceManager(&reset_token, &dxgi_mgr)) && dxgi_mgr &&
+                SUCCEEDED(dxgi_mgr->ResetDevice(surface.d3d_device(), reset_token)) &&
+                surface.init_nv12_pipeline()) {
+                dxgi_nv12_ready = true;
+            } else {
+                dxgi_mgr.reset();
+            }
+        }
 
         // Initialize requested WASAPI audio capture streams before creating the sink writer.
         WasapiCaptureStream desktop_cap;
@@ -580,16 +515,21 @@ private:
         DWORD audio_stream_idx = 0;
         uint32_t actual_audio_sr = cfg.audio_sample_rate;
         uint32_t actual_audio_ch = cfg.audio_channels;
+        bool using_dxgi_nv12 = false;
 
-        auto try_init_writer = [&](VideoCodec eff_codec, bool use_hw, bool with_audio) -> bool {
+        auto try_init_writer = [&](VideoCodec eff_codec, bool use_hw, bool use_dxgi_nv12, bool with_audio) -> bool {
             writer.reset();
+            using_dxgi_nv12 = false;
             wil::com_ptr<IMFAttributes> attrs;
-            if (FAILED(MFCreateAttributes(&attrs, 3)) || !attrs) {
+            if (FAILED(MFCreateAttributes(&attrs, 4)) || !attrs) {
                 res.error = "MFCreateAttributes failed";
                 return false;
             }
             attrs->SetUINT32(MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, use_hw ? TRUE : FALSE);
             attrs->SetUINT32(MF_SINK_WRITER_DISABLE_THROTTLING, TRUE);
+            if (use_dxgi_nv12 && dxgi_mgr) {
+                attrs->SetUnknown(MF_SINK_WRITER_D3D_MANAGER, dxgi_mgr.get());
+            }
             if (cfg.format == RecordFormat::Wmv) {
                 attrs->SetGUID(MF_TRANSCODE_CONTAINERTYPE, MFTranscodeContainerType_ASF);
             } else {
@@ -603,21 +543,24 @@ private:
                     : "Failed to create Media Foundation MP4 sink writer";
                 return false;
             }
-            if (!configure_video_stream(writer.get(), w, h, fps, cfg, eff_codec, video_stream_idx, res.error)) {
+            if (!configure_video_stream(writer.get(), w, h, fps, cfg, eff_codec, use_dxgi_nv12, video_stream_idx, res.error)) {
                 return false;
             }
             if (with_audio && !configure_audio_stream(writer.get(), cfg, audio_stream_idx, actual_audio_sr, actual_audio_ch)) {
                 return false;
             }
+            using_dxgi_nv12 = use_dxgi_nv12;
             return true;
         };
 
         auto init_with_fallbacks = [&](bool with_audio) -> bool {
-            if (try_init_writer(cfg.codec, cfg.hw_accel, with_audio)) return true;
-            if (cfg.hw_accel && try_init_writer(cfg.codec, false, with_audio)) return true;
+            if (dxgi_nv12_ready && try_init_writer(cfg.codec, true, true, with_audio)) return true;
+            if (try_init_writer(cfg.codec, cfg.hw_accel, false, with_audio)) return true;
+            if (cfg.hw_accel && try_init_writer(cfg.codec, false, false, with_audio)) return true;
             if (cfg.format == RecordFormat::Mp4 && cfg.codec == VideoCodec::Hevc) {
-                if (try_init_writer(VideoCodec::H264, cfg.hw_accel, with_audio)) return true;
-                if (cfg.hw_accel && try_init_writer(VideoCodec::H264, false, with_audio)) return true;
+                if (dxgi_nv12_ready && try_init_writer(VideoCodec::H264, true, true, with_audio)) return true;
+                if (try_init_writer(VideoCodec::H264, cfg.hw_accel, false, with_audio)) return true;
+                if (cfg.hw_accel && try_init_writer(VideoCodec::H264, false, false, with_audio)) return true;
             }
             return false;
         };
@@ -637,6 +580,10 @@ private:
             if (!init_with_fallbacks(false)) return res;
         }
 
+        if (!using_dxgi_nv12 && !surface.init_cpu_pipeline(res.error)) {
+            return res;
+        }
+
         if (has_audio && actual_audio_sr != cfg.audio_sample_rate) {
             if (desktop_ok) desktop_cap.retarget_sample_rate(actual_audio_sr);
             if (mic_ok) mic_cap.retarget_sample_rate(actual_audio_sr);
@@ -650,10 +597,8 @@ private:
             return res;
         }
 
-        CaptureSurface surface;
-        if (!surface.init(src_w, src_h, w, h, res.error)) {
-            return res;
-        }
+        // Wait for the initial WGC frame from each intersecting monitor before starting clocks & audio so frame 0 isn't black.
+        surface.wait_initial_frames(stop_requested_, 600u);
 
         if (desktop_ok && !desktop_cap.start()) desktop_ok = false;
         if (mic_ok && !mic_cap.start()) mic_ok = false;
@@ -766,30 +711,58 @@ private:
             const auto now = std::chrono::steady_clock::now();
             const LONGLONG ts_100ns = std::chrono::duration_cast<std::chrono::nanoseconds>(now - t0).count() / 100ll;
 
-            surface.grab(region, cfg.include_cursor);
-            if (!res.first_frame) {
-                res.first_frame = surface.copy_first_frame();
-            }
+            surface.update_from_monitors();
 
             wil::com_ptr<IMFMediaBuffer> buf;
             wil::com_ptr<IMFSample> sample;
-            if (SUCCEEDED(MFCreateMemoryBuffer(frame_bytes, &buf)) && buf &&
-                SUCCEEDED(MFCreateSample(&sample)) && sample) {
-                BYTE* dst_ptr = nullptr;
-                if (SUCCEEDED(buf->Lock(&dst_ptr, nullptr, nullptr)) && dst_ptr) {
-                    std::memcpy(dst_ptr, surface.bits(), frame_bytes);
-                    buf->Unlock();
-                    buf->SetCurrentLength(frame_bytes);
-                    sample->AddBuffer(buf.get());
-                    sample->SetSampleTime(ts_100ns);
-                    sample->SetSampleDuration(frame_dur_100ns);
-                    HRESULT wr_hr = E_FAIL;
-                    {
-                        const std::scoped_lock lk{writer_mx};
-                        wr_hr = writer->WriteSample(video_stream_idx, sample.get());
+
+            if (using_dxgi_nv12) {
+                if (!res.first_frame) {
+                    res.first_frame = surface.copy_first_frame();
+                }
+                if (auto nv12_tex = surface.render_nv12_frame()) {
+                    if (SUCCEEDED(MFCreateDXGISurfaceBuffer(__uuidof(ID3D11Texture2D), nv12_tex.get(), 0, FALSE, &buf)) && buf &&
+                        SUCCEEDED(MFCreateSample(&sample)) && sample) {
+                        DWORD contig_len = (w * h * 3u) / 2u;
+                        if (const auto buf2d = buf.try_query<IMF2DBuffer>()) {
+                            (void)buf2d->GetContiguousLength(&contig_len);
+                        }
+                        buf->SetCurrentLength(contig_len);
+                        sample->AddBuffer(buf.get());
+                        sample->SetSampleTime(ts_100ns);
+                        sample->SetSampleDuration(frame_dur_100ns);
+                        HRESULT wr_hr = E_FAIL;
+                        {
+                            const std::scoped_lock lk{writer_mx};
+                            wr_hr = writer->WriteSample(video_stream_idx, sample.get());
+                        }
+                        if (SUCCEEDED(wr_hr)) {
+                            ++frames_written;
+                        }
                     }
-                    if (SUCCEEDED(wr_hr)) {
-                        ++frames_written;
+                }
+            } else if (surface.readback_cpu_bgra()) {
+                if (!res.first_frame) {
+                    res.first_frame = surface.copy_first_frame();
+                }
+                if (SUCCEEDED(MFCreateMemoryBuffer(frame_bytes, &buf)) && buf &&
+                    SUCCEEDED(MFCreateSample(&sample)) && sample) {
+                    BYTE* dst_ptr = nullptr;
+                    if (SUCCEEDED(buf->Lock(&dst_ptr, nullptr, nullptr)) && dst_ptr) {
+                        std::memcpy(dst_ptr, surface.cpu_bits(), frame_bytes);
+                        buf->Unlock();
+                        buf->SetCurrentLength(frame_bytes);
+                        sample->AddBuffer(buf.get());
+                        sample->SetSampleTime(ts_100ns);
+                        sample->SetSampleDuration(frame_dur_100ns);
+                        HRESULT wr_hr = E_FAIL;
+                        {
+                            const std::scoped_lock lk{writer_mx};
+                            wr_hr = writer->WriteSample(video_stream_idx, sample.get());
+                        }
+                        if (SUCCEEDED(wr_hr)) {
+                            ++frames_written;
+                        }
                     }
                 }
             }
@@ -833,7 +806,11 @@ private:
         res.height = h;
 
         const uint32_t fps = cfg.fps;
-        const ulp::win::COMWrapper<false> com{static_cast<DWORD>(COINIT_MULTITHREADED)};
+        const wgc_detail::RoScope ro{RO_INIT_MULTITHREADED};
+        if (!ro.ok()) {
+            res.error = "WinRT initialization failed for GIF recording";
+            return res;
+        }
 
         std::error_code ec;
         if (output_path.has_parent_path()) fs::create_directories(output_path.parent_path(), ec);
@@ -877,10 +854,13 @@ private:
             (void)global_meta->SetMetadataByName(L"/appext/data", &pv_data);
         }
 
-        CaptureSurface surface;
-        if (!surface.init(src_w, src_h, w, h, res.error)) {
+        WgcRegionSurface surface;
+        const auto wgc_mons = enumerate_wgc_monitors();
+        if (!surface.init(region, wgc_mons, src_w, src_h, w, h, cfg.include_cursor, fps, res.error) ||
+            !surface.init_cpu_pipeline(res.error)) {
             return res;
         }
+        surface.wait_initial_frames(stop_requested_, 600u);
 
         const auto t0 = std::chrono::steady_clock::now();
         const auto frame_period = std::chrono::microseconds{1'000'000 / fps};
@@ -895,7 +875,14 @@ private:
 
         while (!stop_requested_.load(std::memory_order_acquire)) {
             const auto cap_time = std::chrono::steady_clock::now();
-            surface.grab(region, cfg.include_cursor);
+            surface.update_from_monitors();
+            if (!surface.readback_cpu_bgra()) {
+                next_tick += frame_period;
+                const auto after = std::chrono::steady_clock::now();
+                if (next_tick > after) std::this_thread::sleep_until(next_tick);
+                else next_tick = after;
+                continue;
+            }
             if (!res.first_frame) {
                 res.first_frame = surface.copy_first_frame();
             }
@@ -912,7 +899,7 @@ private:
             wil::com_ptr<IWICBitmap> src_bmp;
             if (SUCCEEDED(wic->CreateBitmapFromMemory(
                     w, h, GUID_WICPixelFormat32bppBGR, stride, frame_bytes,
-                    const_cast<BYTE*>(reinterpret_cast<const BYTE*>(surface.bits())), &src_bmp)) && src_bmp) {
+                    const_cast<BYTE*>(reinterpret_cast<const BYTE*>(surface.cpu_bits())), &src_bmp)) && src_bmp) {
                 wil::com_ptr<IWICPalette> palette;
                 wil::com_ptr<IWICFormatConverter> conv;
                 wil::com_ptr<IWICBitmapFrameEncode> frame;

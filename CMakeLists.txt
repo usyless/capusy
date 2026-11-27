@@ -204,5 +204,6 @@ target_link_libraries(capusy PRIVATE
     capusy_sqlite3
     d2d1 dwrite d3d11 dxgi dxguid dcomp dwmapi windowscodecs
     mfplat mfreadwrite mfuuid mf
+    runtimeobject
     shell32 shlwapi shcore ole32 oleaut32 user32 gdi32 imm32 uxtheme comdlg32 propsys winhttp bcrypt
 )
