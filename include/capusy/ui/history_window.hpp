@@ -77,6 +77,7 @@ public:
 
     void show() {
         if (!hwnd_) return;
+        KillTimer(hwnd_, TIMER_RELEASE_TARGET);
         if (!sh_.gfx.ensure_device(hwnd_)) return;
         if (!target_.ready() && !target_.attach(sh_.gfx, hwnd_)) {
             if (sh_.on_visibility_changed) sh_.on_visibility_changed();
@@ -111,9 +112,12 @@ public:
 
     void hide() {
         if (!hwnd_ || dragging_out_) return;
-        // Hide the window first so closing is visually instantaneous even while media or caches tear down.
-        cloak_window(hwnd_, true);
-        ShowWindow(hwnd_, SW_HIDE);
+        // Hide via SW_HIDE without cloaking so Windows plays its native DWM close animation,
+        // and defer releasing the DComp swapchain until after the animation finishes.
+        const bool was_visible = visible();
+        if (was_visible) {
+            ShowWindow(hwnd_, SW_HIDE);
+        }
         KillTimer(hwnd_, TIMER_VIDEO);
         if (async_drops_.empty()) KillTimer(hwnd_, TIMER_DROP);
         KillTimer(hwnd_, TIMER_CARET);
@@ -144,7 +148,12 @@ public:
         focused_row_.reset();
         total_count_ = 0;
         unfiltered_count_ = 0;
-        target_.release();
+        if (was_visible) {
+            SetTimer(hwnd_, TIMER_RELEASE_TARGET, 400, nullptr);
+        } else {
+            KillTimer(hwnd_, TIMER_RELEASE_TARGET);
+            target_.release();
+        }
         dragging_scroll_ = false;
         in_sizemove_ = false;
         minimized_ = false;
@@ -252,6 +261,7 @@ private:
     static constexpr UINT_PTR TIMER_CARET = 4;
     static constexpr UINT_PTR TIMER_TOOLTIP = 5;
     static constexpr UINT_PTR TIMER_SEARCH = 6;
+    static constexpr UINT_PTR TIMER_RELEASE_TARGET = 7;
 
     struct RowCache {
         std::wstring wpath;
@@ -2143,6 +2153,11 @@ private:
                     if (tooltip_.on_timer(hwnd_, TIMER_TOOLTIP, ok, std::move(tip_title), std::move(tip_sub), true)) {
                         start_anim();
                     }
+                } else if (wp == TIMER_RELEASE_TARGET) {
+                    KillTimer(hwnd, TIMER_RELEASE_TARGET);
+                    if (!visible()) {
+                        target_.release();
+                    }
                 }
                 return 0;
             case WM_MOUSEWHEEL: {
@@ -2178,6 +2193,7 @@ private:
                 KillTimer(hwnd, TIMER_CARET);
                 KillTimer(hwnd, TIMER_TOOLTIP);
                 KillTimer(hwnd, TIMER_SEARCH);
+                KillTimer(hwnd, TIMER_RELEASE_TARGET);
                 return 0;
             case WM_KEYDOWN: dismiss_tooltip(); on_key_down(static_cast<UINT>(wp)); return 0;
             case WM_CHAR: on_char(static_cast<wchar_t>(wp)); return 0;

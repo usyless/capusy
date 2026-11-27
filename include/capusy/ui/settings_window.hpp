@@ -95,6 +95,7 @@ public:
 
     void show(int tab = -1) {
         if (!hwnd_) return;
+        KillTimer(hwnd_, TIMER_RELEASE_TARGET);
         if (tab >= 0) {
             tab_ = std::clamp(tab, 0, TAB_COUNT - 1);
             tab_anim_.snap(static_cast<float>(tab_));
@@ -130,8 +131,12 @@ public:
 
     void hide() {
         if (!hwnd_) return;
-        cloak_window(hwnd_, true);
-        ShowWindow(hwnd_, SW_HIDE);
+        // Hide via SW_HIDE without cloaking so Windows plays its native DWM close animation,
+        // and defer releasing the DComp swapchain until after the animation finishes.
+        const bool was_visible = visible();
+        if (was_visible) {
+            ShowWindow(hwnd_, SW_HIDE);
+        }
         stop_recording_hotkey();
         tooltip_.clear(hwnd_, TIMER_TOOLTIP, false);
         last_tooltip_dirty_.reset();
@@ -157,8 +162,13 @@ public:
         pending_dirty_.shrink_to_fit();
         dirty_dips_scratch_.clear();
         dirty_dips_scratch_.shrink_to_fit();
-        app_icon_.reset();
-        target_.release();
+        if (was_visible) {
+            SetTimer(hwnd_, TIMER_RELEASE_TARGET, 400, nullptr);
+        } else {
+            KillTimer(hwnd_, TIMER_RELEASE_TARGET);
+            app_icon_.reset();
+            target_.release();
+        }
         if (sh_.on_visibility_changed) sh_.on_visibility_changed();
     }
 
@@ -211,6 +221,7 @@ private:
     static constexpr float CARD_GAP = 14.0f;
     static constexpr UINT WM_APP_RECORDED_KEY = WM_APP + 30;
     static constexpr UINT_PTR TIMER_TOOLTIP = 1;
+    static constexpr UINT_PTR TIMER_RELEASE_TARGET = 2;
 
     enum HitId : uint8_t {
         IdNone = 0,
@@ -2878,6 +2889,12 @@ private:
                     if (tooltip_.on_timer(hwnd_, TIMER_TOOLTIP, ok, std::move(tip_title), std::move(tip_sub), true)) {
                         start_anim();
                     }
+                } else if (wp == TIMER_RELEASE_TARGET) {
+                    KillTimer(hwnd, TIMER_RELEASE_TARGET);
+                    if (!visible()) {
+                        app_icon_.reset();
+                        target_.release();
+                    }
                 }
                 return 0;
             case WM_ACTIVATE:
@@ -2894,6 +2911,7 @@ private:
                 break;
             case WM_DESTROY:
                 KillTimer(hwnd, TIMER_TOOLTIP);
+                KillTimer(hwnd, TIMER_RELEASE_TARGET);
                 return 0;
             case WM_APP_RECORDED_KEY:
                 if (recording_action_) {
