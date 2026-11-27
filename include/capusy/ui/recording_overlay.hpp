@@ -49,7 +49,8 @@ public:
 
         if (!sh_.gfx.ensure_device(nullptr)) return false;
 
-        // 1. Click-through border window wrapping the recorded region by 3px
+        // 1. Click-through border window wrapping the recorded region by 3px.
+        // WS_EX_LAYERED | WS_EX_TRANSPARENT is required for true cross-process mouse click-through.
         constexpr int pad = 3;
         const int bx = region.left - pad;
         const int by = region.top - pad;
@@ -57,10 +58,11 @@ public:
         const int bh = (region.bottom - region.top) + (pad * 2);
 
         border_hwnd_ = CreateWindowExW(
-            WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT | WS_EX_NOREDIRECTIONBITMAP,
+            WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOREDIRECTIONBITMAP,
             REC_BORDER_CLASS, L"capusy rec border", WS_POPUP,
             bx, by, bw, bh, nullptr, nullptr, inst, this);
         if (border_hwnd_) {
+            SetLayeredWindowAttributes(border_hwnd_, 0, 255, LWA_ALPHA);
             exclude_window_from_capture(border_hwnd_, true);
             if (border_target_.attach(sh_.gfx, border_hwnd_)) {
                 render_border();
