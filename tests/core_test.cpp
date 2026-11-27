@@ -6,6 +6,7 @@
 #include <capusy/history_store.hpp>
 #include <capusy/hotkeys.hpp>
 #include <capusy/recording_logic.hpp>
+#include <capusy/sharex_import.hpp>
 #include <capusy/startup_logic.hpp>
 #include <capusy/update_logic.hpp>
 #include <capusy/ui/anim.hpp>
@@ -628,6 +629,209 @@ static void test_color_logic() {
     CHECK(!sample_bgra_pixel(bgra, 2, 2, 0, 2).has_value());
 }
 
+static void test_sharex_import() {
+    using namespace capusy;
+
+    // 1. ISO-8601 / .NET round-trip DateTime parsing
+    // 2019-04-06T19:24:02+01:00 == 2019-04-06T18:24:02Z == 1554575042
+    CHECK(parse_sharex_datetime_unix("2019-04-06T19:24:02.3725698+01:00") == 1554575042ll);
+    CHECK(parse_sharex_datetime_unix("2019-04-06T18:24:02Z") == 1554575042ll);
+    CHECK(parse_sharex_datetime_unix("2019-04-06T13:24:02-05:00") == 1554575042ll);
+    CHECK(parse_sharex_datetime_unix("2019-04-06T23:54:02+05:30") == 1554575042ll);
+    CHECK(parse_sharex_datetime_unix("2024-02-29T00:00:00Z") == 1709164800ll); // leap day
+    CHECK(parse_sharex_datetime_unix("2026-11-26T23:30:24.2328513+00:00") == 1795735824ll);
+    CHECK(!parse_sharex_datetime_unix("2023-02-29T00:00:00Z").has_value()); // non-leap year
+    CHECK(!parse_sharex_datetime_unix("not-a-date").has_value());
+    CHECK(!parse_sharex_datetime_unix("").has_value());
+
+    // 2. Media classification (ShareX records MP4 videos with Type="File")
+    const auto png = classify_sharex_media("C:\\ShareX\\shot.PNG", "Image");
+    CHECK(png.has_value() && png->kind == CaptureKind::Image && png->format.view() == "PNG");
+    const auto jpg = classify_sharex_media("C:\\ShareX\\photo.jpg", "Image");
+    CHECK(jpg.has_value() && jpg->kind == CaptureKind::Image && jpg->format.view() == "JPEG");
+    const auto gif = classify_sharex_media("C:\\ShareX\\anim.gif", "Image");
+    CHECK(gif.has_value() && gif->kind == CaptureKind::Image && gif->format.view() == "GIF");
+    const auto mp4 = classify_sharex_media("C:\\ShareX\\clip.mp4", "File");
+    CHECK(mp4.has_value() && mp4->kind == CaptureKind::Video && mp4->mode == CaptureMode::Recording && mp4->format.view() == "MP4");
+    const auto webm = classify_sharex_media("C:\\ShareX\\rec.webm", "File");
+    CHECK(webm.has_value() && webm->kind == CaptureKind::Video && webm->format.view() == "WEBM");
+    CHECK(!classify_sharex_media("C:\\ShareX\\notes.txt", "Text").has_value());
+    CHECK(!classify_sharex_media("C:\\ShareX\\archive.zip", "File").has_value());
+    CHECK(!classify_sharex_media("", "URL").has_value());
+
+    // 3. Legacy JSON normalization (UTF-8 BOM, unwrapped objects, trailing comma, already-wrapped array)
+    CHECK(normalize_sharex_json_array("\xEF\xBB\xBF{\"FileName\":\"a.png\"},\r\n{\"FileName\":\"b.png\"},\r\n") ==
+          "[{\"FileName\":\"a.png\"},\r\n{\"FileName\":\"b.png\"}]");
+    CHECK(normalize_sharex_json_array("  [{\"FileName\":\"a.png\"}]  ") == "[{\"FileName\":\"a.png\"}]");
+    CHECK(normalize_sharex_json_array("   ") == "[]");
+
+    // 4. End-to-end SQLite History.db + legacy JSON import tests
+    const fs::path base = fs::temp_directory_path() / L"capusy_test_sharex";
+    std::error_code ec;
+    fs::remove_all(base, ec);
+    fs::create_directories(base, ec);
+
+    const fs::path target_db = base / L"capusy_history.db";
+    const fs::path sx_db_path = base / L"History.db";
+    const fs::path sx_json_path = base / L"History-2024-10-W42.json";
+    const fs::path bad_json_path = base / L"ApplicationConfig.json";
+    const fs::path bad_db_path = base / L"NotShareX.db";
+    const fs::path existing_img = base / L"existing_shot.png";
+
+    {
+        std::ofstream f(existing_img, std::ios::binary);
+        f << "PNGDATA12345"; // 12 bytes
+    }
+
+    // Build a realistic ShareX History.db
+    sqlite3* sx = nullptr;
+    const auto sx_u8 = sx_db_path.u8string();
+    const std::string sx_utf8{reinterpret_cast<const char*>(sx_u8.data()), sx_u8.size()};
+    CHECK(sqlite3_open(sx_utf8.c_str(), &sx) == SQLITE_OK);
+    const auto existing_u8 = existing_img.u8string();
+    const std::string existing_utf8{reinterpret_cast<const char*>(existing_u8.data()), existing_u8.size()};
+    const std::string setup_sql =
+        "CREATE TABLE History ("
+        "Id INTEGER PRIMARY KEY AUTOINCREMENT, FileName TEXT, FilePath TEXT, DateTime TEXT, "
+        "Type TEXT, Host TEXT, URL TEXT, ThumbnailURL TEXT, DeletionURL TEXT, ShortenedURL TEXT, Tags TEXT);"
+        "INSERT INTO History(FileName, FilePath, DateTime, Type, Host, Tags) VALUES("
+        "'existing_shot.png', '" + existing_utf8 + "', '2024-09-27T19:44:18.0840469+01:00', 'Image', '', "
+        "'{\"WindowTitle\":\"Roblox\",\"ProcessName\":\"RobloxPlayerBeta\",\"Favorite\":null,\"Tag\":\"game\"}');"
+        "INSERT INTO History(FileName, FilePath, DateTime, Type, Host, Tags) VALUES("
+        "'clip.mp4', 'C:\\ShareX\\2021-06\\clip.mp4', '2021-06-03T10:47:59.4971679+01:00', 'File', '', NULL);"
+        "INSERT INTO History(FileName, FilePath, DateTime, Type, Host, Tags) VALUES("
+        "'paste.txt', 'C:\\ShareX\\paste.txt', '2024-01-01T00:00:00Z', 'Text', '', '{}');"
+        "INSERT INTO History(FileName, FilePath, DateTime, Type, Host, Tags) VALUES("
+        "'', '', '2024-01-02T00:00:00Z', 'URL', 'tinyurl', NULL);";
+    CHECK(sqlite3_exec(sx, setup_sql.c_str(), nullptr, nullptr, nullptr) == SQLITE_OK);
+    sqlite3_close(sx);
+
+    CHECK(detect_sharex_history_format(sx_db_path) == ShareXHistoryFormat::Sqlite);
+
+    HistoryStore store;
+    std::string err;
+    CHECK(store.open(target_db, &err));
+
+    // Pre-insert a capusy-native entry for clip.mp4 to verify existing metadata is preserved on import
+    CaptureEntry pre{
+        .path = "C:\\ShareX\\2021-06\\clip.mp4",
+        .kind = CaptureKind::Video,
+        .mode = CaptureMode::Recording,
+        .created_at = 9999,
+        .width = 1920,
+        .height = 1080,
+        .size_bytes = 42000,
+        .duration_ms = 7500,
+        .window_title = "Existing Native Title",
+        .process_name = "obs64.exe",
+        .format = "MP4",
+    };
+    CHECK(store.insert(pre, &err));
+
+    ShareXImportResult r1{};
+    CHECK(import_sharex_history(sx_db_path, store, {.only_existing_files = false}, r1, &err));
+    CHECK(r1.format == ShareXHistoryFormat::Sqlite);
+    CHECK(r1.total_seen == 4);
+    CHECK(r1.imported == 1 && r1.imported_images == 1 && r1.imported_videos == 0);
+    CHECK(r1.duplicates_skipped == 1);
+    CHECK(r1.non_media_skipped == 2);
+    CHECK(r1.missing_skipped == 0);
+
+    const auto rows1 = store.list_recent(20);
+    CHECK(rows1.has_value() && rows1->size() == 2);
+    CHECK((*rows1)[0].path == existing_utf8);
+    CHECK((*rows1)[0].window_title == "Roblox");
+    CHECK((*rows1)[0].process_name == "RobloxPlayerBeta");
+    CHECK((*rows1)[0].format == "PNG");
+    CHECK((*rows1)[0].created_at == 1727462658ll);
+    // Pre-existing native entry must remain untouched
+    CHECK((*rows1)[1].path == "C:\\ShareX\\2021-06\\clip.mp4");
+    CHECK((*rows1)[1].width == 1920 && (*rows1)[1].window_title == "Existing Native Title");
+
+    // Legacy ShareX JSON format (unwrapped comma-separated objects, UTF-8 BOM, Unicode emoji, trailing comma)
+    {
+        std::ofstream jf(sx_json_path, std::ios::binary);
+        jf << "\xEF\xBB\xBF"
+           << "{\r\n"
+           << "  \"FileName\": \"existing_shot.png\",\r\n"
+           << "  \"FilePath\": \"C:\\\\ShareX\\\\2024-09\\\\missing_shot.jpg\",\r\n"
+           << "  \"DateTime\": \"2024-09-28T03:40:44.641986+01:00\",\r\n"
+           << "  \"Type\": \"Image\",\r\n"
+           << "  \"Host\": \"\",\r\n"
+           << "  \"Tags\": {\r\n"
+           << "    \"WindowTitle\": \"🦄 (ponycule) - Discord\",\r\n"
+           << "    \"ProcessName\": \"Discord\"\r\n"
+           << "  }\r\n"
+           << "},\r\n"
+           << "{\r\n"
+           << "  \"FileName\": \"rec.mp4\",\r\n"
+           << "  \"FilePath\": \"C:\\\\ShareX\\\\2024-10\\\\rec.mp4\",\r\n"
+           << "  \"DateTime\": \"2024-10-14T00:37:42.3896453+01:00\",\r\n"
+           << "  \"Type\": \"File\",\r\n"
+           << "  \"Host\": \"\"\r\n"
+           << "},\r\n";
+    }
+    CHECK(detect_sharex_history_format(sx_json_path) == ShareXHistoryFormat::Json);
+
+    ShareXImportResult r2{};
+    CHECK(import_sharex_history(sx_json_path, store, {.only_existing_files = false}, r2, &err));
+    CHECK(r2.format == ShareXHistoryFormat::Json);
+    CHECK(r2.imported == 2 && r2.imported_images == 1 && r2.imported_videos == 1);
+    CHECK(r2.duplicates_skipped == 0);
+
+    const auto rows2 = store.list_recent(20);
+    CHECK(rows2.has_value() && rows2->size() == 4);
+    CHECK((*rows2)[0].path == "C:\\ShareX\\2024-10\\rec.mp4" && (*rows2)[0].kind == CaptureKind::Video && (*rows2)[0].format == "MP4");
+    CHECK((*rows2)[1].path == "C:\\ShareX\\2024-09\\missing_shot.jpg" && (*rows2)[1].format == "JPEG" && (*rows2)[1].process_name == "Discord");
+    CHECK((*rows2)[1].window_title == "🦄 (ponycule) - Discord");
+
+    // Verify `only_existing_files = true` skips missing files and records size_bytes
+    store.close();
+    fs::remove(target_db, ec);
+    fs::remove(target_db.wstring() + L"-wal", ec);
+    fs::remove(target_db.wstring() + L"-shm", ec);
+    CHECK(store.open(target_db, &err));
+
+    ShareXImportResult r3{};
+    CHECK(import_sharex_history(sx_db_path, store, {.only_existing_files = true}, r3, &err));
+    CHECK(r3.imported == 1 && r3.missing_skipped == 1 && r3.non_media_skipped == 2);
+    const auto rows3 = store.list_recent(10);
+    CHECK(rows3.has_value() && rows3->size() == 1 && (*rows3)[0].size_bytes == 12u);
+
+    // Non-history JSON config file must fail gracefully
+    {
+        std::ofstream bf(bad_json_path, std::ios::binary);
+        bf << "{\"DefaultTaskSettings\": {\"CaptureSettings\": {}}}";
+    }
+    ShareXImportResult r_bad_json{};
+    err.clear();
+    CHECK(!import_sharex_history(bad_json_path, store, {}, r_bad_json, &err));
+    CHECK(!err.empty());
+
+    // Non-ShareX SQLite database must fail gracefully
+    {
+        sqlite3* bdb = nullptr;
+        const auto bu8 = bad_db_path.u8string();
+        const std::string butf8{reinterpret_cast<const char*>(bu8.data()), bu8.size()};
+        CHECK(sqlite3_open(butf8.c_str(), &bdb) == SQLITE_OK);
+        CHECK(sqlite3_exec(bdb, "CREATE TABLE Other(id INTEGER);", nullptr, nullptr, nullptr) == SQLITE_OK);
+        sqlite3_close(bdb);
+    }
+    ShareXImportResult r_bad_db{};
+    err.clear();
+    CHECK(!import_sharex_history(bad_db_path, store, {}, r_bad_db, &err));
+    CHECK(!err.empty());
+
+    // Summary formatting
+    const std::wstring summary = format_sharex_import_summary(r1, L"History.db");
+    CHECK(summary.find(L"Imported 1 capture (1 image, 0 videos) from History.db") != std::wstring::npos);
+    CHECK(summary.find(L"1 already in history") != std::wstring::npos);
+    CHECK(summary.find(L"2 non-media") != std::wstring::npos);
+
+    store.close();
+    fs::remove_all(base, ec);
+}
+
 int main() {
     test_startup_logic();
     test_hotkey_collisions();
@@ -640,5 +844,6 @@ int main() {
     test_audio_capture_helpers();
     test_recording_logic();
     test_color_logic();
+    test_sharex_import();
     return capusy::test::failures == 0 ? 0 : 1;
 }

@@ -9,6 +9,7 @@ enable_testing()
 
 set(CAPUSY_TEST_SQLITE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../build/_deps/sqlite3-src")
 set(CAPUSY_TEST_USYLIBPP_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../build/_deps/usylibpp-src/include")
+set(CAPUSY_TEST_GLAZE_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../build/_deps/glaze-src/include")
 
 add_library(capusy_tests_sqlite3 STATIC "${CAPUSY_TEST_SQLITE_DIR}/sqlite3.c")
 set_target_properties(capusy_tests_sqlite3 PROPERTIES CXX_SCAN_FOR_MODULES OFF)
@@ -24,7 +25,7 @@ endif()
 
 add_executable(core_test core_test.cpp)
 target_include_directories(core_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../include")
-target_include_directories(core_test SYSTEM PRIVATE "${CAPUSY_TEST_USYLIBPP_INCLUDE_DIR}")
+target_include_directories(core_test SYSTEM PRIVATE "${CAPUSY_TEST_USYLIBPP_INCLUDE_DIR}" "${CAPUSY_TEST_GLAZE_INCLUDE_DIR}")
 target_compile_definitions(core_test PRIVATE WINVER=0x0A00 _WIN32_WINNT=0x0A00 WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
 target_link_libraries(core_test PRIVATE capusy_tests_sqlite3)
 if(MSVC)

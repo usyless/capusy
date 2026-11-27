@@ -6,6 +6,7 @@
 
 #include <capusy/audio_capture.hpp>
 #include <capusy/recorder.hpp>
+#include <capusy/sharex_import.hpp>
 #include <capusy/updater.hpp>
 
 #include <algorithm>
@@ -40,8 +41,10 @@ public:
     void stop_background_jobs() noexcept {
         update_job_.thread.request_stop();
         update_check_thread_.request_stop();
+        sharex_job_.thread.request_stop();
         update_job_.thread = {};
         update_check_thread_ = {};
+        sharex_job_.thread = {};
     }
 
     void maybe_auto_check_updates() {
@@ -187,6 +190,10 @@ private:
         IdBrowseSaveDir,
         IdOpenSaveDir,
         IdSaveDirWell,
+        IdShareXPathWell,
+        IdBrowseShareX,
+        IdImportShareX,
+        IdToggleShareXExistingOnly,
         IdToggleToast,
         IdSliderToastSize,
         IdSliderToastTimeout,
@@ -261,6 +268,43 @@ private:
         return {.log = update_job_.log, .failed = update_job_.failed, .done = update_job_.done, .total = update_job_.total};
     }
 
+    [[nodiscard]] JobView view_sharex_job() {
+        const std::scoped_lock lk{sharex_job_.mx};
+        return {.log = sharex_job_.log, .failed = sharex_job_.failed, .done = sharex_job_.done, .total = sharex_job_.total};
+    }
+
+    void report_sharex(std::wstring_view msg, bool failed = false) {
+        {
+            const std::scoped_lock lk{sharex_job_.mx};
+            sharex_job_.log.assign(msg);
+            sharex_job_.failed = failed;
+        }
+        sh_.call([this] { invalidate(); });
+    }
+
+    void report_sharex_progress(uint64_t done, uint64_t total, std::wstring_view msg) {
+        {
+            const std::scoped_lock lk{sharex_job_.mx};
+            sharex_job_.done = done;
+            sharex_job_.total = total;
+            sharex_job_.log.assign(msg);
+            sharex_job_.failed = false;
+        }
+        sh_.call([this] { invalidate(); });
+    }
+
+    [[nodiscard]] static std::wstring detect_default_sharex_history_path() {
+        const std::wstring docs = known_folder(FOLDERID_Documents);
+        if (docs.empty()) return {};
+        const fs::path base = fs::path{docs} / L"ShareX";
+        std::error_code ec;
+        const fs::path db = base / L"History.db";
+        if (fs::is_regular_file(db, ec) && !ec) return db.wstring();
+        const fs::path legacy_json = base / L"History.json";
+        if (fs::is_regular_file(legacy_json, ec) && !ec) return legacy_json.wstring();
+        return {};
+    }
+
     void report_update(std::wstring_view msg, bool failed = false) {
         {
             const std::scoped_lock lk{update_job_.mx};
@@ -293,6 +337,11 @@ private:
         sw_cap_cursor_.set(sh_.settings.capture_cursor ? 1.0f : 0.0f, animate);
         sw_instant_region_.set(sh_.settings.region_instant_capture ? 1.0f : 0.0f, animate);
         sw_split_month_.set(sh_.settings.split_by_month ? 1.0f : 0.0f, animate);
+        sw_sharex_existing_only_.set(sharex_only_existing_ ? 1.0f : 0.0f, animate);
+        if (!sharex_path_probed_) {
+            sharex_path_w_ = detect_default_sharex_history_path();
+            sharex_path_probed_ = true;
+        }
         sw_toast_.set(sh_.settings.show_corner_toast ? 1.0f : 0.0f, animate);
         sw_rec_cursor_.set(sh_.settings.record_cursor ? 1.0f : 0.0f, animate);
         sw_rec_hw_accel_.set(sh_.settings.record_hw_accel ? 1.0f : 0.0f, animate);
@@ -333,6 +382,7 @@ private:
         if (sw_cap_cursor_.step(dt, 22.0f, 0.004f)) moving = true;
         if (sw_instant_region_.step(dt, 22.0f, 0.004f)) moving = true;
         if (sw_split_month_.step(dt, 22.0f, 0.004f)) moving = true;
+        if (sw_sharex_existing_only_.step(dt, 22.0f, 0.004f)) moving = true;
         if (sw_toast_.step(dt, 22.0f, 0.004f)) moving = true;
         if (sw_rec_cursor_.step(dt, 22.0f, 0.004f)) moving = true;
         if (sw_rec_hw_accel_.step(dt, 22.0f, 0.004f)) moving = true;
@@ -528,6 +578,10 @@ private:
             case IdBrowseSaveDir:
             case IdOpenSaveDir:
             case IdSaveDirWell:
+            case IdShareXPathWell:
+            case IdBrowseShareX:
+            case IdImportShareX:
+            case IdToggleShareXExistingOnly:
             case IdToggleToast:
             case IdSliderToastSize:
             case IdSliderToastTimeout:
@@ -625,6 +679,21 @@ private:
                 return !subtitle.empty();
             case IdBrowseSaveDir: title = L"Choose a folder for saved screenshots and recordings"; return true;
             case IdOpenSaveDir: title = L"Open save folder in Explorer"; return true;
+            case IdShareXPathWell:
+                title = L"Selected ShareX history file";
+                subtitle = sharex_path_w_.empty() ? L"No file selected — click Browse to pick History.db or History.json" : sharex_path_w_;
+                return true;
+            case IdBrowseShareX:
+                title = L"Browse for a ShareX History.db or legacy History.json file";
+                return true;
+            case IdImportShareX:
+                title = sharex_job_.busy
+                    ? L"Cancel ShareX history import"
+                    : L"Import captures from the selected ShareX history file (existing entries are kept)";
+                return true;
+            case IdToggleShareXExistingOnly:
+                title = L"Skip entries whose files are no longer on disk and record file sizes";
+                return true;
             case IdToggleSplitMonth: title = L"Group saved files into YYYY-MM subfolders"; return true;
             case IdFmtPng: title = L"Lossless PNG (recommended)"; return true;
             case IdFmtJpeg: title = L"Lossy JPEG (smaller files, adjustable quality)"; return true;
@@ -965,6 +1034,84 @@ private:
                     : (fmt == ImageFormat::Bmp ? L"BMP is uncompressed lossless — fastest write, largest file size."
                                                : L"TIFF is lossless — full pixel quality for archival workflows.");
                 cv.text(note, rect(lx, qual_y, rw, 22.0f), Font::Caption, cv.theme().on_surface_variant);
+            }
+
+            y = next_y;
+        }
+
+        // 4. Import History from ShareX card
+        {
+            const JobView sx_view = view_sharex_job();
+            const CardHeader hd = make_header(
+                cv, rw, L"Import History from ShareX", cv.theme().on_surface,
+                L"Import screenshots and recordings from ShareX History.db (SQLite) or legacy History.json backups without overwriting existing entries");
+
+            const float browse_w = button_width(cv, L"Browse", true, 98.0f);
+            const wchar_t* imp_lbl = sharex_job_.busy ? L"Cancel" : L"Import";
+            const float import_w = button_width(cv, imp_lbl, true, 102.0f);
+
+            const float file_lbl_y = y + 16.0f + hd.h + 12.0f;
+            const float file_row_y = file_lbl_y + 22.0f;
+            const float opt_y = file_row_y + 42.0f;
+
+            float cy = opt_y + 34.0f;
+            const bool show_bar = sharex_job_.busy && sx_view.total > 0;
+            const float bar_y = cy + 8.0f;
+            if (show_bar) cy = bar_y + 8.0f;
+
+            const float msg_y = cy + 8.0f;
+            const float msg_h = sx_view.log.empty()
+                ? 0.0f
+                : (sx_view.failed ? error_row_height(cv, sx_view.log, rw) : text_height(cv, sx_view.log, Font::Caption, rw, 18.0f));
+            if (msg_h > 0.0f) cy = msg_y + msg_h;
+
+            const float card_h = (cy + 16.0f) - y;
+            const float next_y = card_begin(cv, x, y, w, card_h, CARD_GAP);
+
+            (void)draw_header(cv, lx, y, rw, hd);
+            cv.text(L"ShareX history file (History.db or History.json)", rect(lx, file_lbl_y, rw, 20.0f), Font::SmallSemi, cv.theme().on_surface_variant);
+
+            const float well_w = std::max(120.0f, rw - browse_w - import_w - 16.0f);
+            const D2D1_RECT_F well = rect(lx, file_row_y, well_w, 34.0f);
+            draw_well(cv, well, 9.0f, true);
+            const std::wstring_view path_display = sharex_path_w_.empty()
+                ? std::wstring_view{L"Select ShareX History.db or legacy History.json…"}
+                : std::wstring_view{sharex_path_w_};
+            cv.text(path_display, inset(well, 10.0f, 0.0f), Font::MonoSmall,
+                    sharex_path_w_.empty() ? cv.theme().outline : cv.theme().on_surface);
+            cv.hit(well, IdShareXPathWell);
+
+            const D2D1_RECT_F browse_r = rect(lx + well_w + 8.0f, file_row_y, browse_w, 34.0f);
+            if (sharex_job_.busy) {
+                draw_disabled_button(cv, browse_r, glyph::folder, L"Browse");
+            } else {
+                draw_button(cv, hover_.alpha(IdBrowseShareX), browse_r, glyph::folder, L"Browse", IdBrowseShareX, 0, 0);
+            }
+            const D2D1_RECT_F import_r = rect(lx + well_w + 8.0f + browse_w + 8.0f, file_row_y, import_w, 34.0f);
+            draw_button(cv, hover_.alpha(IdImportShareX), import_r,
+                        sharex_job_.busy ? glyph::close : glyph::download, imp_lbl, IdImportShareX, 0,
+                        sharex_job_.busy ? 2 : 1);
+
+            cv.text(L"Only import files that still exist on disk", rect(lx, opt_y, rw - 60.0f, 32.0f), Font::Body,
+                    sharex_job_.busy ? with_alpha(cv.theme().on_surface_variant, 0.6f) : cv.theme().on_surface);
+            draw_switch(cv, sharex_job_.busy ? 0.0f : hover_.alpha(IdToggleShareXExistingOnly),
+                        sw_sharex_existing_only_.value, lx + rw, opt_y + 16.0f,
+                        sharex_job_.busy ? IdNone : IdToggleShareXExistingOnly);
+
+            if (show_bar) {
+                const float pct = std::clamp(static_cast<float>(sx_view.done) / static_cast<float>(sx_view.total), 0.0f, 1.0f);
+                const D2D1_RECT_F trk = rect(lx, bar_y, rw, 6.0f);
+                cv.fill_round(trk, 3.0f, with_alpha(cv.theme().outline_variant, 0.35f));
+                if (pct > 0.0f) {
+                    cv.fill_round(rect(lx, bar_y, std::max(6.0f, rw * pct), 6.0f), 3.0f, cv.theme().primary);
+                }
+            }
+            if (msg_h > 0.0f) {
+                if (sx_view.failed) {
+                    draw_error_row(cv, sx_view.log, lx, msg_y, rw, msg_h);
+                } else {
+                    cv.text_wrap(sx_view.log, rect(lx, msg_y, rw, msg_h), Font::Caption, cv.theme().on_surface_variant);
+                }
             }
 
             y = next_y;
@@ -1750,6 +1897,116 @@ private:
     }
 
     // ------------------------------------------------------------------------------------------
+    // ShareX History Import (SQLite History.db & Legacy JSON)
+    // ------------------------------------------------------------------------------------------
+
+    [[nodiscard]] std::wstring sharex_browse_initial_dir() const {
+        std::error_code ec;
+        if (!sharex_path_w_.empty()) {
+            const fs::path parent = fs::path{sharex_path_w_}.parent_path();
+            if (!parent.empty() && fs::is_directory(parent, ec) && !ec) return parent.wstring();
+        }
+        const std::wstring docs = known_folder(FOLDERID_Documents);
+        if (!docs.empty()) {
+            const fs::path sx_dir = fs::path{docs} / L"ShareX";
+            if (fs::is_directory(sx_dir, ec) && !ec) return sx_dir.wstring();
+            return docs;
+        }
+        return {};
+    }
+
+    bool browse_sharex_history_file() {
+        static constexpr std::array<COMDLG_FILTERSPEC, 4> kFilters = {{
+            {L"ShareX History (*.db; *.json)", L"*.db;*.sqlite;*.sqlite3;*.json"},
+            {L"ShareX SQLite Database (*.db)", L"*.db;*.sqlite;*.sqlite3"},
+            {L"ShareX Legacy JSON (*.json)", L"*.json"},
+            {L"All Files (*.*)", L"*.*"},
+        }};
+        if (auto picked = browse_file_dialog(hwnd_, L"Select ShareX History.db or History.json", sharex_browse_initial_dir(), kFilters)) {
+            sharex_path_w_ = std::move(*picked);
+            {
+                const std::scoped_lock lk{sharex_job_.mx};
+                sharex_job_.log.clear();
+                sharex_job_.failed = false;
+                sharex_job_.done = 0;
+                sharex_job_.total = 0;
+            }
+            invalidate();
+            return true;
+        }
+        return false;
+    }
+
+    void start_sharex_import() {
+        if (sharex_job_.busy) {
+            sharex_job_.thread.request_stop();
+            return;
+        }
+        if (sharex_path_w_.empty()) {
+            if (!browse_sharex_history_file()) return;
+        }
+        if (sharex_job_.thread.joinable()) sharex_job_.thread.join();
+
+        const fs::path src_path{sharex_path_w_};
+        const std::wstring filename = src_path.filename().wstring();
+        const ShareXImportOptions opts{.only_existing_files = sharex_only_existing_};
+        {
+            const std::scoped_lock lk{sharex_job_.mx};
+            sharex_job_.log = ulp::str::concat_strings(L"Importing ", filename, L"…");
+            sharex_job_.failed = false;
+            sharex_job_.done = 0;
+            sharex_job_.total = 0;
+        }
+        sharex_job_.busy = true;
+        ++sh_.background_jobs;
+        invalidate();
+
+        sharex_job_.thread = std::jthread([this, src_path, filename, opts](const std::stop_token& stop) {
+            ShareXImportResult res{};
+            std::string err;
+            bool ok = false;
+            try {
+                ok = import_sharex_history(
+                    src_path, sh_.history, opts, res, &err,
+                    [this, &filename](uint64_t done, uint64_t total) {
+                        std::wstring status = ulp::str::concat_strings(L"Importing ", filename, L"…");
+                        if (total > 0) {
+                            append_to(status, L" (", format_count(done).view(), L" / ", format_count(total).view(), L")");
+                        }
+                        report_sharex_progress(done, total, status);
+                    },
+                    stop);
+            } catch (const std::exception& e) {
+                ok = false;
+                err = e.what();
+            }
+
+            sh_.call([this, ok, res, filename, err = std::move(err)] {
+                sharex_job_.busy = false;
+                if (sh_.background_jobs > 0) --sh_.background_jobs;
+                {
+                    const std::scoped_lock lk{sharex_job_.mx};
+                    sharex_job_.done = 0;
+                    sharex_job_.total = 0;
+                    if (ok) {
+                        sharex_job_.log = format_sharex_import_summary(res, filename);
+                        sharex_job_.failed = false;
+                    } else {
+                        sharex_job_.log = err.empty() ? L"ShareX history import failed." : to_wide(err);
+                        sharex_job_.failed = true;
+                    }
+                }
+                if (auto st = sh_.history.stats()) stats_ = *st;
+                if (ok && res.imported > 0 && sh_.on_history_changed) {
+                    sh_.on_history_changed();
+                }
+                if (sh_.on_visibility_changed) sh_.on_visibility_changed();
+                invalidate();
+            });
+        });
+    }
+
+    // ------------------------------------------------------------------------------------------
     // Input
     // ------------------------------------------------------------------------------------------
 
@@ -1937,6 +2194,19 @@ private:
                 return;
             case IdOpenSaveDir:
                 (void)open_file(resolve_save_dir(sh_.settings).wstring());
+                return;
+            case IdBrowseShareX:
+                if (!sharex_job_.busy) (void)browse_sharex_history_file();
+                return;
+            case IdImportShareX:
+                start_sharex_import();
+                return;
+            case IdToggleShareXExistingOnly:
+                if (!sharex_job_.busy) {
+                    sharex_only_existing_ = !sharex_only_existing_;
+                    sync_state(true);
+                    start_anim();
+                }
                 return;
             case IdToggleToast:
                 sh_.settings.show_corner_toast = !sh_.settings.show_corner_toast;
@@ -2249,13 +2519,13 @@ private:
                 if (nid != raw_hover_id_ || nidx != raw_hover_index_) {
                     raw_hover_id_ = nid;
                     raw_hover_index_ = nidx;
-                    const int vis_id = (nid == IdSaveDirWell || nid == IdInstallUpdateDisabled) ? IdNone : nid;
+                    const int vis_id = (nid == IdSaveDirWell || nid == IdShareXPathWell || nid == IdInstallUpdateDisabled) ? IdNone : nid;
                     const int vis_idx = (vis_id == IdNone) ? 0 : nidx;
                     const bool vis_changed = hover_.set(vis_id, vis_idx, true);
                     tooltip_.on_hover_changed(hwnd_, TIMER_TOOLTIP, h, has_tooltip(nid, nidx), true);
                     if (vis_changed || tooltip_.alpha.active()) start_anim();
                 }
-                SetCursor((h && h->id != IdSaveDirWell && h->id != IdInstallUpdateDisabled) ? cursor_hand_ : cursor_arrow_);
+                SetCursor((h && h->id != IdSaveDirWell && h->id != IdShareXPathWell && h->id != IdInstallUpdateDisabled) ? cursor_hand_ : cursor_arrow_);
                 TRACKMOUSEEVENT tme{.cbSize = sizeof(tme), .dwFlags = TME_LEAVE, .hwndTrack = hwnd};
                 TrackMouseEvent(&tme);
                 return 0;
@@ -2338,6 +2608,7 @@ private:
     AnimFloat sw_cap_cursor_;
     AnimFloat sw_instant_region_;
     AnimFloat sw_split_month_;
+    AnimFloat sw_sharex_existing_only_;
     AnimFloat sw_toast_;
     AnimFloat sw_rec_cursor_;
     AnimFloat sw_rec_hw_accel_;
@@ -2368,6 +2639,10 @@ private:
     static inline SettingsWindow* record_hook_target_ = nullptr;
     UpdateJob update_job_;
     std::jthread update_check_thread_;
+    UpdateJob sharex_job_;
+    std::wstring sharex_path_w_;
+    bool sharex_path_probed_ = false;
+    bool sharex_only_existing_ = false;
 
     wil::com_ptr<ID2D1Bitmap1> app_icon_;
     uint64_t app_icon_epoch_ = 0;

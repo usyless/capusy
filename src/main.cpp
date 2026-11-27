@@ -176,6 +176,10 @@ private:
             }
         };
         sh_.on_visibility_changed = [this] { schedule_idle_trim(); };
+        sh_.on_history_changed = [this] {
+            if (history_win_ && history_win_->visible()) history_win_->reload_entries(true);
+            if (settings_win_ && settings_win_->visible()) settings_win_->sync_and_invalidate();
+        };
         sh_.on_redraw_all = [this] {
             if (history_win_ && history_win_->visible()) history_win_->invalidate();
             if (settings_win_ && settings_win_->visible()) settings_win_->sync_and_invalidate();

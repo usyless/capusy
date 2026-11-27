@@ -243,6 +243,37 @@ inline std::optional<std::wstring> browse_folder_dialog(HWND owner, const wchar_
     return out;
 }
 
+inline std::optional<std::wstring> browse_file_dialog(HWND owner, const wchar_t* title, const std::wstring& initial_dir,
+                                                      std::span<const COMDLG_FILTERSPEC> filters = {}) {
+    wil::com_ptr<IFileOpenDialog> dlg;
+    if (FAILED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dlg))) || !dlg) {
+        return std::nullopt;
+    }
+    DWORD opts = 0;
+    if (SUCCEEDED(dlg->GetOptions(&opts))) {
+        dlg->SetOptions(opts | FOS_FORCEFILESYSTEM | FOS_FILEMUSTEXIST | FOS_PATHMUSTEXIST);
+    }
+    if (title) dlg->SetTitle(title);
+    if (!filters.empty()) {
+        (void)dlg->SetFileTypes(static_cast<UINT>(filters.size()), filters.data());
+        (void)dlg->SetFileTypeIndex(1);
+    }
+    if (!initial_dir.empty()) {
+        wil::com_ptr<IShellItem> item;
+        if (SUCCEEDED(SHCreateItemFromParsingName(initial_dir.c_str(), nullptr, IID_PPV_ARGS(&item))) && item) {
+            dlg->SetFolder(item.get());
+        }
+    }
+    if (FAILED(dlg->Show(owner))) return std::nullopt;
+    wil::com_ptr<IShellItem> res;
+    if (FAILED(dlg->GetResult(&res)) || !res) return std::nullopt;
+    PWSTR p = nullptr;
+    if (FAILED(res->GetDisplayName(SIGDN_FILESYSPATH, &p)) || !p) return std::nullopt;
+    std::wstring out{p};
+    CoTaskMemFree(p);
+    return out;
+}
+
 // ---------------------------------------------------------------------------------------------
 // OLE Drag & Drop + Clipboard (exact architecture reused from usyseek)
 // ---------------------------------------------------------------------------------------------

@@ -71,6 +71,13 @@ struct HistoryStats {
     uint64_t db_bytes = 0;
 };
 
+struct BatchInsertResult {
+    uint64_t inserted = 0;
+    uint64_t inserted_images = 0;
+    uint64_t inserted_videos = 0;
+    uint64_t duplicates = 0;
+};
+
 /// Multi-select state for the history list (Ctrl toggle, Shift range, Ctrl+Shift additive range,
 /// keyboard navigation, deferred single-select on multi-drag, and reconciliation across reloads).
 struct HistorySelection {
@@ -394,6 +401,62 @@ public:
                 }
             }
         }
+        return true;
+    }
+
+    /// Inserts a batch of capture entries inside a single transaction, ignoring any paths that already exist.
+    /// Existing entries are preserved untouched.
+    bool insert_many_ignore(std::span<const CaptureEntry> entries, BatchInsertResult* result = nullptr, std::string* error = nullptr) {
+        BatchInsertResult res{};
+        if (entries.empty()) {
+            if (result) *result = res;
+            return true;
+        }
+        const std::scoped_lock lk{mx_};
+        if (!require_open_locked(error)) return false;
+
+        if (!exec_locked("BEGIN IMMEDIATE;", error)) return false;
+        Stmt st;
+        if (!prepare_locked(
+                "INSERT OR IGNORE INTO captures(path, kind, mode, created_at, width, height, size_bytes, duration_ms, window_title, process_name, format) "
+                "VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11);",
+                st, error)) {
+            (void)exec_locked("ROLLBACK;", nullptr);
+            return false;
+        }
+
+        for (const CaptureEntry& entry : entries) {
+            sqlite3_reset(st.s);
+            sqlite3_clear_bindings(st.s);
+            sqlite3_bind_text(st.s, 1, entry.path.data(), static_cast<int>(entry.path.size()), SQLITE_TRANSIENT);
+            sqlite3_bind_int(st.s, 2, static_cast<int>(entry.kind));
+            sqlite3_bind_int(st.s, 3, static_cast<int>(entry.mode));
+            sqlite3_bind_int64(st.s, 4, entry.created_at);
+            sqlite3_bind_int64(st.s, 5, static_cast<int64_t>(entry.width));
+            sqlite3_bind_int64(st.s, 6, static_cast<int64_t>(entry.height));
+            sqlite3_bind_int64(st.s, 7, static_cast<int64_t>(entry.size_bytes));
+            sqlite3_bind_int64(st.s, 8, static_cast<int64_t>(entry.duration_ms));
+            sqlite3_bind_text(st.s, 9, entry.window_title.data(), static_cast<int>(entry.window_title.size()), SQLITE_TRANSIENT);
+            sqlite3_bind_text(st.s, 10, entry.process_name.data(), static_cast<int>(entry.process_name.size()), SQLITE_TRANSIENT);
+            sqlite3_bind_text(st.s, 11, entry.format.data(), static_cast<int>(entry.format.size()), SQLITE_TRANSIENT);
+            if (!step_done_locked(st.s, error)) {
+                (void)exec_locked("ROLLBACK;", nullptr);
+                return false;
+            }
+            if (sqlite3_changes(db_) > 0) {
+                ++res.inserted;
+                if (entry.kind == CaptureKind::Video) ++res.inserted_videos;
+                else ++res.inserted_images;
+            } else {
+                ++res.duplicates;
+            }
+        }
+
+        if (!exec_locked("COMMIT;", error)) {
+            (void)exec_locked("ROLLBACK;", nullptr);
+            return false;
+        }
+        if (result) *result = res;
         return true;
     }
 
