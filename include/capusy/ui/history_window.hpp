@@ -88,6 +88,7 @@ public:
         else ShowWindow(hwnd_, SW_SHOWNORMAL);
         SetForegroundWindow(hwnd_);
         SetFocus(hwnd_);
+        sync_preview_media();
         anim_active_ = false;
         full_dirty_ = true;
         render();
@@ -402,6 +403,11 @@ private:
 
         const bool anim = step_anim();
 
+        if (video_.needs_recover() && sh_.gfx.d3d()) {
+            if (video_.recover_if_needed(sh_.gfx.d3d(), sh_.gfx.epoch())) {
+                SetTimer(hwnd_, TIMER_VIDEO, 16, nullptr);
+            }
+        }
         if (video_.active() && target_.dc()) {
             (void)video_.tick(sh_.gfx.d3d(), sh_.gfx.epoch(), target_.dc());
         }
@@ -861,8 +867,12 @@ private:
                 return;
             case IdActDelete: delete_entry(selected_idx_, true); return;
             case IdVideoPlay:
-                video_.toggle_play();
-                if (video_.needs_timer()) SetTimer(hwnd_, TIMER_VIDEO, 16, nullptr);
+                if (!video_.active() || video_.failed()) {
+                    sync_preview_media();
+                } else {
+                    video_.toggle_play();
+                    if (video_.needs_timer()) SetTimer(hwnd_, TIMER_VIDEO, 16, nullptr);
+                }
                 invalidate();
                 return;
             case IdVideoMute:
@@ -1041,8 +1051,12 @@ private:
         if (vk == VK_DELETE && selected_idx_ >= 0) { delete_entry(selected_idx_, true); return; }
         if (ctrl && vk == 'C' && selected_idx_ >= 0) { copy_entry(selected_idx_); return; }
         if (vk == VK_SPACE && selected_entry() && selected_entry()->kind == CaptureKind::Video) {
-            video_.toggle_play();
-            if (video_.needs_timer()) SetTimer(hwnd_, TIMER_VIDEO, 16, nullptr);
+            if (!video_.active() || video_.failed()) {
+                sync_preview_media();
+            } else {
+                video_.toggle_play();
+                if (video_.needs_timer()) SetTimer(hwnd_, TIMER_VIDEO, 16, nullptr);
+            }
             invalidate();
         }
     }
