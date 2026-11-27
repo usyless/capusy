@@ -84,13 +84,19 @@ public:
         return true;
     }
 
+    static constexpr int TAB_GENERAL = 0;
+    static constexpr int TAB_HOTKEYS = 1;
+    static constexpr int TAB_RECORDING = 2;
+    static constexpr int TAB_ABOUT = 3;
+    static constexpr int TAB_COUNT = 4;
+
     [[nodiscard]] HWND hwnd() const noexcept { return hwnd_; }
     [[nodiscard]] bool visible() const noexcept { return hwnd_ && IsWindowVisible(hwnd_) != FALSE; }
 
     void show(int tab = -1) {
         if (!hwnd_) return;
         if (tab >= 0) {
-            tab_ = std::clamp(tab, 0, 2);
+            tab_ = std::clamp(tab, 0, TAB_COUNT - 1);
             tab_anim_.snap(static_cast<float>(tab_));
             scroll_ = target_scroll_ = 0.0f;
         }
@@ -124,6 +130,8 @@ public:
 
     void hide() {
         if (!hwnd_) return;
+        cloak_window(hwnd_, true);
+        ShowWindow(hwnd_, SW_HIDE);
         stop_recording_hotkey();
         tooltip_.clear(hwnd_, TIMER_TOOLTIP, false);
         last_tooltip_dirty_.reset();
@@ -151,8 +159,6 @@ public:
         dirty_dips_scratch_.shrink_to_fit();
         app_icon_.reset();
         target_.release();
-        cloak_window(hwnd_, true);
-        ShowWindow(hwnd_, SW_HIDE);
         if (sh_.on_visibility_changed) sh_.on_visibility_changed();
     }
 
@@ -211,6 +217,7 @@ private:
         IdTab0,
         IdTab1,
         IdTab2,
+        IdTab3,
         IdToggleHotkey,
         IdRecordHotkey,
         IdResetHotkey,
@@ -578,22 +585,23 @@ private:
         int id;
     };
 
-    static constexpr std::array<TabDef, 3> tab_defs() noexcept {
+    static constexpr std::array<TabDef, TAB_COUNT> tab_defs() noexcept {
         return {{
-            {.g = glyph::keyboard, .label = L"General & Hotkeys", .id = IdTab0},
-            {.g = glyph::video, .label = L"Toast & Recording", .id = IdTab1},
-            {.g = glyph::info, .label = L"About", .id = IdTab2},
+            {.g = glyph::settings, .label = L"General", .id = IdTab0},
+            {.g = glyph::keyboard, .label = L"Hotkeys", .id = IdTab1},
+            {.g = glyph::video, .label = L"Toast & Recording", .id = IdTab2},
+            {.g = glyph::info, .label = L"About", .id = IdTab3},
         },};
     }
 
     struct TabLayout {
-        std::array<FlowPlacement, 3> placements{};
+        std::array<FlowPlacement, TAB_COUNT> placements{};
         float height = 0.0f;
     };
 
     [[nodiscard]] TabLayout tab_layout(float total_w) const {
         constexpr auto tabs = tab_defs();
-        std::array<FlowItem, 3> items; // NOLINT(cppcoreguidelines-pro-type-member-init)
+        std::array<FlowItem, TAB_COUNT> items; // NOLINT(cppcoreguidelines-pro-type-member-init)
         for (size_t i = 0; i < items.size(); ++i) {
             items[i] = {.width = sh_.fonts.measure(tabs[i].label, Font::BodySemi) + 46.0f, .height = TABS_H - 16.0f, .grow = false};
         }
@@ -698,9 +706,11 @@ private:
         const float cx = std::round((sz.width - cw) * 0.5f);
         float y = view.top + PAD - scroll_;
 
-        if (tab_ == 0) {
+        if (tab_ == TAB_GENERAL) {
             y = draw_tab_general(cv, cx, y, cw);
-        } else if (tab_ == 1) {
+        } else if (tab_ == TAB_HOTKEYS) {
+            y = draw_tab_hotkeys(cv, cx, y, cw);
+        } else if (tab_ == TAB_RECORDING) {
             y = draw_tab_toast_recording(cv, cx, y, cw);
         } else {
             y = draw_tab_about(cv, cx, y, cw);
@@ -720,7 +730,7 @@ private:
             cv.hit(D2D1::RectF(view.right - 12.0f, view.top, view.right, view.bottom), IdScrollbar);
         }
 
-        if (tab_ == 1 && open_audio_drop_ != AudioDropdown::None) {
+        if (tab_ == TAB_RECORDING && open_audio_drop_ != AudioDropdown::None) {
             const bool is_desk = (open_audio_drop_ == AudioDropdown::Desktop);
             const auto& devs = is_desk ? desktop_devices_ : mic_devices_;
             const std::string& cur_id = is_desk ? sh_.settings.record_desktop_device_id : sh_.settings.record_mic_device_id;
@@ -750,6 +760,7 @@ private:
             case IdTab0:
             case IdTab1:
             case IdTab2:
+            case IdTab3:
             case IdToggleWinPrtSc:
             case IdOpenWinKeyboardSettings:
             case IdToggleStartup:
@@ -829,9 +840,10 @@ private:
         subtitle.clear();
         if (open_audio_drop_ != AudioDropdown::None) return false;
         switch (id) {
-            case IdTab0: title = L"Global hotkeys, startup, save folder, and image format"; return true;
-            case IdTab1: title = L"Corner preview toast and screen recording"; return true;
-            case IdTab2: title = L"App info, history database stats, and software updates"; return true;
+            case IdTab0: title = L"Startup, capture behavior, save folder, image format, and ShareX import"; return true;
+            case IdTab1: title = L"Global capture shortcuts and Windows Print Screen override"; return true;
+            case IdTab2: title = L"Corner preview toast and screen recording"; return true;
+            case IdTab3: title = L"App info, history database stats, and software updates"; return true;
             case IdToggleHotkey:
                 if (idx >= 0 && std::cmp_less(idx, HOTKEY_COUNT)) {
                     const auto a = static_cast<HotkeyAction>(idx);
@@ -985,19 +997,19 @@ private:
         cv.fill(D2D1::RectF(0.0f, 0.0f, sz.width, strip_h), with_alpha(cv.theme().surface_lowest, 0.78f));
 
         constexpr auto tabs = tab_defs();
-        std::array<D2D1_RECT_F, 3> rects{};
+        std::array<D2D1_RECT_F, TAB_COUNT> rects{};
         for (size_t i = 0; i < tabs.size(); ++i) {
             const FlowPlacement& p = layout.placements[i];
             rects[i] = rect(PAD + p.x, 8.0f + p.y, p.width, TABS_H - 16.0f);
         }
 
-        const float t = std::clamp(tab_anim_.value, 0.0f, 2.0f);
-        const int i0 = std::clamp(static_cast<int>(std::floor(t)), 0, 2);
-        const int i1 = std::clamp(i0 + 1, 0, 2);
+        const float t = std::clamp(tab_anim_.value, 0.0f, static_cast<float>(TAB_COUNT - 1));
+        const int i0 = std::clamp(static_cast<int>(std::floor(t)), 0, TAB_COUNT - 1);
+        const int i1 = std::clamp(i0 + 1, 0, TAB_COUNT - 1);
         const float frac = t - static_cast<float>(i0);
         const float tab_rad = 10.0f;
 
-        for (int i = 0; i < 3; ++i) {
+        for (int i = 0; i < TAB_COUNT; ++i) {
             const float act = std::clamp(1.0f - std::abs(t - static_cast<float>(i)), 0.0f, 1.0f);
             if (const float ha = hover_.alpha(tabs[static_cast<size_t>(i)].id) * indicator_hover_fade(act); ha > 0.002f) {
                 cv.fill_round(rects[static_cast<size_t>(i)], tab_rad, with_alpha(cv.theme().on_surface, 0.07f * ha));
@@ -1005,7 +1017,7 @@ private:
         }
         cv.fill_round(lerp_rect(rects[static_cast<size_t>(i0)], rects[static_cast<size_t>(i1)], frac), tab_rad, cv.theme().primary_container);
 
-        for (int i = 0; i < 3; ++i) {
+        for (int i = 0; i < TAB_COUNT; ++i) {
             const D2D1_RECT_F r = rects[static_cast<size_t>(i)];
             const float act = std::clamp(1.0f - std::abs(t - static_cast<float>(i)), 0.0f, 1.0f);
             const D2D1_COLOR_F fg = lerp_color(cv.theme().on_surface_variant, cv.theme().on_primary_container, act);
@@ -1030,7 +1042,7 @@ private:
         draw_switch(cv, ha, sw_val, lx + rw, y + (row_h * 0.5f), id);
     }
 
-    float draw_tab_general(Canvas& cv, float x, float y, float w) {
+    float draw_tab_hotkeys(Canvas& cv, float x, float y, float w) {
         const float lx = x + 22.0f;
         const float rw = w - 44.0f;
 
@@ -1144,8 +1156,14 @@ private:
             actions.draw(lx, actions_y, rw);
             y = next_y;
         }
+        return y;
+    }
 
-        // 2. Startup & Capture Behavior card
+    float draw_tab_general(Canvas& cv, float x, float y, float w) {
+        const float lx = x + 22.0f;
+        const float rw = w - 44.0f;
+
+        // 1. Startup & Capture Behavior card
         {
             const CardHeader hd = make_header(cv, rw, L"Startup & Capture", cv.theme().on_surface,
                                               L"Windows sign-in launch, clipboard copy, and save directory");
@@ -2348,15 +2366,17 @@ private:
         if (recording_action_ && h->id != IdRecordHotkey) stop_recording_hotkey();
 
         switch (h->id) {
-            case IdTab0: case IdTab1: case IdTab2:
+            case IdTab0: case IdTab1: case IdTab2: case IdTab3:
                 open_audio_drop_ = AudioDropdown::None;
                 tab_ = h->id - IdTab0;
                 tab_anim_.set(static_cast<float>(tab_), true);
                 scroll_ = target_scroll_ = 0.0f;
-                if (tab_ == 1) {
+                if (tab_ == TAB_HOTKEYS) {
+                    refresh_external_state(false);
+                } else if (tab_ == TAB_RECORDING) {
                     desktop_devices_ = enumerate_audio_devices(AudioFlow::Render);
                     mic_devices_ = enumerate_audio_devices(AudioFlow::Capture);
-                } else if (tab_ == 2) {
+                } else if (tab_ == TAB_ABOUT) {
                     if (auto st = sh_.history.stats()) stats_ = *st;
                 }
                 full_dirty_ = true;
@@ -2820,8 +2840,19 @@ private:
                     const int vis_id = (nid == IdSaveDirWell || nid == IdShareXPathWell || nid == IdInstallUpdateDisabled) ? IdNone : nid;
                     const int vis_idx = (vis_id == IdNone) ? 0 : nidx;
                     const bool vis_changed = hover_.set(vis_id, vis_idx, true);
-                    tooltip_.on_hover_changed(hwnd_, TIMER_TOOLTIP, h, has_tooltip(nid, nidx), true);
-                    if (vis_changed || tooltip_.alpha.active()) start_anim();
+                    bool tip_changed = false;
+                    if (tooltip_.on_hover_changed(hwnd_, TIMER_TOOLTIP, h ? &h->r : nullptr, has_tooltip(nid, nidx), true)) {
+                        std::wstring tip_title;
+                        std::wstring tip_sub;
+                        const bool ok = window_active_ && open_audio_drop_ == AudioDropdown::None &&
+                                        build_tooltip(nid, nidx, tip_title, tip_sub);
+                        tip_changed = tooltip_.show_now(ok, std::move(tip_title), std::move(tip_sub), true);
+                    }
+                    if (vis_changed || tooltip_.alpha.active()) {
+                        start_anim();
+                    } else if (tip_changed && window_can_render_live(visible(), minimized_)) {
+                        InvalidateRect(hwnd_, nullptr, FALSE);
+                    }
                 }
                 SetCursor((h && h->id != IdSaveDirWell && h->id != IdShareXPathWell && h->id != IdInstallUpdateDisabled) ? cursor_hand_ : cursor_arrow_);
                 TRACKMOUSEEVENT tme{.cbSize = sizeof(tme), .dwFlags = TME_LEAVE, .hwndTrack = hwnd};

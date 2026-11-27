@@ -105,7 +105,7 @@ public:
         register_hotkeys(true);
 
         if (open_about_on_start) {
-            settings_win_->show(2);
+            settings_win_->show(SettingsWindow::TAB_ABOUT);
         }
         settings_win_->maybe_auto_check_updates();
 
@@ -198,7 +198,7 @@ private:
             if (settings_win_ && settings_win_->visible()) settings_win_->sync_and_invalidate();
         };
         sh_.on_update_balloon = [this](std::wstring_view ver_label) {
-            balloon_opens_about_ = true;
+            balloon_target_tab_ = SettingsWindow::TAB_ABOUT;
             show_balloon(ulp::str::concat_strings(L"Update available: capusy ", ver_label, L". Click to open Settings -> About."), NIIF_INFO);
         };
 
@@ -330,7 +330,7 @@ private:
             .mic_device_id = sh_.settings.record_mic_device_id,
         };
         if (!recorder_.start(region, out, std::move(cfg))) {
-            balloon_opens_about_ = false;
+            balloon_target_tab_ = SettingsWindow::TAB_RECORDING;
             show_balloon(force_tray_only ? L"Failed to start full-screen recording." : L"Failed to start region recording.", NIIF_ERROR);
             schedule_idle_trim();
             return;
@@ -400,7 +400,7 @@ private:
         }
         if (!res.ok) {
             if (!res.error.empty()) {
-                balloon_opens_about_ = false;
+                balloon_target_tab_ = SettingsWindow::TAB_RECORDING;
                 show_balloon(to_wide(res.error), NIIF_ERROR);
             }
             schedule_idle_trim();
@@ -636,8 +636,8 @@ private:
             }
         }
         if (notify_conflicts && !conflicts.empty()) {
-            balloon_opens_about_ = false;
-            show_balloon(ulp::str::concat_strings(L"Some hotkeys are already in use by another app: ", conflicts, L". Open Settings to change them."), NIIF_WARNING);
+            balloon_target_tab_ = SettingsWindow::TAB_HOTKEYS;
+            show_balloon(ulp::str::concat_strings(L"Some hotkeys are already in use by another app: ", conflicts, L". Open Settings -> Hotkeys to change them."), NIIF_WARNING);
         }
         if (settings_win_ && settings_win_->visible()) settings_win_->invalidate();
     }
@@ -895,11 +895,11 @@ private:
                 open_current_captures_folder();
                 break;
             case IdTraySettings:
-                settings_win_->show(0);
+                settings_win_->show(SettingsWindow::TAB_GENERAL);
                 settings_win_->maybe_auto_check_updates();
                 break;
             case IdTrayUpdate:
-                settings_win_->show(2);
+                settings_win_->show(SettingsWindow::TAB_ABOUT);
                 break;
             case IdTrayQuit: PostQuitMessage(0); break;
             default: break;
@@ -925,7 +925,7 @@ private:
             return 0;
         }
         if (msg == msg_open_settings()) {
-            settings_win_->show(0);
+            settings_win_->show(SettingsWindow::TAB_GENERAL);
             return 0;
         }
         switch (msg) {
@@ -983,8 +983,8 @@ private:
                         show_tray_menu();
                         break;
                     case NIN_BALLOONUSERCLICK:
-                        settings_win_->show(balloon_opens_about_ ? 2 : 0);
-                        balloon_opens_about_ = false;
+                        settings_win_->show(balloon_target_tab_);
+                        balloon_target_tab_ = SettingsWindow::TAB_GENERAL;
                         break;
                     default:
                         break;
@@ -1046,7 +1046,7 @@ private:
     Shared sh_;
     RegionRecorder recorder_;
     WindowInfo pending_record_window_;
-    bool balloon_opens_about_ = false;
+    int balloon_target_tab_ = SettingsWindow::TAB_GENERAL;
     std::unique_ptr<HistoryWindow> history_win_;
     std::unique_ptr<SettingsWindow> settings_win_;
     std::unique_ptr<ToastWindow> toast_win_;

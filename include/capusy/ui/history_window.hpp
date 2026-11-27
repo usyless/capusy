@@ -111,6 +111,9 @@ public:
 
     void hide() {
         if (!hwnd_ || dragging_out_) return;
+        // Hide the window first so closing is visually instantaneous even while media or caches tear down.
+        cloak_window(hwnd_, true);
+        ShowWindow(hwnd_, SW_HIDE);
         KillTimer(hwnd_, TIMER_VIDEO);
         if (async_drops_.empty()) KillTimer(hwnd_, TIMER_DROP);
         KillTimer(hwnd_, TIMER_CARET);
@@ -125,9 +128,7 @@ public:
         deferred_select_idx_ = -1;
         video_.shutdown();
         sh_.previews.clear();
-        sh_.previews.stop();
         sh_.thumbs.clear();
-        sh_.thumbs.stop();
         page_cache_.clear();
         page_cache_.shrink_to_fit();
         search_ids_.clear();
@@ -152,20 +153,18 @@ public:
         anim_active_ = false;
         full_dirty_ = true;
         hover_.set(IdNone, 0, false);
-        cloak_window(hwnd_, true);
-        ShowWindow(hwnd_, SW_HIDE);
         if (sh_.on_visibility_changed) sh_.on_visibility_changed();
     }
 
-    void reload_entries(bool keep_selection = true) {
+    void reload_entries(bool keep_selection = true, bool sync_media = true) {
         if (hwnd_) KillTimer(hwnd_, TIMER_SEARCH);
         const int64_t prev_id = (keep_selection && focused_row_) ? focused_row_->entry.id : -1;
         const auto filter = current_filter_kind();
         unfiltered_count_ = sh_.history.count(filter).value_or(0);
-        apply_search_filter(prev_id, keep_selection);
+        apply_search_filter(prev_id, keep_selection, sync_media);
     }
 
-    void apply_search_filter(int64_t preferred_id = -1, bool keep_selection = true) {
+    void apply_search_filter(int64_t preferred_id = -1, bool keep_selection = true, bool sync_media = true) {
         if (hwnd_) KillTimer(hwnd_, TIMER_SEARCH);
         if (preferred_id < 0 && keep_selection && focused_row_) {
             preferred_id = focused_row_->entry.id;
@@ -194,7 +193,7 @@ public:
         reconcile_selection(keep_selection, preferred_id);
         deferred_select_idx_ = -1;
 
-        sync_preview_media();
+        if (sync_media) sync_preview_media();
         clamp_scroll();
         invalidate();
     }
@@ -1581,12 +1580,12 @@ private:
             sh_.previews.evict(static_cast<uint64_t>(id));
         }
 
-        reload_entries(false);
+        reload_entries(false, false);
         if (total_count_ > 0) {
             const int next_sel = std::clamp(first_idx, 0, total_count_ - 1);
             select_single_idx(next_sel);
-            sync_preview_media();
         }
+        sync_preview_media();
         invalidate();
     }
 
@@ -1882,8 +1881,18 @@ private:
             const int vis_id = (nid == IdFooterInfo) ? IdNone : nid;
             const int vis_idx = (nid == IdFooterInfo) ? 0 : nidx;
             const bool vis_changed = hover_.set(vis_id, vis_idx, true);
-            tooltip_.on_hover_changed(hwnd_, TIMER_TOOLTIP, h, has_tooltip(nid, nidx), true);
-            if (vis_changed || tooltip_.alpha.active()) start_anim();
+            bool tip_changed = false;
+            if (tooltip_.on_hover_changed(hwnd_, TIMER_TOOLTIP, h ? &h->r : nullptr, has_tooltip(nid, nidx), true)) {
+                std::wstring tip_title;
+                std::wstring tip_sub;
+                const bool ok = window_active_ && build_tooltip(nid, nidx, tip_title, tip_sub);
+                tip_changed = tooltip_.show_now(ok, std::move(tip_title), std::move(tip_sub), true);
+            }
+            if (vis_changed || tooltip_.alpha.active()) {
+                start_anim();
+            } else if (tip_changed && window_can_render_live(visible(), minimized_)) {
+                InvalidateRect(hwnd_, nullptr, FALSE);
+            }
         }
         if (h && h->id == IdSearchBox) {
             SetCursor(cursor_ibeam_);

@@ -13,6 +13,7 @@
 #include <capusy/ui/dirty_rects.hpp>
 #include <capusy/ui/fit.hpp>
 #include <capusy/ui/flow.hpp>
+#include <usylibpp/ui/tooltip.hpp>
 
 #include <array>
 #include <filesystem>
@@ -945,6 +946,55 @@ static void test_history_paging_and_search() {
     fs::remove(tmp.wstring() + L"-shm", ec);
 }
 
+static void test_hover_tooltip_warm_reshow() {
+    using namespace usylibpp::ui;
+    struct TestRect {
+        float left = 0.0f;
+        float top = 0.0f;
+        float right = 0.0f;
+        float bottom = 0.0f;
+    };
+    HoverTooltipBase<TestRect> tip;
+    const TestRect r_a{.left = 10.0f, .top = 0.0f, .right = 60.0f, .bottom = 28.0f};
+    const TestRect r_b{.left = 70.0f, .top = 0.0f, .right = 120.0f, .bottom = 28.0f};
+    const TestRect r_c{.left = 130.0f, .top = 0.0f, .right = 180.0f, .bottom = 28.0f};
+
+    // Cold hover waits for delay even if moving rapidly between items before tooltip appears
+    CHECK(tip.on_hover_changed_state(&r_a, true, true, 100) == TooltipHoverAction::StartTimer);
+    CHECK(tip.on_hover_changed_state(&r_b, true, true, 200) == TooltipHoverAction::StartTimer);
+    CHECK(!tip.shown);
+
+    // Once timer fires, tooltip is shown & warm
+    CHECK(tip.on_timer_state(true, L"B", L"", true, 580));
+    CHECK(tip.shown && tip.title == L"B" && tip.revision == 1u);
+    while (tip.step(0.016f)) {}
+    CHECK(tip.alpha.value == 1.0f);
+
+    // Direct move to another tooltip item shows immediately with no alpha reset
+    CHECK(tip.on_hover_changed_state(&r_c, true, true, 1800) == TooltipHoverAction::ShowNow);
+    CHECK(tip.show_now(true, L"C", L"Detail", true, 1800));
+    CHECK(tip.shown && tip.title == L"C" && tip.subtitle == L"Detail" && tip.revision == 2u);
+    CHECK(tip.alpha.value == 1.0f);
+
+    // Crossing an empty gap within WARM_WINDOW_MS still shows immediately
+    CHECK(tip.on_hover_changed_state(nullptr, false, true, 2000) == TooltipHoverAction::None);
+    CHECK(!tip.shown && tip.is_warm(2100));
+    CHECK(tip.on_hover_changed_state(&r_a, true, true, 2100) == TooltipHoverAction::ShowNow);
+    CHECK(tip.show_now(true, L"A", L"", true, 2100));
+    CHECK(tip.shown && tip.title == L"A" && tip.anchor.left == r_a.left);
+
+    // Waiting past WARM_WINDOW_MS returns to cold delay
+    CHECK(tip.on_hover_changed_state(nullptr, false, true, 3000) == TooltipHoverAction::None);
+    CHECK(tip.on_hover_changed_state(&r_b, true, true, 3000 + HoverTooltipBase<TestRect>::WARM_WINDOW_MS + 1) ==
+          TooltipHoverAction::StartTimer);
+
+    // Explicit clear_state resets warm window immediately
+    CHECK(tip.on_timer_state(true, L"B", L"", true, 4000));
+    tip.clear_state(false);
+    CHECK(!tip.is_warm(4001));
+    CHECK(tip.on_hover_changed_state(&r_c, true, true, 4001) == TooltipHoverAction::StartTimer);
+}
+
 int main() {
     test_startup_logic();
     test_hotkey_collisions();
@@ -954,6 +1004,7 @@ int main() {
     test_history_search();
     test_update_logic();
     test_ui_primitives();
+    test_hover_tooltip_warm_reshow();
     test_audio_capture_helpers();
     test_recording_logic();
     test_color_logic();

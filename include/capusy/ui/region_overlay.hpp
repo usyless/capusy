@@ -505,6 +505,7 @@ private:
         std::optional<D2D1_RECT_F> last_crosshair_v_dirty;
         std::optional<D2D1_RECT_F> last_crosshair_h_dirty;
         std::optional<D2D1_RECT_F> last_tooltip_dirty;
+        uint64_t last_tooltip_revision = 0;
     };
 
     static constexpr std::array<uint32_t, 8> PALETTE = {
@@ -761,7 +762,8 @@ private:
             if (tl.valid) curr_tip_dirty = tl.dirty;
         }
         if (!request_full) {
-            if (curr_tip_dirty && (tooltip_.alpha.active() || !mw.last_tooltip_dirty || !rect_equal(*mw.last_tooltip_dirty, *curr_tip_dirty))) {
+            if (curr_tip_dirty && (tooltip_.alpha.active() || mw.last_tooltip_revision != tooltip_.revision ||
+                                   !mw.last_tooltip_dirty || !rect_equal(*mw.last_tooltip_dirty, *curr_tip_dirty))) {
                 mw.pending_dirty.push_back(*curr_tip_dirty);
             }
             if (mw.last_tooltip_dirty && (!curr_tip_dirty || !rect_equal(*mw.last_tooltip_dirty, *curr_tip_dirty))) {
@@ -783,6 +785,7 @@ private:
             mw.full_dirty = false;
             mw.pending_dirty.clear();
             mw.last_tooltip_dirty = curr_tip_dirty;
+            mw.last_tooltip_revision = curr_tip_dirty ? tooltip_.revision : 0;
             const LoupeRects lr = compute_loupe_rects(mw);
             mw.last_reticle_dirty = lr.reticle;
             mw.last_loupe_dirty = lr.card;
@@ -2166,7 +2169,13 @@ private:
                     tooltip_.clear(nullptr, 0, false);
                 }
                 tooltip_hwnd_ = mw.hwnd;
-                tooltip_.on_hover_changed(mw.hwnd, TIMER_TOOLTIP, h, has_tooltip(nid, nidx), true);
+                if (tooltip_.on_hover_changed(mw.hwnd, TIMER_TOOLTIP, h ? &h->r : nullptr, has_tooltip(nid, nidx), true)) {
+                    std::wstring tip_title;
+                    std::wstring tip_sub;
+                    const bool ok = open_dropdown_ == AudioDropdown::None && !color_picker_open_ &&
+                                    build_tooltip(nid, nidx, tip_title, tip_sub);
+                    (void)tooltip_.show_now(ok, std::move(tip_title), std::move(tip_sub), true);
+                }
                 if (tooltip_.alpha.active()) start_tooltip_anim(mw.hwnd);
             }
             hover_id_ = nid;
