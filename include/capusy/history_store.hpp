@@ -2,9 +2,21 @@
 
 #include <sqlite3.h>
 
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
+
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <filesystem>
 #include <limits>
 #include <mutex>
@@ -13,6 +25,7 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -77,6 +90,209 @@ struct BatchInsertResult {
     uint64_t inserted_videos = 0;
     uint64_t duplicates = 0;
 };
+
+struct SelectionSummary {
+    uint64_t count = 0;
+    uint64_t image_count = 0;
+    uint64_t video_count = 0;
+    uint64_t total_bytes = 0;
+};
+
+namespace detail {
+
+[[nodiscard]] constexpr char hs_ascii_lower(char c) noexcept {
+    return (c >= 'A' && c <= 'Z') ? static_cast<char>(c + ('a' - 'A')) : c;
+}
+
+[[nodiscard]] constexpr bool hs_is_ascii(std::string_view s) noexcept {
+    for (const char c : s) {
+        if (static_cast<unsigned char>(c) >= 0x80u) return false;
+    }
+    return true;
+}
+
+/// Case-insensitive substring check for an already-lowercased ASCII needle against arbitrary UTF-8 haystack.
+[[nodiscard]] inline bool hs_contains_ascii_ci(std::string_view hay, std::string_view needle_lower) noexcept {
+    if (needle_lower.empty()) return true;
+    if (needle_lower.size() > hay.size()) return false;
+    const size_t last = hay.size() - needle_lower.size();
+    const char first = needle_lower[0];
+    for (size_t i = 0; i <= last; ++i) {
+        if (hs_ascii_lower(hay[i]) != first) continue;
+        size_t j = 1;
+        while (j < needle_lower.size() && hs_ascii_lower(hay[i + j]) == needle_lower[j]) ++j;
+        if (j == needle_lower.size()) return true;
+    }
+    return false;
+}
+
+/// Formats `unix_s` as local `"YYYY-MM-DD HH:MM:SS d mmm yyyy"` into a caller-provided stack buffer (lowercase, zero allocs).
+[[nodiscard]] inline std::string_view hs_format_local_search_time(int64_t unix_s, std::span<char> buf) noexcept {
+    if (unix_s <= 0 || buf.size() < 40) return {};
+    unsigned year = 0;
+    unsigned month = 0;
+    unsigned day = 0;
+    unsigned hour = 0;
+    unsigned minute = 0;
+    unsigned second = 0;
+#ifdef _WIN32
+    const uint64_t ft = (static_cast<uint64_t>(unix_s) + 11'644'473'600ull) * 10'000'000ull;
+    const FILETIME f{.dwLowDateTime = static_cast<DWORD>(ft), .dwHighDateTime = static_cast<DWORD>(ft >> 32u)};
+    FILETIME local{};
+    SYSTEMTIME st{};
+    if (!FileTimeToLocalFileTime(&f, &local) || !FileTimeToSystemTime(&local, &st)) return {};
+    year = st.wYear;
+    month = st.wMonth;
+    day = st.wDay;
+    hour = st.wHour;
+    minute = st.wMinute;
+    second = st.wSecond;
+#else
+    const int64_t z = (unix_s / 86400) + 719468;
+    const int64_t era = (z >= 0 ? z : z - 146096) / 146097;
+    const auto doe = static_cast<unsigned>(z - (era * 146097));
+    const unsigned yoe = (doe - (doe / 1460u) + (doe / 36524u) - (doe / 146096u)) / 365u;
+    const int64_t y = static_cast<int64_t>(yoe) + (era * 400);
+    const unsigned doy = doe - ((365u * yoe) + (yoe / 4u) - (yoe / 100u));
+    const unsigned mp = ((5u * doy) + 2u) / 153u;
+    day = doy - (((153u * mp) + 2u) / 5u) + 1u;
+    month = mp < 10u ? (mp + 3u) : (mp - 9u);
+    year = static_cast<unsigned>(y + (month <= 2u ? 1 : 0));
+    const int64_t rem = ((unix_s % 86400) + 86400) % 86400;
+    hour = static_cast<unsigned>(rem / 3600);
+    minute = static_cast<unsigned>((rem % 3600) / 60);
+    second = static_cast<unsigned>(rem % 60);
+#endif
+    static constexpr std::array<const char*, 12> kMonths = {
+        "jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"
+    };
+    size_t p = 0;
+    const auto push2 = [&](unsigned v) noexcept {
+        buf[p++] = static_cast<char>('0' + ((v / 10u) % 10u));
+        buf[p++] = static_cast<char>('0' + (v % 10u));
+    };
+    const auto push4 = [&](unsigned v) noexcept {
+        buf[p++] = static_cast<char>('0' + ((v / 1000u) % 10u));
+        buf[p++] = static_cast<char>('0' + ((v / 100u) % 10u));
+        buf[p++] = static_cast<char>('0' + ((v / 10u) % 10u));
+        buf[p++] = static_cast<char>('0' + (v % 10u));
+    };
+    // ISO: YYYY-MM-DD HH:MM:SS
+    push4(year);
+    buf[p++] = '-';
+    push2(month);
+    buf[p++] = '-';
+    push2(day);
+    buf[p++] = ' ';
+    push2(hour);
+    buf[p++] = ':';
+    push2(minute);
+    buf[p++] = ':';
+    push2(second);
+    // Display: " d mmm yyyy"
+    buf[p++] = ' ';
+    if (day >= 10u) buf[p++] = static_cast<char>('0' + ((day / 10u) % 10u));
+    buf[p++] = static_cast<char>('0' + (day % 10u));
+    buf[p++] = ' ';
+    if (month >= 1u && month <= 12u) {
+        const char* m = kMonths[month - 1u];
+        buf[p++] = m[0];
+        buf[p++] = m[1];
+        buf[p++] = m[2];
+    }
+    buf[p++] = ' ';
+    push4(year);
+    return {buf.data(), p};
+}
+
+/// UTF-8 case-insensitive substring check (zero-alloc ASCII fast path; Win32 Unicode fallback for non-ASCII needles).
+[[nodiscard]] inline bool hs_field_contains(std::string_view hay, std::string_view token_lower, bool token_ascii) {
+    if (token_lower.empty()) return true;
+    if (hay.empty()) return false;
+    if (token_ascii) return hs_contains_ascii_ci(hay, token_lower);
+#ifdef _WIN32
+    const auto to_lower_w = [](std::string_view u8, std::wstring& out) -> bool {
+        const int n = MultiByteToWideChar(CP_UTF8, 0, u8.data(), static_cast<int>(u8.size()), nullptr, 0);
+        if (n <= 0) return false;
+        out.resize(static_cast<size_t>(n));
+        if (MultiByteToWideChar(CP_UTF8, 0, u8.data(), static_cast<int>(u8.size()), out.data(), n) <= 0) return false;
+        CharLowerBuffW(out.data(), static_cast<DWORD>(out.size()));
+        return true;
+    };
+    thread_local std::wstring whay;
+    thread_local std::wstring wtok;
+    if (!to_lower_w(hay, whay) || !to_lower_w(token_lower, wtok)) return false;
+    return whay.find(wtok) != std::wstring::npos;
+#else
+    return hay.find(token_lower) != std::string_view::npos;
+#endif
+}
+
+/// Deterministic SQLite scalar function:
+/// capusy_match_query(path, window_title, process_name, format, mode, created_at, query_lower_utf8) -> 0|1
+inline void sqlite_match_query(sqlite3_context* ctx, int argc, sqlite3_value** argv) {
+    if (argc < 7) {
+        sqlite3_result_int(ctx, 1);
+        return;
+    }
+    const auto arg_sv = [&](int idx) noexcept -> std::string_view {
+        const auto* p = reinterpret_cast<const char*>(sqlite3_value_text(argv[idx]));
+        const int n = sqlite3_value_bytes(argv[idx]);
+        return (p && n > 0) ? std::string_view{p, static_cast<size_t>(n)} : std::string_view{};
+    };
+
+    const std::string_view query = arg_sv(6);
+    if (query.empty()) {
+        sqlite3_result_int(ctx, 1);
+        return;
+    }
+
+    const std::string_view path = arg_sv(0);
+    const std::string_view title = arg_sv(1);
+    const std::string_view proc = arg_sv(2);
+    const std::string_view fmt = arg_sv(3);
+    const int mode = sqlite3_value_int(argv[4]);
+    const int64_t created_at = sqlite3_value_int64(argv[5]);
+
+    const std::string_view mode_str = (mode == static_cast<int>(CaptureMode::Full))
+        ? std::string_view{"full screen"}
+        : (mode == static_cast<int>(CaptureMode::Region) ? std::string_view{"region"} : std::string_view{"recording video"});
+
+    std::array<char, 48> time_buf; // NOLINT(cppcoreguidelines-pro-type-member-init)
+    std::string_view time_str;
+    bool time_ready = false;
+
+    size_t pos = 0;
+    while (pos < query.size()) {
+        while (pos < query.size() && (query[pos] == ' ' || query[pos] == '\t')) ++pos;
+        if (pos >= query.size()) break;
+        const size_t start = pos;
+        while (pos < query.size() && query[pos] != ' ' && query[pos] != '\t') ++pos;
+        const std::string_view tok = query.substr(start, pos - start);
+        if (tok.empty()) continue;
+
+        const bool ascii = hs_is_ascii(tok);
+        bool matched = hs_field_contains(path, tok, ascii) ||
+                       hs_field_contains(title, tok, ascii) ||
+                       hs_field_contains(proc, tok, ascii) ||
+                       hs_field_contains(fmt, tok, ascii) ||
+                       (ascii && hs_contains_ascii_ci(mode_str, tok));
+        if (!matched && ascii) {
+            if (!time_ready) {
+                time_str = hs_format_local_search_time(created_at, time_buf);
+                time_ready = true;
+            }
+            matched = hs_contains_ascii_ci(time_str, tok);
+        }
+        if (!matched) {
+            sqlite3_result_int(ctx, 0);
+            return;
+        }
+    }
+    sqlite3_result_int(ctx, 1);
+}
+
+} // namespace detail
 
 /// Multi-select state for the history list (Ctrl toggle, Shift range, Ctrl+Shift additive range,
 /// keyboard navigation, deferred single-select on multi-drag, and reconciliation across reloads).
@@ -339,12 +555,19 @@ public:
                 format       TEXT NOT NULL DEFAULT ''
             );
             CREATE INDEX IF NOT EXISTS idx_captures_created_at ON captures(created_at DESC, id DESC);
+            CREATE INDEX IF NOT EXISTS idx_captures_kind_created_at ON captures(kind, created_at DESC, id DESC);
         )sql";
         if (!exec_locked(INIT_SQL, error)) {
             close_locked();
             return false;
         }
         if (!migrate_schema_locked(error)) {
+            close_locked();
+            return false;
+        }
+        if (sqlite3_create_function_v2(db_, "capusy_match_query", 7, SQLITE_UTF8 | SQLITE_DETERMINISTIC,
+                                       nullptr, &detail::sqlite_match_query, nullptr, nullptr, nullptr) != SQLITE_OK) {
+            if (error) *error = sqlite3_errmsg(db_);
             close_locked();
             return false;
         }
@@ -462,31 +685,55 @@ public:
 
     [[nodiscard]] std::optional<std::vector<CaptureEntry>> list_recent(int limit = 1000, std::optional<CaptureKind> filter_kind = std::nullopt,
                                                                        std::string* error = nullptr) {
+        return list_page(limit, 0, filter_kind, error);
+    }
+
+    /// Returns total capture count (optionally filtered by kind). Uses covering B-tree index.
+    [[nodiscard]] std::optional<uint64_t> count(std::optional<CaptureKind> filter_kind = std::nullopt,
+                                                std::string* error = nullptr) {
         const std::scoped_lock lk{mx_};
         if (!require_open_locked(error)) return std::nullopt;
+        const char* sql = filter_kind
+            ? "SELECT COUNT(*) FROM captures WHERE kind = ?1;"
+            : "SELECT COUNT(*) FROM captures;";
+        Stmt st;
+        if (!prepare_locked(sql, st, error)) return std::nullopt;
+        if (filter_kind) sqlite3_bind_int(st.s, 1, static_cast<int>(*filter_kind));
+        if (sqlite3_step(st.s) != SQLITE_ROW) {
+            if (error) *error = sqlite3_errmsg(db_);
+            return std::nullopt;
+        }
+        return static_cast<uint64_t>(std::max<sqlite3_int64>(0, sqlite3_column_int64(st.s, 0)));
+    }
+
+    /// Fetches a paginated slice of captures ordered newest-first (`created_at DESC, id DESC`).
+    [[nodiscard]] std::optional<std::vector<CaptureEntry>> list_page(int limit, int offset,
+                                                                     std::optional<CaptureKind> filter_kind = std::nullopt,
+                                                                     std::string* error = nullptr) {
+        const std::scoped_lock lk{mx_};
+        if (!require_open_locked(error)) return std::nullopt;
+        if (limit <= 0) return std::vector<CaptureEntry>{};
+        offset = std::max(0, offset);
 
         const char* sql = filter_kind
             ? "SELECT id, path, kind, mode, created_at, width, height, size_bytes, duration_ms, window_title, process_name, format "
-              "FROM captures WHERE kind = ?1 ORDER BY created_at DESC, id DESC LIMIT ?2;"
+              "FROM captures WHERE kind = ?1 ORDER BY created_at DESC, id DESC LIMIT ?2 OFFSET ?3;"
             : "SELECT id, path, kind, mode, created_at, width, height, size_bytes, duration_ms, window_title, process_name, format "
-              "FROM captures ORDER BY created_at DESC, id DESC LIMIT ?1;";
+              "FROM captures ORDER BY created_at DESC, id DESC LIMIT ?1 OFFSET ?2;";
 
         Stmt st;
         if (!prepare_locked(sql, st, error)) return std::nullopt;
         if (filter_kind) {
             sqlite3_bind_int(st.s, 1, static_cast<int>(*filter_kind));
             sqlite3_bind_int(st.s, 2, limit);
+            sqlite3_bind_int(st.s, 3, offset);
         } else {
             sqlite3_bind_int(st.s, 1, limit);
+            sqlite3_bind_int(st.s, 2, offset);
         }
 
-        const auto read_str = [](sqlite3_stmt* stmt, int col, std::string& dst) {
-            const auto* txt = reinterpret_cast<const char*>(sqlite3_column_text(stmt, col));
-            const int len = sqlite3_column_bytes(stmt, col);
-            if (txt && len > 0) dst.assign(txt, static_cast<size_t>(len));
-        };
-
         std::vector<CaptureEntry> out;
+        out.reserve(static_cast<size_t>(std::min(limit, 512)));
         for (;;) {
             const int rc = sqlite3_step(st.s);
             if (rc == SQLITE_DONE) break;
@@ -494,22 +741,274 @@ public:
                 if (error) *error = sqlite3_errmsg(db_);
                 return std::nullopt;
             }
-            CaptureEntry e;
-            e.id = sqlite3_column_int64(st.s, 0);
-            read_str(st.s, 1, e.path);
-            e.kind = static_cast<CaptureKind>(sqlite3_column_int(st.s, 2));
-            e.mode = static_cast<CaptureMode>(sqlite3_column_int(st.s, 3));
-            e.created_at = sqlite3_column_int64(st.s, 4);
-            e.width = static_cast<uint32_t>(sqlite3_column_int64(st.s, 5));
-            e.height = static_cast<uint32_t>(sqlite3_column_int64(st.s, 6));
-            e.size_bytes = static_cast<uint64_t>(sqlite3_column_int64(st.s, 7));
-            e.duration_ms = static_cast<uint64_t>(sqlite3_column_int64(st.s, 8));
-            read_str(st.s, 9, e.window_title);
-            read_str(st.s, 10, e.process_name);
-            read_str(st.s, 11, e.format);
-            out.push_back(std::move(e));
+            out.push_back(read_entry_row(st.s));
         }
         return out;
+    }
+
+    /// Fetches capture IDs for a contiguous slice `[offset, offset + limit)` in display order (`created_at DESC, id DESC`).
+    [[nodiscard]] std::optional<std::vector<int64_t>> list_ids_range(int limit, int offset,
+                                                                     std::optional<CaptureKind> filter_kind = std::nullopt,
+                                                                     std::string* error = nullptr) {
+        const std::scoped_lock lk{mx_};
+        if (!require_open_locked(error)) return std::nullopt;
+        if (limit <= 0) return std::vector<int64_t>{};
+        offset = std::max(0, offset);
+
+        const char* sql = filter_kind
+            ? "SELECT id FROM captures WHERE kind = ?1 ORDER BY created_at DESC, id DESC LIMIT ?2 OFFSET ?3;"
+            : "SELECT id FROM captures ORDER BY created_at DESC, id DESC LIMIT ?1 OFFSET ?2;";
+
+        Stmt st;
+        if (!prepare_locked(sql, st, error)) return std::nullopt;
+        if (filter_kind) {
+            sqlite3_bind_int(st.s, 1, static_cast<int>(*filter_kind));
+            sqlite3_bind_int(st.s, 2, limit);
+            sqlite3_bind_int(st.s, 3, offset);
+        } else {
+            sqlite3_bind_int(st.s, 1, limit);
+            sqlite3_bind_int(st.s, 2, offset);
+        }
+
+        std::vector<int64_t> out;
+        out.reserve(static_cast<size_t>(std::min(limit, 4096)));
+        for (;;) {
+            const int rc = sqlite3_step(st.s);
+            if (rc == SQLITE_DONE) break;
+            if (rc != SQLITE_ROW) {
+                if (error) *error = sqlite3_errmsg(db_);
+                return std::nullopt;
+            }
+            out.push_back(sqlite3_column_int64(st.s, 0));
+        }
+        return out;
+    }
+
+    /// Searches all captures in SQLite (newest-first) matching multi-token AND `query_lower_utf8`.
+    /// Returns matching capture IDs in display order (`created_at DESC, id DESC`).
+    [[nodiscard]] std::optional<std::vector<int64_t>> search_ids(std::string_view query_lower_utf8,
+                                                                 std::optional<CaptureKind> filter_kind = std::nullopt,
+                                                                 std::string* error = nullptr) {
+        const std::scoped_lock lk{mx_};
+        if (!require_open_locked(error)) return std::nullopt;
+
+        const char* sql = filter_kind
+            ? "SELECT id FROM captures WHERE kind = ?1 AND "
+              "capusy_match_query(path, window_title, process_name, format, mode, created_at, ?2) != 0 "
+              "ORDER BY created_at DESC, id DESC;"
+            : "SELECT id FROM captures WHERE "
+              "capusy_match_query(path, window_title, process_name, format, mode, created_at, ?1) != 0 "
+              "ORDER BY created_at DESC, id DESC;";
+
+        Stmt st;
+        if (!prepare_locked(sql, st, error)) return std::nullopt;
+        if (filter_kind) {
+            sqlite3_bind_int(st.s, 1, static_cast<int>(*filter_kind));
+            sqlite3_bind_text(st.s, 2, query_lower_utf8.data(), static_cast<int>(query_lower_utf8.size()), SQLITE_TRANSIENT);
+        } else {
+            sqlite3_bind_text(st.s, 1, query_lower_utf8.data(), static_cast<int>(query_lower_utf8.size()), SQLITE_TRANSIENT);
+        }
+
+        std::vector<int64_t> out;
+        for (;;) {
+            const int rc = sqlite3_step(st.s);
+            if (rc == SQLITE_DONE) break;
+            if (rc != SQLITE_ROW) {
+                if (error) *error = sqlite3_errmsg(db_);
+                return std::nullopt;
+            }
+            out.push_back(sqlite3_column_int64(st.s, 0));
+        }
+        return out;
+    }
+
+    /// Fetches entries for the specified `ids` in the exact order given (missing IDs are omitted).
+    [[nodiscard]] std::optional<std::vector<CaptureEntry>> get_by_ids(std::span<const int64_t> ids,
+                                                                      std::string* error = nullptr) {
+        if (ids.empty()) return std::vector<CaptureEntry>{};
+        const std::scoped_lock lk{mx_};
+        if (!require_open_locked(error)) return std::nullopt;
+
+        std::unordered_map<int64_t, CaptureEntry> by_id;
+        by_id.reserve(ids.size());
+
+        constexpr size_t kChunk = 500;
+        std::string sql;
+        for (size_t off = 0; off < ids.size(); off += kChunk) {
+            const size_t n = std::min(kChunk, ids.size() - off);
+            sql.assign("SELECT id, path, kind, mode, created_at, width, height, size_bytes, duration_ms, window_title, process_name, format "
+                       "FROM captures WHERE id IN (");
+            for (size_t i = 0; i < n; ++i) {
+                if (i > 0) sql.push_back(',');
+                sql.push_back('?');
+            }
+            sql.append(");");
+
+            Stmt st;
+            if (!prepare_locked(sql.c_str(), st, error)) return std::nullopt;
+            for (size_t i = 0; i < n; ++i) {
+                sqlite3_bind_int64(st.s, static_cast<int>(i + 1), ids[off + i]);
+            }
+            for (;;) {
+                const int rc = sqlite3_step(st.s);
+                if (rc == SQLITE_DONE) break;
+                if (rc != SQLITE_ROW) {
+                    if (error) *error = sqlite3_errmsg(db_);
+                    return std::nullopt;
+                }
+                CaptureEntry e = read_entry_row(st.s);
+                const int64_t eid = e.id;
+                by_id.emplace(eid, std::move(e));
+            }
+        }
+
+        std::vector<CaptureEntry> out;
+        out.reserve(by_id.size());
+        for (const int64_t id : ids) {
+            if (const auto it = by_id.find(id); it != by_id.end()) {
+                out.push_back(it->second);
+            }
+        }
+        return out;
+    }
+
+    /// Returns entries for `ids` ordered in display order (`created_at DESC, id DESC`).
+    [[nodiscard]] std::optional<std::vector<CaptureEntry>> get_by_ids_ordered(std::span<const int64_t> ids,
+                                                                              std::string* error = nullptr) {
+        auto entries = get_by_ids(ids, error);
+        if (!entries) return std::nullopt;
+        std::ranges::sort(*entries, [](const CaptureEntry& a, const CaptureEntry& b) noexcept {
+            if (a.created_at != b.created_at) return a.created_at > b.created_at;
+            return a.id > b.id;
+        });
+        return entries;
+    }
+
+    /// Finds the exact 0-based row index of `id` in the unfiltered `ORDER BY created_at DESC, id DESC` list.
+    /// Returns std::nullopt if `id` does not exist (or doesn't match `filter_kind`).
+    [[nodiscard]] std::optional<int> find_row_index(int64_t id, std::optional<CaptureKind> filter_kind = std::nullopt,
+                                                    std::string* error = nullptr) {
+        const std::scoped_lock lk{mx_};
+        if (!require_open_locked(error)) return std::nullopt;
+
+        int64_t created_at = 0;
+        int kind = 0;
+        {
+            Stmt q;
+            if (!prepare_locked("SELECT created_at, kind FROM captures WHERE id = ?1;", q, error)) return std::nullopt;
+            sqlite3_bind_int64(q.s, 1, id);
+            const int rc = sqlite3_step(q.s);
+            if (rc == SQLITE_DONE) return std::nullopt;
+            if (rc != SQLITE_ROW) {
+                if (error) *error = sqlite3_errmsg(db_);
+                return std::nullopt;
+            }
+            created_at = sqlite3_column_int64(q.s, 0);
+            kind = sqlite3_column_int(q.s, 1);
+        }
+        if (filter_kind && kind != static_cast<int>(*filter_kind)) return std::nullopt;
+
+        const char* sql = filter_kind
+            ? "SELECT COUNT(*) FROM captures WHERE kind = ?1 AND (created_at > ?2 OR (created_at = ?2 AND id > ?3));"
+            : "SELECT COUNT(*) FROM captures WHERE created_at > ?1 OR (created_at = ?1 AND id > ?2);";
+        Stmt st;
+        if (!prepare_locked(sql, st, error)) return std::nullopt;
+        if (filter_kind) {
+            sqlite3_bind_int(st.s, 1, static_cast<int>(*filter_kind));
+            sqlite3_bind_int64(st.s, 2, created_at);
+            sqlite3_bind_int64(st.s, 3, id);
+        } else {
+            sqlite3_bind_int64(st.s, 1, created_at);
+            sqlite3_bind_int64(st.s, 2, id);
+        }
+        if (sqlite3_step(st.s) != SQLITE_ROW) {
+            if (error) *error = sqlite3_errmsg(db_);
+            return std::nullopt;
+        }
+        return static_cast<int>(sqlite3_column_int64(st.s, 0));
+    }
+
+    /// Computes image/video counts and total file size across an arbitrary set of selected capture IDs.
+    [[nodiscard]] std::optional<SelectionSummary> summarize_ids(std::span<const int64_t> ids,
+                                                                std::string* error = nullptr) {
+        SelectionSummary sum{};
+        if (ids.empty()) return sum;
+        const std::scoped_lock lk{mx_};
+        if (!require_open_locked(error)) return std::nullopt;
+
+        constexpr size_t kChunk = 500;
+        std::string sql;
+        for (size_t off = 0; off < ids.size(); off += kChunk) {
+            const size_t n = std::min(kChunk, ids.size() - off);
+            sql.assign("SELECT COUNT(*), "
+                       "COALESCE(SUM(CASE WHEN kind = 0 THEN 1 ELSE 0 END), 0), "
+                       "COALESCE(SUM(CASE WHEN kind = 1 THEN 1 ELSE 0 END), 0), "
+                       "COALESCE(SUM(size_bytes), 0) "
+                       "FROM captures WHERE id IN (");
+            for (size_t i = 0; i < n; ++i) {
+                if (i > 0) sql.push_back(',');
+                sql.push_back('?');
+            }
+            sql.append(");");
+
+            Stmt st;
+            if (!prepare_locked(sql.c_str(), st, error)) return std::nullopt;
+            for (size_t i = 0; i < n; ++i) {
+                sqlite3_bind_int64(st.s, static_cast<int>(i + 1), ids[off + i]);
+            }
+            if (sqlite3_step(st.s) != SQLITE_ROW) {
+                if (error) *error = sqlite3_errmsg(db_);
+                return std::nullopt;
+            }
+            sum.count += static_cast<uint64_t>(std::max<sqlite3_int64>(0, sqlite3_column_int64(st.s, 0)));
+            sum.image_count += static_cast<uint64_t>(std::max<sqlite3_int64>(0, sqlite3_column_int64(st.s, 1)));
+            sum.video_count += static_cast<uint64_t>(std::max<sqlite3_int64>(0, sqlite3_column_int64(st.s, 2)));
+            sum.total_bytes += static_cast<uint64_t>(std::max<sqlite3_int64>(0, sqlite3_column_int64(st.s, 3)));
+        }
+        return sum;
+    }
+
+    /// Returns the subset of `ids` that currently exist in the database (optionally matching `filter_kind`).
+    [[nodiscard]] std::optional<std::unordered_set<int64_t>> filter_existing_ids(
+        std::span<const int64_t> ids, std::optional<CaptureKind> filter_kind = std::nullopt,
+        std::string* error = nullptr) {
+        std::unordered_set<int64_t> keep;
+        if (ids.empty()) return keep;
+        const std::scoped_lock lk{mx_};
+        if (!require_open_locked(error)) return std::nullopt;
+
+        keep.reserve(ids.size());
+        constexpr size_t kChunk = 500;
+        std::string sql;
+        for (size_t off = 0; off < ids.size(); off += kChunk) {
+            const size_t n = std::min(kChunk, ids.size() - off);
+            sql.assign("SELECT id FROM captures WHERE ");
+            if (filter_kind) sql.append("kind = ? AND ");
+            sql.append("id IN (");
+            for (size_t i = 0; i < n; ++i) {
+                if (i > 0) sql.push_back(',');
+                sql.push_back('?');
+            }
+            sql.append(");");
+
+            Stmt st;
+            if (!prepare_locked(sql.c_str(), st, error)) return std::nullopt;
+            int bind_idx = 1;
+            if (filter_kind) sqlite3_bind_int(st.s, bind_idx++, static_cast<int>(*filter_kind));
+            for (size_t i = 0; i < n; ++i) {
+                sqlite3_bind_int64(st.s, bind_idx++, ids[off + i]);
+            }
+            for (;;) {
+                const int rc = sqlite3_step(st.s);
+                if (rc == SQLITE_DONE) break;
+                if (rc != SQLITE_ROW) {
+                    if (error) *error = sqlite3_errmsg(db_);
+                    return std::nullopt;
+                }
+                keep.insert(sqlite3_column_int64(st.s, 0));
+            }
+        }
+        return keep;
     }
 
     bool remove(int64_t id, std::string* error = nullptr) {
@@ -582,6 +1081,28 @@ public:
     }
 
 private:
+    [[nodiscard]] static CaptureEntry read_entry_row(sqlite3_stmt* s) {
+        const auto read_str = [](sqlite3_stmt* stmt, int col, std::string& dst) {
+            const auto* txt = reinterpret_cast<const char*>(sqlite3_column_text(stmt, col));
+            const int len = sqlite3_column_bytes(stmt, col);
+            if (txt && len > 0) dst.assign(txt, static_cast<size_t>(len));
+        };
+        CaptureEntry e;
+        e.id = sqlite3_column_int64(s, 0);
+        read_str(s, 1, e.path);
+        e.kind = static_cast<CaptureKind>(sqlite3_column_int(s, 2));
+        e.mode = static_cast<CaptureMode>(sqlite3_column_int(s, 3));
+        e.created_at = sqlite3_column_int64(s, 4);
+        e.width = static_cast<uint32_t>(sqlite3_column_int64(s, 5));
+        e.height = static_cast<uint32_t>(sqlite3_column_int64(s, 6));
+        e.size_bytes = static_cast<uint64_t>(sqlite3_column_int64(s, 7));
+        e.duration_ms = static_cast<uint64_t>(sqlite3_column_int64(s, 8));
+        read_str(s, 9, e.window_title);
+        read_str(s, 10, e.process_name);
+        read_str(s, 11, e.format);
+        return e;
+    }
+
     struct Stmt {
         sqlite3_stmt* s = nullptr;
         Stmt() = default;

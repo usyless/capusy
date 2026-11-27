@@ -832,6 +832,110 @@ static void test_sharex_import() {
     fs::remove_all(base, ec);
 }
 
+static void test_history_paging_and_search() {
+    using namespace capusy;
+    const fs::path tmp = fs::temp_directory_path() / L"capusy_test_paging.db";
+    std::error_code ec;
+    fs::remove(tmp, ec);
+    fs::remove(tmp.wstring() + L"-wal", ec);
+    fs::remove(tmp.wstring() + L"-shm", ec);
+
+    HistoryStore store;
+    std::string err;
+    CHECK(store.open(tmp, &err));
+
+    // Insert 600 entries (tests chunking past the 500-parameter SQLite IN() batch boundary)
+    std::vector<CaptureEntry> batch;
+    batch.reserve(600);
+    for (int i = 0; i < 600; ++i) {
+        const bool is_vid = (i % 5 == 0);
+        CaptureEntry e;
+        e.path = "C:\\Captures\\2024-09\\item_" + std::to_string(i) + (is_vid ? ".mp4" : ".png");
+        e.kind = is_vid ? CaptureKind::Video : CaptureKind::Image;
+        e.mode = is_vid ? CaptureMode::Recording : ((i % 2 == 0) ? CaptureMode::Full : CaptureMode::Region);
+        // Deliberate timestamp ties on pairs (i / 2) to verify id DESC tie-breaking
+        e.created_at = 1727460000ll + static_cast<int64_t>(i / 2);
+        e.size_bytes = static_cast<uint64_t>(1000 + i);
+        e.window_title = (i == 42) ? "🦄 Ponycule - Discord" : ("Window " + std::to_string(i));
+        e.process_name = (i % 3 == 0) ? "firefox" : "Code.exe";
+        e.format = is_vid ? "MP4" : "PNG";
+        batch.push_back(std::move(e));
+    }
+    BatchInsertResult br{};
+    CHECK(store.insert_many_ignore(batch, &br, &err));
+    CHECK(br.inserted == 600 && br.inserted_videos == 120 && br.inserted_images == 480);
+
+    // Count queries
+    CHECK(store.count() == 600u);
+    CHECK(store.count(CaptureKind::Image) == 480u);
+    CHECK(store.count(CaptureKind::Video) == 120u);
+
+    // Paging: newest first (item_599 is index 0, item_0 is index 599)
+    const auto p0 = store.list_page(10, 0);
+    CHECK(p0.has_value() && p0->size() == 10);
+    CHECK((*p0)[0].path == "C:\\Captures\\2024-09\\item_599.png");
+    CHECK((*p0)[9].path == "C:\\Captures\\2024-09\\item_590.mp4");
+
+    const auto p_last = store.list_page(10, 595);
+    CHECK(p_last.has_value() && p_last->size() == 5);
+    CHECK((*p_last)[4].path == "C:\\Captures\\2024-09\\item_0.mp4");
+
+    const auto vids_p1 = store.list_page(5, 5, CaptureKind::Video);
+    CHECK(vids_p1.has_value() && vids_p1->size() == 5);
+    // Videos are 595, 590, 585, 580, 575 (page 0), then 570, 565, 560, 555, 550 (page 1)
+    CHECK((*vids_p1)[0].path == "C:\\Captures\\2024-09\\item_570.mp4");
+
+    // find_row_index with timestamp ties & kind filters
+    CHECK(store.find_row_index((*p0)[0].id) == 0);
+    CHECK(store.find_row_index((*p0)[1].id) == 1);
+    CHECK(store.find_row_index((*p_last)[4].id) == 599);
+    CHECK(store.find_row_index((*vids_p1)[0].id, CaptureKind::Video) == 5);
+    CHECK(!store.find_row_index((*vids_p1)[0].id, CaptureKind::Image).has_value());
+
+    // list_ids_range + get_by_ids (> 500 chunk boundary) + summarize_ids
+    const auto all_ids = store.list_ids_range(600, 0);
+    CHECK(all_ids.has_value() && all_ids->size() == 600);
+    const auto sum = store.summarize_ids(*all_ids);
+    CHECK(sum.has_value() && sum->count == 600u && sum->image_count == 480u && sum->video_count == 120u);
+    // Sum of (1000 + i) for i = 0..599 == 600*1000 + 599*600/2 == 779700
+    CHECK(sum->total_bytes == 779700u);
+
+    const std::array<int64_t, 3> custom_order = {(*all_ids)[599], (*all_ids)[0], (*all_ids)[123]};
+    const auto by_ids = store.get_by_ids(custom_order);
+    CHECK(by_ids.has_value() && by_ids->size() == 3);
+    CHECK((*by_ids)[0].id == (*all_ids)[599] && (*by_ids)[1].id == (*all_ids)[0] && (*by_ids)[2].id == (*all_ids)[123]);
+
+    const auto by_ids_ord = store.get_by_ids_ordered(custom_order);
+    CHECK(by_ids_ord.has_value() && by_ids_ord->size() == 3);
+    CHECK((*by_ids_ord)[0].id == (*all_ids)[0] && (*by_ids_ord)[1].id == (*all_ids)[123] && (*by_ids_ord)[2].id == (*all_ids)[599]);
+
+    // SQLite multi-token AND search (ASCII + Unicode + mode + date)
+    const auto s_emoji = store.search_ids("🦄 discord firefox");
+    CHECK(s_emoji.has_value() && s_emoji->size() == 1);
+    const auto s_emoji_rows = store.get_by_ids(*s_emoji);
+    CHECK(s_emoji_rows.has_value() && s_emoji_rows->size() == 1 && (*s_emoji_rows)[0].path == "C:\\Captures\\2024-09\\item_42.png");
+
+    const auto s_mode = store.search_ids("recording mp4 firefox");
+    // i divisible by 5 (video/recording) AND divisible by 3 (firefox) => multiples of 15 in 0..599 => 40 items
+    CHECK(s_mode.has_value() && s_mode->size() == 40);
+
+    const auto s_date = store.search_ids("2024-09 item_599");
+    CHECK(s_date.has_value() && s_date->size() == 1);
+
+    const auto s_kind = store.search_ids("firefox", CaptureKind::Video);
+    CHECK(s_kind.has_value() && s_kind->size() == 40);
+
+    // filter_existing_ids
+    CHECK(store.remove((*all_ids)[0]));
+    const auto kept = store.filter_existing_ids(*all_ids, CaptureKind::Image);
+    CHECK(kept.has_value() && kept->size() == 479u && !kept->contains((*all_ids)[0]));
+
+    store.close();
+    fs::remove(tmp, ec);
+    fs::remove(tmp.wstring() + L"-wal", ec);
+    fs::remove(tmp.wstring() + L"-shm", ec);
+}
+
 int main() {
     test_startup_logic();
     test_hotkey_collisions();
@@ -845,5 +949,6 @@ int main() {
     test_recording_logic();
     test_color_logic();
     test_sharex_import();
+    test_history_paging_and_search();
     return capusy::test::failures == 0 ? 0 : 1;
 }
