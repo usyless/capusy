@@ -4,6 +4,7 @@
 #include <capusy/capture_logic.hpp>
 #include <capusy/history_store.hpp>
 #include <capusy/hotkeys.hpp>
+#include <capusy/recording_logic.hpp>
 #include <capusy/startup_logic.hpp>
 #include <capusy/update_logic.hpp>
 #include <capusy/ui/anim.hpp>
@@ -365,6 +366,14 @@ static void test_audio_capture_helpers() {
     CHECK(std::abs(mixed[2] - 16384) <= 2);
     CHECK(std::abs(mixed[3] + 16384) <= 2);
 
+    // Mono mix downmixes stereo L/R and applies soft-limiting
+    const std::array<float, 4> ma = {0.5f, -0.5f, 0.9f, 0.9f};
+    const std::array<float, 4> mb = {0.0f, 0.0f, 0.9f, 0.9f};
+    std::array<int16_t, 2> mono_out{};
+    mix_stereo_to_mono_pcm16(ma, mb, mono_out);
+    CHECK(std::abs(mono_out[0]) <= 1);
+    CHECK(mono_out[1] > 28000 && mono_out[1] <= 32767);
+
     // Device label resolution
     const std::vector<AudioDeviceInfo> devs = {
         {.id = "id-spk", .name = L"Speakers (Realtek)", .is_default = true},
@@ -376,6 +385,95 @@ static void test_audio_capture_helpers() {
     CHECK(resolve_audio_device_label("", {}, L"Default Output") == L"No device found");
 }
 
+static void test_recording_logic() {
+    using namespace capusy;
+
+    CHECK(parse_record_format("mp4") == RecordFormat::Mp4);
+    CHECK(parse_record_format("WMV") == RecordFormat::Wmv);
+    CHECK(parse_record_format("gif") == RecordFormat::Gif);
+    CHECK(parse_record_format("unknown") == RecordFormat::Mp4);
+    CHECK(record_format_ext(RecordFormat::Mp4) == L".mp4");
+    CHECK(record_format_ext(RecordFormat::Wmv) == L".wmv");
+    CHECK(record_format_ext(RecordFormat::Gif) == L".gif");
+    CHECK(record_format_supports_audio(RecordFormat::Mp4));
+    CHECK(record_format_supports_audio(RecordFormat::Wmv));
+    CHECK(!record_format_supports_audio(RecordFormat::Gif));
+
+    CHECK(parse_video_codec("h264") == VideoCodec::H264);
+    CHECK(parse_video_codec("hevc") == VideoCodec::Hevc);
+    CHECK(parse_video_codec("H.265") == VideoCodec::Hevc);
+    CHECK(parse_video_codec("invalid") == VideoCodec::H264);
+
+    CHECK(parse_h264_profile("baseline") == H264Profile::Baseline);
+    CHECK(parse_h264_profile("main") == H264Profile::Main);
+    CHECK(parse_h264_profile("high") == H264Profile::High);
+    CHECK(parse_h264_profile("other") == H264Profile::High);
+
+    CHECK(parse_rate_control("vbr") == RateControlMode::Vbr);
+    CHECK(parse_rate_control("quality") == RateControlMode::Quality);
+    CHECK(parse_rate_control("cbr") == RateControlMode::Cbr);
+    CHECK(parse_rate_control("unknown") == RateControlMode::Vbr);
+
+    CHECK(clamp_record_fps(1) == RECORD_FPS_MIN);
+    CHECK(clamp_record_fps(24) == 24u);
+    CHECK(clamp_record_fps(120) == RECORD_FPS_MAX);
+    CHECK(effective_record_fps(60, RecordFormat::Mp4) == 60u);
+    CHECK(effective_record_fps(60, RecordFormat::Gif) == RECORD_GIF_FPS_MAX);
+    CHECK(effective_record_fps(15, RecordFormat::Gif) == 15u);
+
+    CHECK(clamp_record_bitrate_mbps(0) == 1u);
+    CHECK(clamp_record_bitrate_mbps(15) == 15u);
+    CHECK(clamp_record_bitrate_mbps(99) == 50u);
+    CHECK(clamp_record_quality(0) == 10u);
+    CHECK(clamp_record_quality(85) == 85u);
+    CHECK(clamp_record_quality(120) == 100u);
+    CHECK(clamp_record_scale_pct(10) == 25u);
+    CHECK(clamp_record_scale_pct(75) == 75u);
+    CHECK(clamp_record_scale_pct(200) == 100u);
+    CHECK(clamp_record_keyframe_s(0) == 1u);
+    CHECK(clamp_record_keyframe_s(5) == 5u);
+    CHECK(clamp_record_keyframe_s(30) == 10u);
+
+    CHECK(normalize_audio_bitrate_kbps(64) == 96u);
+    CHECK(normalize_audio_bitrate_kbps(128) == 128u);
+    CHECK(normalize_audio_bitrate_kbps(160) == 160u);
+    CHECK(normalize_audio_bitrate_kbps(320) == 192u);
+    CHECK(normalize_audio_sample_rate(44100) == 44100u);
+    CHECK(normalize_audio_sample_rate(48000) == 48000u);
+    CHECK(normalize_audio_channels(1) == 1u);
+    CHECK(normalize_audio_channels(2) == 2u);
+    CHECK(normalize_audio_channels(6) == 2u);
+    CHECK(normalize_gif_colors(32) == 64u);
+    CHECK(normalize_gif_colors(128) == 128u);
+    CHECK(normalize_gif_colors(256) == 256u);
+
+    // Scaling preserves even alignment & minimum 16x16
+    const auto [w1, h1] = compute_scaled_video_dimensions(1920, 1080, 50, true);
+    CHECK(w1 == 960u && h1 == 540u);
+    const auto [w2, h2] = compute_scaled_video_dimensions(1921, 1081, 100, true);
+    CHECK(w2 == 1920u && h2 == 1080u);
+    const auto [w3, h3] = compute_scaled_video_dimensions(20, 20, 25, true);
+    CHECK(w3 == 16u && h3 == 16u);
+    const auto [w4, h4] = compute_scaled_video_dimensions(301, 201, 100, false);
+    CHECK(w4 == 301u && h4 == 201u);
+
+    // GIF frame delay centiseconds
+    CHECK(gif_frame_delay_cs(10) == 10u);
+    CHECK(gif_frame_delay_cs(20) == 5u);
+    CHECK(gif_frame_delay_cs(30) == 3u);
+
+    // GIF detection helper
+    CHECK(is_gif_capture("GIF", "C:\\clip.mp4"));
+    CHECK(is_gif_capture("", "C:\\clip.gif"));
+    CHECK(!is_gif_capture("MP4", "C:\\clip.mp4"));
+
+    // Spec summary formatting
+    CHECK(format_recording_spec_summary(RecordFormat::Mp4, VideoCodec::H264, RateControlMode::Vbr, 30, 12, 80, 100, 256) == L"MP4 • H.264 • 30 FPS • 12M");
+    CHECK(format_recording_spec_summary(RecordFormat::Mp4, VideoCodec::Hevc, RateControlMode::Quality, 60, 12, 85, 75, 256) == L"MP4 • HEVC • 60 FPS • Q85 • 75%");
+    CHECK(format_recording_spec_summary(RecordFormat::Wmv, VideoCodec::H264, RateControlMode::Cbr, 24, 8, 80, 100, 256) == L"WMV • 24 FPS • 8M");
+    CHECK(format_recording_spec_summary(RecordFormat::Gif, VideoCodec::H264, RateControlMode::Vbr, 60, 12, 80, 50, 128) == L"GIF • 30 FPS • 128c • 50%");
+}
+
 int main() {
     test_startup_logic();
     test_hotkey_collisions();
@@ -385,5 +483,6 @@ int main() {
     test_update_logic();
     test_ui_primitives();
     test_audio_capture_helpers();
+    test_recording_logic();
     return capusy::test::failures == 0 ? 0 : 1;
 }

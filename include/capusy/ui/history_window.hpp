@@ -312,6 +312,10 @@ private:
         return &entries_[static_cast<size_t>(selected_idx_)];
     }
 
+    [[nodiscard]] static bool is_playable_video(const CaptureEntry& e) noexcept {
+        return e.kind == CaptureKind::Video && !is_gif_capture(e.format, e.path);
+    }
+
     void sync_preview_media() {
         const CaptureEntry* e = selected_entry();
         if (!e) {
@@ -320,7 +324,7 @@ private:
             return;
         }
         const std::wstring wpath = to_wide(e->path);
-        if (e->kind == CaptureKind::Video) {
+        if (is_playable_video(*e)) {
             if (visible() && sh_.gfx.d3d()) {
                 video_.open(wpath, sh_.gfx.d3d(), sh_.gfx.epoch(), true);
                 SetTimer(hwnd_, TIMER_VIDEO, 16, nullptr);
@@ -735,8 +739,9 @@ private:
             return;
         }
 
+        const bool playable_video = is_playable_video(*e);
         const float footer_h = 68.0f;
-        const float video_bar_h = (e->kind == CaptureKind::Video) ? 44.0f : 0.0f;
+        const float video_bar_h = playable_video ? 44.0f : 0.0f;
         const D2D1_RECT_F stage = D2D1::RectF(area.left + 18.0f, area.top + 18.0f, area.right - 18.0f, area.bottom - footer_h - video_bar_h - 12.0f);
         preview_rect_ = stage;
 
@@ -744,7 +749,7 @@ private:
         cv.stroke_round(stage, 12.0f, with_alpha(cv.theme().outline_variant, 0.55f));
 
         const D2D1_RECT_F media_box = inset(stage, 10.0f, 10.0f);
-        if (e->kind == CaptureKind::Video) {
+        if (playable_video) {
             if (video_.has_frame() && video_.bitmap()) {
                 const FitBox fb = compute_preview_box(video_.native_width(), video_.native_height(), e->width, e->height, target_.scale(),
                                                       {.left = media_box.left, .top = media_box.top, .width = width(media_box), .height = height(media_box)});
@@ -1198,7 +1203,7 @@ private:
         if (vk == VK_RETURN && selected_idx_ >= 0) { open_entry(selected_idx_); return; }
         if (vk == VK_DELETE && selected_idx_ >= 0) { delete_entry(selected_idx_, true); return; }
         if (ctrl && vk == 'C' && selected_idx_ >= 0) { copy_entry(selected_idx_); return; }
-        if (vk == VK_SPACE && selected_entry() && selected_entry()->kind == CaptureKind::Video) {
+        if (vk == VK_SPACE && selected_entry() && is_playable_video(*selected_entry())) {
             if (!video_.active() || video_.failed()) {
                 sync_preview_media();
             } else {

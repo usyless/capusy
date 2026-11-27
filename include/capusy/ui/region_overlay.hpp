@@ -323,6 +323,7 @@ private:
         IdRecMicToggle,
         IdRecMicDrop,
         IdRecDropdownItem,
+        IdRecFmtQuick,
     };
 
     enum class AudioDropdown : uint8_t {
@@ -575,6 +576,7 @@ private:
             case IdRecDesktopDrop:
             case IdRecMicToggle:
             case IdRecMicDrop:
+            case IdRecFmtQuick:
                 return true;
             case IdTool:
                 return idx >= 0 && idx < 7;
@@ -682,6 +684,11 @@ private:
                 title = L"Select microphone device";
                 subtitle = resolve_audio_device_label(sh_.settings.record_mic_device_id, mic_devices_, L"Default Mic");
                 return true;
+            case IdRecFmtQuick:
+                if (idx == 0) title = L"Record as MP4 (H.264/HEVC + AAC)";
+                else if (idx == 1) title = L"Record as WMV (WMV9 + WMA)";
+                else title = L"Record as animated GIF (no audio)";
+                return true;
             default:
                 return false;
         }
@@ -725,12 +732,14 @@ private:
             (static_cast<float>(selection_.bottom) - mon_y) * inv_s);
 
         if (mode_ == OverlayMode::RecordRegion) {
+            const RecordFormat fmt = sh_.settings.resolved_record_format();
+            const bool audio_supported = record_format_supports_audio(fmt);
             const float rec_w = button_width(cv, L"Start Recording", true, 148.0f);
             const float cancel_w = button_width(cv, L"Cancel", true, 88.0f);
             const float pad = 12.0f;
             const float toggle_w = 108.0f;
-            const float tw = std::min(sz.width - 24.0f, 430.0f);
-            const float th = 138.0f;
+            const float tw = std::min(sz.width - 24.0f, 460.0f);
+            const float th = audio_supported ? 174.0f : 98.0f;
             const float tx = std::clamp(((sr.left + sr.right) * 0.5f) - (tw * 0.5f), 12.0f, std::max(12.0f, sz.width - tw - 12.0f));
             float ty = sr.bottom + 12.0f;
             if (ty + th > sz.height - 12.0f) ty = sr.top - th - 12.0f;
@@ -742,64 +751,88 @@ private:
             cv.stroke_round(bar, 12.0f, cv.theme().outline_variant);
 
             const float inner_w = tw - (pad * 2.0f);
-            const float drop_w = std::max(110.0f, inner_w - toggle_w - 8.0f);
-            const float drop_x = tx + pad + toggle_w + 8.0f;
 
-            // Row 1: Desktop audio toggle + output device dropdown
-            const float y1 = ty + 10.0f;
-            const bool desk_on = sh_.settings.record_desktop_audio;
-            draw_button(cv, hover_id_ == IdRecDesktopToggle ? 1.0f : 0.0f,
-                        rect(tx + pad, y1, toggle_w, 32.0f),
-                        desk_on ? glyph::volume : glyph::mute, L"Desktop",
-                        IdRecDesktopToggle, 0, desk_on ? 1 : 0);
-            const D2D1_RECT_F desk_drop = rect(drop_x, y1, drop_w, 32.0f);
-            const std::wstring desk_lbl = resolve_audio_device_label(sh_.settings.record_desktop_device_id, desktop_devices_, L"Default Output");
-            draw_dropdown_field(cv, hover_id_ == IdRecDesktopDrop ? 1.0f : 0.0f, desk_drop, desk_lbl,
-                                open_dropdown_ == AudioDropdown::Desktop, desk_on && !desktop_devices_.empty(),
-                                desktop_devices_.empty() ? IdNone : IdRecDesktopDrop);
+            // Row 0: Quick Format switch + live recording spec summary
+            const float y0 = ty + 10.0f;
+            static constexpr std::array<const wchar_t*, 3> fmt_lbls = {L"MP4", L"WMV", L"GIF"};
+            float fx = tx + pad;
+            for (int fi = 0; fi < 3; ++fi) {
+                const bool active = (static_cast<int>(fmt) == fi);
+                draw_button(cv, (hover_id_ == IdRecFmtQuick && hover_idx_ == fi) ? 1.0f : 0.0f,
+                            rect(fx, y0, 52.0f, 28.0f), 0, fmt_lbls[static_cast<size_t>(fi)],
+                            IdRecFmtQuick, fi, active ? 1 : 0);
+                fx += 58.0f;
+            }
+            const float spec_l = fx + 4.0f;
+            const float spec_r = tx + tw - pad;
+            if (spec_r - spec_l >= 60.0f) {
+                const FixedWString<80> spec = format_recording_spec_summary(
+                    fmt, sh_.settings.resolved_record_codec(), sh_.settings.resolved_rate_control(),
+                    sh_.settings.record_fps, sh_.settings.record_bitrate_mbps, sh_.settings.record_quality,
+                    sh_.settings.record_scale_pct, sh_.settings.record_gif_colors);
+                cv.text(spec, D2D1::RectF(spec_l, y0, spec_r, y0 + 28.0f), Font::Caption, cv.theme().on_surface_variant, Align::Right);
+            }
 
-            // Row 2: Microphone toggle + input device dropdown
-            const float y2 = y1 + 38.0f;
-            const bool mic_on = sh_.settings.record_mic_audio;
-            draw_button(cv, hover_id_ == IdRecMicToggle ? 1.0f : 0.0f,
-                        rect(tx + pad, y2, toggle_w, 32.0f),
-                        mic_on ? glyph::mic : glyph::mute, L"Mic",
-                        IdRecMicToggle, 0, mic_on ? 1 : 0);
-            const D2D1_RECT_F mic_drop = rect(drop_x, y2, drop_w, 32.0f);
-            const std::wstring mic_lbl = resolve_audio_device_label(sh_.settings.record_mic_device_id, mic_devices_, L"Default Mic");
-            draw_dropdown_field(cv, hover_id_ == IdRecMicDrop ? 1.0f : 0.0f, mic_drop, mic_lbl,
-                                open_dropdown_ == AudioDropdown::Mic, mic_on && !mic_devices_.empty(),
-                                mic_devices_.empty() ? IdNone : IdRecMicDrop);
+            D2D1_RECT_F desk_drop{};
+            D2D1_RECT_F mic_drop{};
+            float div_y = y0 + 36.0f;
 
-            // Divider + Row 3: Start Recording + summary + Cancel
-            const float div_y = y2 + 40.0f;
+            if (audio_supported) {
+                const float drop_w = std::max(110.0f, inner_w - toggle_w - 8.0f);
+                const float drop_x = tx + pad + toggle_w + 8.0f;
+
+                // Row 1: Desktop audio toggle + output device dropdown
+                const float y1 = y0 + 36.0f;
+                const bool desk_on = sh_.settings.record_desktop_audio;
+                draw_button(cv, hover_id_ == IdRecDesktopToggle ? 1.0f : 0.0f,
+                            rect(tx + pad, y1, toggle_w, 32.0f),
+                            desk_on ? glyph::volume : glyph::mute, L"Desktop",
+                            IdRecDesktopToggle, 0, desk_on ? 1 : 0);
+                desk_drop = rect(drop_x, y1, drop_w, 32.0f);
+                const std::wstring desk_lbl = resolve_audio_device_label(sh_.settings.record_desktop_device_id, desktop_devices_, L"Default Output");
+                draw_dropdown_field(cv, hover_id_ == IdRecDesktopDrop ? 1.0f : 0.0f, desk_drop, desk_lbl,
+                                    open_dropdown_ == AudioDropdown::Desktop, desk_on && !desktop_devices_.empty(),
+                                    desktop_devices_.empty() ? IdNone : IdRecDesktopDrop);
+
+                // Row 2: Microphone toggle + input device dropdown
+                const float y2 = y1 + 38.0f;
+                const bool mic_on = sh_.settings.record_mic_audio;
+                draw_button(cv, hover_id_ == IdRecMicToggle ? 1.0f : 0.0f,
+                            rect(tx + pad, y2, toggle_w, 32.0f),
+                            mic_on ? glyph::mic : glyph::mute, L"Mic",
+                            IdRecMicToggle, 0, mic_on ? 1 : 0);
+                mic_drop = rect(drop_x, y2, drop_w, 32.0f);
+                const std::wstring mic_lbl = resolve_audio_device_label(sh_.settings.record_mic_device_id, mic_devices_, L"Default Mic");
+                draw_dropdown_field(cv, hover_id_ == IdRecMicDrop ? 1.0f : 0.0f, mic_drop, mic_lbl,
+                                    open_dropdown_ == AudioDropdown::Mic, mic_on && !mic_devices_.empty(),
+                                    mic_devices_.empty() ? IdNone : IdRecMicDrop);
+                div_y = y2 + 40.0f;
+            }
+
+            // Divider + Final row: Start Recording + Cancel
             cv.hline(tx + pad, tx + tw - pad, div_y, with_alpha(cv.theme().outline_variant, 0.55f));
             const float y3 = div_y + 8.0f;
             draw_button(cv, hover_id_ == IdCapture ? 1.0f : 0.0f, rect(tx + pad, y3, rec_w, 32.0f),
                         glyph::video, L"Start Recording", IdCapture, 0, 2);
-
-            const float mid_l = tx + pad + rec_w + 8.0f;
-            const float mid_r = tx + tw - pad - cancel_w - 8.0f;
-            if (mid_r - mid_l >= 64.0f) {
-                FixedWString<32> spec;
-                spec.assign(to_fixed_wstr<8>(sh_.settings.record_fps));
-                spec.append(L" FPS • ");
-                spec.append(to_fixed_wstr<8>(sh_.settings.record_bitrate_mbps));
-                spec.append(L"M");
-                cv.text(spec, D2D1::RectF(mid_l, y3, mid_r, y3 + 32.0f), Font::Caption, cv.theme().on_surface_variant, Align::Center);
+            if (!audio_supported) {
+                const float mid_l = tx + pad + rec_w + 8.0f;
+                const float mid_r = tx + tw - pad - cancel_w - 8.0f;
+                if (mid_r - mid_l >= 60.0f) {
+                    cv.text(L"No audio (GIF)", D2D1::RectF(mid_l, y3, mid_r, y3 + 32.0f), Font::Caption, cv.theme().outline, Align::Center);
+                }
             }
             draw_button(cv, hover_id_ == IdCancel ? 1.0f : 0.0f, rect(tx + tw - pad - cancel_w, y3, cancel_w, 32.0f),
                         glyph::close, L"Cancel", IdCancel, 0, 3);
 
             // Open audio device dropdown popup (rendered last so it wins hit-testing)
-            if (open_dropdown_ != AudioDropdown::None) {
+            if (audio_supported && open_dropdown_ != AudioDropdown::None) {
                 const bool is_desk = (open_dropdown_ == AudioDropdown::Desktop);
                 const auto& devs = is_desk ? desktop_devices_ : mic_devices_;
                 const std::string& cur_id = is_desk ? sh_.settings.record_desktop_device_id : sh_.settings.record_mic_device_id;
                 std::vector<DropdownOption> opts;
                 opts.reserve(devs.size() + 1);
                 opts.push_back({
-                    .label = resolve_audio_device_label("", devs, is_desk ? L"System Default" : L"System Default"),
+                    .label = resolve_audio_device_label("", devs, L"System Default"),
                     .selected = cur_id.empty(),
                     .index = -1,
                 });
@@ -1113,6 +1146,14 @@ private:
                     if (sh_.on_redraw_all) sh_.on_redraw_all();
                 }
                 open_dropdown_ = AudioDropdown::None;
+                break;
+            case IdRecFmtQuick:
+                open_dropdown_ = AudioDropdown::None;
+                if (idx == 0) sh_.settings.record_format = "mp4";
+                else if (idx == 1) sh_.settings.record_format = "wmv";
+                else if (idx == 2) sh_.settings.record_format = "gif";
+                sh_.save();
+                if (sh_.on_redraw_all) sh_.on_redraw_all();
                 break;
             default:
                 break;

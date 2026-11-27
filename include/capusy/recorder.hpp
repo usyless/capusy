@@ -3,11 +3,15 @@
 #include "audio_capture.hpp"
 #include "capture.hpp"
 #include "common.hpp"
+#include "recording_logic.hpp"
 
+#include <codecapi.h>
 #include <mfapi.h>
+#include <mferror.h>
 #include <mfidl.h>
 #include <mfreadwrite.h>
-#include <mferror.h>
+#include <strmif.h>
+#include <wincodec.h>
 #include <wil/com.h>
 #include <wil/resource.h>
 
@@ -15,19 +19,36 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <functional>
+#include <limits>
 #include <mutex>
 #include <optional>
 #include <string>
 #include <thread>
+#include <vector>
 
 namespace capusy {
 
 struct RecordingConfig {
+    RecordFormat format = RecordFormat::Mp4;
+    VideoCodec codec = VideoCodec::H264;
+    H264Profile h264_profile = H264Profile::High;
+    RateControlMode rate_control = RateControlMode::Vbr;
     uint32_t fps = 30;
     uint32_t bitrate_mbps = 12;
+    uint32_t quality = 80;
+    uint32_t scale_pct = 100;
+    uint32_t keyframe_s = 2;
+    bool hw_accel = true;
+    bool fragmented_mp4 = false;
+    uint32_t audio_bitrate_kbps = 192;
+    uint32_t audio_sample_rate = 48000;
+    uint32_t audio_channels = 2;
+    uint32_t gif_colors = 256;
+    bool gif_dither = false;
     bool include_cursor = true;
     bool record_desktop_audio = true;
     bool record_mic_audio = false;
@@ -38,6 +59,7 @@ struct RecordingConfig {
 struct RecordingResult {
     bool ok = false;
     fs::path path;
+    std::string format_label;
     uint32_t width = 0;
     uint32_t height = 0;
     uint64_t duration_ms = 0;
@@ -46,8 +68,40 @@ struct RecordingResult {
     std::string error;
 };
 
-/// Native Windows Media Foundation H.264 + AAC MP4 region screen recorder.
-/// Zero external binaries; captures video via persistent DIB section and desktop/mic audio via WASAPI.
+/// Probes whether Windows Media Foundation has at least one HEVC (H.265) video encoder MFT available.
+/// Safe to call from STA (UI thread) or MTA (worker threads).
+[[nodiscard]] inline bool is_hevc_encoder_available(bool allow_hw = true) noexcept {
+    bool com_inited = false;
+    const HRESULT com_hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    if (SUCCEEDED(com_hr)) com_inited = true;
+    const auto com_guard = wil::scope_exit([&] {
+        if (com_inited) CoUninitialize();
+    });
+
+    if (FAILED(MFStartup(MF_VERSION))) return false;
+    const auto mf_guard = wil::scope_exit([] { MFShutdown(); });
+
+    MFT_REGISTER_TYPE_INFO out_info{};
+    out_info.guidMajorType = MFMediaType_Video;
+    out_info.guidSubtype = MFVideoFormat_HEVC;
+
+    DWORD flags = MFT_ENUM_FLAG_SYNCMFT | MFT_ENUM_FLAG_ASYNCMFT | MFT_ENUM_FLAG_SORTANDFILTER;
+    if (allow_hw) flags |= MFT_ENUM_FLAG_HARDWARE;
+
+    IMFActivate** activates = nullptr;
+    UINT32 count = 0;
+    const HRESULT hr = MFTEnumEx(MFT_CATEGORY_VIDEO_ENCODER, flags, nullptr, &out_info, &activates, &count);
+    if (SUCCEEDED(hr) && activates) {
+        for (UINT32 i = 0; i < count; ++i) {
+            if (activates[i]) activates[i]->Release();
+        }
+        CoTaskMemFree(activates);
+    }
+    return SUCCEEDED(hr) && count > 0;
+}
+
+/// Native Windows Media Foundation (MP4 H.264/HEVC + AAC, WMV9 + WMA) and WIC Animated GIF region screen recorder.
+/// Zero external binaries; captures video via persistent DIB section(s) and desktop/mic audio via WASAPI.
 class RegionRecorder {
 public:
     RegionRecorder() = default;
@@ -74,23 +128,45 @@ public:
         if (active_.load(std::memory_order_acquire)) return false;
         stop_sync();
 
-        // H.264 requires even width and even height (>= 16x16).
-        uint32_t w = static_cast<uint32_t>(std::max<LONG>(0, region.right - region.left)) & ~1u;
-        uint32_t h = static_cast<uint32_t>(std::max<LONG>(0, region.bottom - region.top)) & ~1u;
-        if (w < 16u) w = 16u;
-        if (h < 16u) h = 16u;
-        region_ = RECT{.left = region.left, .top = region.top, .right = region.left + static_cast<LONG>(w), .bottom = region.top + static_cast<LONG>(h)};
-        cfg.fps = (cfg.fps == 60u) ? 60u : 30u;
-        cfg.bitrate_mbps = std::clamp(cfg.bitrate_mbps, 2u, 50u);
+        cfg.fps = effective_record_fps(cfg.fps, cfg.format);
+        cfg.bitrate_mbps = clamp_record_bitrate_mbps(cfg.bitrate_mbps);
+        cfg.quality = clamp_record_quality(cfg.quality);
+        cfg.scale_pct = clamp_record_scale_pct(cfg.scale_pct);
+        cfg.keyframe_s = clamp_record_keyframe_s(cfg.keyframe_s);
+        cfg.audio_bitrate_kbps = normalize_audio_bitrate_kbps(cfg.audio_bitrate_kbps);
+        cfg.audio_sample_rate = normalize_audio_sample_rate(cfg.audio_sample_rate);
+        cfg.audio_channels = normalize_audio_channels(cfg.audio_channels);
+        cfg.gif_colors = normalize_gif_colors(cfg.gif_colors);
 
+        const bool require_even = record_format_uses_mf(cfg.format);
+        uint32_t src_w = static_cast<uint32_t>(std::max<LONG>(0, region.right - region.left));
+        uint32_t src_h = static_cast<uint32_t>(std::max<LONG>(0, region.bottom - region.top));
+        if (require_even) {
+            src_w &= ~1u;
+            src_h &= ~1u;
+        }
+        if (src_w < 16u) src_w = 16u;
+        if (src_h < 16u) src_h = 16u;
+
+        region_ = RECT{
+            .left = region.left,
+            .top = region.top,
+            .right = region.left + static_cast<LONG>(src_w),
+            .bottom = region.top + static_cast<LONG>(src_h),
+        };
+        const auto [out_w, out_h] = compute_scaled_video_dimensions(src_w, src_h, cfg.scale_pct, require_even);
+
+        const bool want_audio = record_format_supports_audio(cfg.format);
         stop_requested_.store(false, std::memory_order_release);
-        desktop_audio_active_.store(cfg.record_desktop_audio, std::memory_order_release);
-        mic_audio_active_.store(cfg.record_mic_audio, std::memory_order_release);
+        desktop_audio_active_.store(want_audio && cfg.record_desktop_audio, std::memory_order_release);
+        mic_audio_active_.store(want_audio && cfg.record_mic_audio, std::memory_order_release);
         active_.store(true, std::memory_order_release);
         start_time_ = std::chrono::steady_clock::now();
 
-        worker_ = std::jthread([this, r = region_, w, h, output_path, cfg = std::move(cfg)] {
-            RecordingResult res = run_worker(r, w, h, output_path, cfg);
+        worker_ = std::jthread([this, r = region_, src_w, src_h, out_w, out_h, output_path, cfg = std::move(cfg)] {
+            RecordingResult res = (cfg.format == RecordFormat::Gif)
+                ? run_gif_worker(r, src_w, src_h, out_w, out_h, output_path, cfg)
+                : run_mf_worker(r, src_w, src_h, out_w, out_h, output_path, cfg);
             desktop_audio_active_.store(false, std::memory_order_release);
             mic_audio_active_.store(false, std::memory_order_release);
             active_.store(false, std::memory_order_release);
@@ -112,27 +188,195 @@ public:
     }
 
 private:
-    static bool configure_video_stream(IMFSinkWriter* writer, uint32_t w, uint32_t h, uint32_t fps, uint32_t bitrate,
+    /// Persistent GDI capture surface with zero per-frame allocations and optional HALFTONE downscaling.
+    class CaptureSurface {
+    public:
+        bool init(uint32_t src_w, uint32_t src_h, uint32_t out_w, uint32_t out_h, std::string& err) {
+            src_w_ = src_w;
+            src_h_ = src_h;
+            out_w_ = out_w;
+            out_h_ = out_h;
+            scaled_ = (src_w_ != out_w_ || src_h_ != out_h_);
+
+            screen_dc_.reset(GetDC(nullptr));
+            out_dc_.reset(screen_dc_ ? CreateCompatibleDC(screen_dc_.get()) : nullptr);
+            if (!screen_dc_ || !out_dc_) {
+                err = "Failed to create capture DC";
+                return false;
+            }
+
+            BITMAPINFO out_bmi{};
+            out_bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+            out_bmi.bmiHeader.biWidth = static_cast<LONG>(out_w_);
+            out_bmi.bmiHeader.biHeight = -static_cast<LONG>(out_h_); // negative = top-down RGB32
+            out_bmi.bmiHeader.biPlanes = 1;
+            out_bmi.bmiHeader.biBitCount = 32;
+            out_bmi.bmiHeader.biCompression = BI_RGB;
+
+            out_dib_.reset(CreateDIBSection(out_dc_.get(), &out_bmi, DIB_RGB_COLORS, &out_bits_, nullptr, 0));
+            if (!out_dib_ || !out_bits_) {
+                err = "CreateDIBSection failed";
+                return false;
+            }
+            old_out_bmp_ = SelectObject(out_dc_.get(), out_dib_.get());
+
+            if (scaled_) {
+                src_dc_.reset(CreateCompatibleDC(screen_dc_.get()));
+                if (!src_dc_) {
+                    err = "Failed to create scaling source DC";
+                    return false;
+                }
+                BITMAPINFO src_bmi{};
+                src_bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+                src_bmi.bmiHeader.biWidth = static_cast<LONG>(src_w_);
+                src_bmi.bmiHeader.biHeight = -static_cast<LONG>(src_h_);
+                src_bmi.bmiHeader.biPlanes = 1;
+                src_bmi.bmiHeader.biBitCount = 32;
+                src_bmi.bmiHeader.biCompression = BI_RGB;
+
+                void* src_bits = nullptr;
+                src_dib_.reset(CreateDIBSection(src_dc_.get(), &src_bmi, DIB_RGB_COLORS, &src_bits, nullptr, 0));
+                if (!src_dib_ || !src_bits) {
+                    err = "CreateDIBSection (source) failed";
+                    return false;
+                }
+                old_src_bmp_ = SelectObject(src_dc_.get(), src_dib_.get());
+                SetStretchBltMode(out_dc_.get(), HALFTONE);
+                SetBrushOrgEx(out_dc_.get(), 0, 0, nullptr);
+            }
+            return true;
+        }
+
+        ~CaptureSurface() {
+            if (src_dc_ && old_src_bmp_) SelectObject(src_dc_.get(), old_src_bmp_);
+            if (out_dc_ && old_out_bmp_) SelectObject(out_dc_.get(), old_out_bmp_);
+        }
+
+        void grab(RECT region, bool include_cursor) noexcept {
+            if (!scaled_) {
+                BitBlt(out_dc_.get(), 0, 0, static_cast<int>(out_w_), static_cast<int>(out_h_),
+                       screen_dc_.get(), region.left, region.top, SRCCOPY | CAPTUREBLT);
+                if (include_cursor) {
+                    draw_cursor_into_dc(out_dc_.get(), region.left, region.top);
+                }
+            } else {
+                BitBlt(src_dc_.get(), 0, 0, static_cast<int>(src_w_), static_cast<int>(src_h_),
+                       screen_dc_.get(), region.left, region.top, SRCCOPY | CAPTUREBLT);
+                if (include_cursor) {
+                    draw_cursor_into_dc(src_dc_.get(), region.left, region.top);
+                }
+                StretchBlt(out_dc_.get(), 0, 0, static_cast<int>(out_w_), static_cast<int>(out_h_),
+                           src_dc_.get(), 0, 0, static_cast<int>(src_w_), static_cast<int>(src_h_), SRCCOPY);
+            }
+            GdiFlush();
+        }
+
+        [[nodiscard]] const void* bits() const noexcept { return out_bits_; }
+        [[nodiscard]] DWORD frame_bytes() const noexcept { return out_w_ * out_h_ * 4u; }
+
+        [[nodiscard]] ui::Raster copy_first_frame() const {
+            ui::Raster thumb;
+            thumb.w = out_w_;
+            thumb.h = out_h_;
+            const DWORD bytes = frame_bytes();
+            thumb.pixels.resize(bytes);
+            std::memcpy(thumb.pixels.data(), out_bits_, bytes);
+            const size_t pixel_count = static_cast<size_t>(out_w_) * out_h_;
+            auto* px32 = reinterpret_cast<uint32_t*>(thumb.pixels.data());
+            for (size_t i = 0; i < pixel_count; ++i) px32[i] |= 0xFF000000u;
+            return thumb;
+        }
+
+    private:
+        uint32_t src_w_ = 0;
+        uint32_t src_h_ = 0;
+        uint32_t out_w_ = 0;
+        uint32_t out_h_ = 0;
+        bool scaled_ = false;
+        wil::unique_hdc_window screen_dc_;
+        wil::unique_hdc src_dc_;
+        wil::unique_hbitmap src_dib_;
+        HGDIOBJ old_src_bmp_ = nullptr;
+        wil::unique_hdc out_dc_;
+        wil::unique_hbitmap out_dib_;
+        HGDIOBJ old_out_bmp_ = nullptr;
+        void* out_bits_ = nullptr;
+    };
+
+    static UINT32 to_mf_h264_profile(H264Profile p) noexcept {
+        switch (p) {
+            case H264Profile::Baseline: return eAVEncH264VProfile_Base;
+            case H264Profile::Main: return eAVEncH264VProfile_Main;
+            case H264Profile::High: return eAVEncH264VProfile_High;
+        }
+        return eAVEncH264VProfile_High;
+    }
+
+    static UINT32 to_mf_rate_control(RateControlMode m) noexcept {
+        switch (m) {
+            case RateControlMode::Vbr: return eAVEncCommonRateControlMode_UnconstrainedVBR;
+            case RateControlMode::Quality: return eAVEncCommonRateControlMode_Quality;
+            case RateControlMode::Cbr: return eAVEncCommonRateControlMode_CBR;
+        }
+        return eAVEncCommonRateControlMode_UnconstrainedVBR;
+    }
+
+    static void apply_codec_api_best_effort(IMFSinkWriter* writer, DWORD stream_idx,
+                                            const RecordingConfig& cfg, uint32_t fps, uint32_t bitrate) noexcept {
+        wil::com_ptr<ICodecAPI> codec_api;
+        if (FAILED(writer->GetServiceForStream(stream_idx, GUID_NULL, IID_PPV_ARGS(&codec_api))) || !codec_api) {
+            return;
+        }
+        const auto set_u32 = [&](const GUID& prop, UINT32 val) noexcept {
+            VARIANT v{};
+            v.vt = VT_UI4;
+            v.ulVal = val;
+            (void)codec_api->SetValue(&prop, &v);
+        };
+        set_u32(CODECAPI_AVEncCommonRateControlMode, to_mf_rate_control(cfg.rate_control));
+        if (cfg.rate_control == RateControlMode::Quality) {
+            set_u32(CODECAPI_AVEncCommonQuality, cfg.quality);
+        } else {
+            set_u32(CODECAPI_AVEncCommonMeanBitRate, bitrate);
+        }
+        set_u32(CODECAPI_AVEncMPVGOPSize, std::max<uint32_t>(1u, fps * cfg.keyframe_s));
+    }
+
+    static bool configure_video_stream(IMFSinkWriter* writer, uint32_t w, uint32_t h, uint32_t fps,
+                                       const RecordingConfig& cfg, VideoCodec effective_codec,
                                        DWORD& out_stream_idx, std::string& err) {
+        const uint32_t target_bitrate = (cfg.rate_control == RateControlMode::Quality)
+            ? estimate_quality_hint_bitrate_bps(cfg.quality, cfg.bitrate_mbps)
+            : (cfg.bitrate_mbps * 1'000'000u);
+
         wil::com_ptr<IMFMediaType> out_type;
         if (FAILED(MFCreateMediaType(&out_type)) || !out_type) {
             err = "MFCreateMediaType (video output) failed";
             return false;
         }
         out_type->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
-        out_type->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_H264);
-        out_type->SetUINT32(MF_MT_AVG_BITRATE, bitrate);
+        if (cfg.format == RecordFormat::Wmv) {
+            out_type->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_WMV3);
+        } else if (effective_codec == VideoCodec::Hevc) {
+            out_type->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_HEVC);
+        } else {
+            out_type->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_H264);
+            out_type->SetUINT32(MF_MT_MPEG2_PROFILE, to_mf_h264_profile(cfg.h264_profile));
+        }
+        out_type->SetUINT32(MF_MT_AVG_BITRATE, target_bitrate);
         out_type->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
         MFSetAttributeSize(out_type.get(), MF_MT_FRAME_SIZE, w, h);
         MFSetAttributeRatio(out_type.get(), MF_MT_FRAME_RATE, fps, 1);
         MFSetAttributeRatio(out_type.get(), MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
 
         if (FAILED(writer->AddStream(out_type.get(), &out_stream_idx))) {
-            err = "Failed to add H.264 output stream";
+            err = (cfg.format == RecordFormat::Wmv)
+                ? "Failed to add WMV9 output stream"
+                : (effective_codec == VideoCodec::Hevc ? "Failed to add HEVC output stream" : "Failed to add H.264 output stream");
             return false;
         }
 
-        // Input stream: top-down 32bpp RGB32 (positive MF_MT_DEFAULT_STRIDE = top-down, universally accepted by HW & SW Windows H.264 MFTs)
+        // Input stream: top-down 32bpp RGB32 (positive MF_MT_DEFAULT_STRIDE = top-down, universally accepted by HW & SW MFTs)
         wil::com_ptr<IMFMediaType> in_type;
         if (FAILED(MFCreateMediaType(&in_type)) || !in_type) {
             err = "MFCreateMediaType (video input) failed";
@@ -146,22 +390,40 @@ private:
         MFSetAttributeRatio(in_type.get(), MF_MT_FRAME_RATE, fps, 1);
         MFSetAttributeRatio(in_type.get(), MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
 
-        if (FAILED(writer->SetInputMediaType(out_stream_idx, in_type.get(), nullptr))) {
-            err = "Failed to configure RGB32 input media type";
-            return false;
+        wil::com_ptr<IMFAttributes> enc_params;
+        if (SUCCEEDED(MFCreateAttributes(&enc_params, 4)) && enc_params) {
+            enc_params->SetUINT32(CODECAPI_AVEncCommonRateControlMode, to_mf_rate_control(cfg.rate_control));
+            if (cfg.rate_control == RateControlMode::Quality) {
+                enc_params->SetUINT32(CODECAPI_AVEncCommonQuality, cfg.quality);
+            } else {
+                enc_params->SetUINT32(CODECAPI_AVEncCommonMeanBitRate, target_bitrate);
+            }
+            enc_params->SetUINT32(CODECAPI_AVEncMPVGOPSize, std::max<uint32_t>(1u, fps * cfg.keyframe_s));
+        }
+
+        if (FAILED(writer->SetInputMediaType(out_stream_idx, in_type.get(), enc_params.get()))) {
+            // Some hardware or WMV MFTs reject CodecAPI attributes during SetInputMediaType; retry cleanly and apply best-effort.
+            if (FAILED(writer->SetInputMediaType(out_stream_idx, in_type.get(), nullptr))) {
+                err = "Failed to configure RGB32 input media type";
+                return false;
+            }
+            apply_codec_api_best_effort(writer, out_stream_idx, cfg, fps, target_bitrate);
         }
         return true;
     }
 
-    static bool configure_audio_stream(IMFSinkWriter* writer, DWORD& out_stream_idx) {
+    static bool configure_aac_audio_stream(IMFSinkWriter* writer, uint32_t bitrate_kbps, uint32_t sample_rate,
+                                           uint32_t channels, DWORD& out_stream_idx,
+                                           uint32_t& actual_sample_rate, uint32_t& actual_channels) {
         wil::com_ptr<IMFMediaType> out_type;
         if (FAILED(MFCreateMediaType(&out_type)) || !out_type) return false;
+        const uint32_t bytes_per_sec = (bitrate_kbps * 1000u) / 8u;
         out_type->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Audio);
         out_type->SetGUID(MF_MT_SUBTYPE, MFAudioFormat_AAC);
         out_type->SetUINT32(MF_MT_AUDIO_BITS_PER_SAMPLE, 16);
-        out_type->SetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND, AUDIO_OUT_SAMPLE_RATE);
-        out_type->SetUINT32(MF_MT_AUDIO_NUM_CHANNELS, AUDIO_OUT_CHANNELS);
-        out_type->SetUINT32(MF_MT_AUDIO_AVG_BYTES_PER_SECOND, 24000); // 192 kbps AAC-LC
+        out_type->SetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND, sample_rate);
+        out_type->SetUINT32(MF_MT_AUDIO_NUM_CHANNELS, channels);
+        out_type->SetUINT32(MF_MT_AUDIO_AVG_BYTES_PER_SECOND, bytes_per_sec);
         out_type->SetUINT32(MF_MT_AAC_PAYLOAD_TYPE, 0);
         out_type->SetUINT32(MF_MT_AAC_AUDIO_PROFILE_LEVEL_INDICATION, 0x29);
 
@@ -169,21 +431,101 @@ private:
 
         wil::com_ptr<IMFMediaType> in_type;
         if (FAILED(MFCreateMediaType(&in_type)) || !in_type) return false;
-        const uint32_t block_align = AUDIO_OUT_CHANNELS * 2u;
+        const uint32_t block_align = channels * 2u;
         in_type->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Audio);
         in_type->SetGUID(MF_MT_SUBTYPE, MFAudioFormat_PCM);
         in_type->SetUINT32(MF_MT_AUDIO_BITS_PER_SAMPLE, 16);
-        in_type->SetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND, AUDIO_OUT_SAMPLE_RATE);
-        in_type->SetUINT32(MF_MT_AUDIO_NUM_CHANNELS, AUDIO_OUT_CHANNELS);
+        in_type->SetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND, sample_rate);
+        in_type->SetUINT32(MF_MT_AUDIO_NUM_CHANNELS, channels);
         in_type->SetUINT32(MF_MT_AUDIO_BLOCK_ALIGNMENT, block_align);
-        in_type->SetUINT32(MF_MT_AUDIO_AVG_BYTES_PER_SECOND, AUDIO_OUT_SAMPLE_RATE * block_align);
+        in_type->SetUINT32(MF_MT_AUDIO_AVG_BYTES_PER_SECOND, sample_rate * block_align);
 
-        return SUCCEEDED(writer->SetInputMediaType(out_stream_idx, in_type.get(), nullptr));
+        if (FAILED(writer->SetInputMediaType(out_stream_idx, in_type.get(), nullptr))) return false;
+        actual_sample_rate = sample_rate;
+        actual_channels = channels;
+        return true;
+    }
+
+    static bool configure_wma_audio_stream(IMFSinkWriter* writer, uint32_t bitrate_kbps, uint32_t sample_rate,
+                                           uint32_t channels, DWORD& out_stream_idx,
+                                           uint32_t& actual_sample_rate, uint32_t& actual_channels) {
+        const DWORD flags = (MFT_ENUM_FLAG_ALL & ~MFT_ENUM_FLAG_FIELDOFUSE) | MFT_ENUM_FLAG_SORTANDFILTER;
+        const uint32_t target_bps = (bitrate_kbps * 1000u) / 8u;
+
+        wil::com_ptr<IMFMediaType> best_type;
+        uint64_t best_score = (std::numeric_limits<uint64_t>::max)();
+        uint32_t best_sr = sample_rate;
+        uint32_t best_ch = channels;
+
+        const std::array<GUID, 2> subtypes = {MFAudioFormat_WMAudioV9, MFAudioFormat_WMAudioV8};
+        for (const GUID& sub : subtypes) {
+            wil::com_ptr<IMFCollection> coll;
+            if (FAILED(MFTranscodeGetAudioOutputAvailableTypes(sub, flags, nullptr, &coll)) || !coll) continue;
+            DWORD count = 0;
+            if (FAILED(coll->GetElementCount(&count))) continue;
+            for (DWORD i = 0; i < count; ++i) {
+                wil::com_ptr<IUnknown> unk;
+                if (FAILED(coll->GetElement(i, &unk)) || !unk) continue;
+                wil::com_ptr<IMFMediaType> mt;
+                if (FAILED(unk->QueryInterface(IID_PPV_ARGS(&mt))) || !mt) continue;
+                UINT32 ch = 0;
+                UINT32 sr = 0;
+                UINT32 bps = 0;
+                UINT32 bits = 16;
+                (void)mt->GetUINT32(MF_MT_AUDIO_NUM_CHANNELS, &ch);
+                (void)mt->GetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND, &sr);
+                (void)mt->GetUINT32(MF_MT_AUDIO_AVG_BYTES_PER_SECOND, &bps);
+                (void)mt->GetUINT32(MF_MT_AUDIO_BITS_PER_SAMPLE, &bits);
+                if ((ch != 1u && ch != 2u) || sr == 0 || bits != 16u) continue;
+
+                const uint64_t ch_pen = (ch == channels) ? 0ull : 10'000'000ull;
+                const uint64_t sr_pen = (sr == sample_rate) ? 0ull : 1'000'000ull;
+                const uint64_t bps_diff = (bps > target_bps) ? (bps - target_bps) : (target_bps - bps);
+                const uint64_t score = ch_pen + sr_pen + bps_diff;
+                if (score < best_score) {
+                    best_score = score;
+                    best_type = mt;
+                    best_sr = sr;
+                    best_ch = ch;
+                }
+            }
+            if (best_type) break;
+        }
+        if (!best_type) return false;
+
+        if (FAILED(writer->AddStream(best_type.get(), &out_stream_idx))) return false;
+
+        wil::com_ptr<IMFMediaType> in_type;
+        if (FAILED(MFCreateMediaType(&in_type)) || !in_type) return false;
+        const uint32_t block_align = best_ch * 2u;
+        in_type->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Audio);
+        in_type->SetGUID(MF_MT_SUBTYPE, MFAudioFormat_PCM);
+        in_type->SetUINT32(MF_MT_AUDIO_BITS_PER_SAMPLE, 16);
+        in_type->SetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND, best_sr);
+        in_type->SetUINT32(MF_MT_AUDIO_NUM_CHANNELS, best_ch);
+        in_type->SetUINT32(MF_MT_AUDIO_BLOCK_ALIGNMENT, block_align);
+        in_type->SetUINT32(MF_MT_AUDIO_AVG_BYTES_PER_SECOND, best_sr * block_align);
+
+        if (FAILED(writer->SetInputMediaType(out_stream_idx, in_type.get(), nullptr))) return false;
+        actual_sample_rate = best_sr;
+        actual_channels = best_ch;
+        return true;
+    }
+
+    static bool configure_audio_stream(IMFSinkWriter* writer, const RecordingConfig& cfg, DWORD& out_stream_idx,
+                                       uint32_t& actual_sample_rate, uint32_t& actual_channels) {
+        if (cfg.format == RecordFormat::Wmv) {
+            return configure_wma_audio_stream(writer, cfg.audio_bitrate_kbps, cfg.audio_sample_rate,
+                                              cfg.audio_channels, out_stream_idx, actual_sample_rate, actual_channels);
+        }
+        return configure_aac_audio_stream(writer, cfg.audio_bitrate_kbps, cfg.audio_sample_rate,
+                                          cfg.audio_channels, out_stream_idx, actual_sample_rate, actual_channels);
     }
 
     static bool write_audio_chunk(IMFSinkWriter* writer, std::mutex& writer_mx, DWORD audio_stream_idx,
-                                  const int16_t* pcm16, uint32_t frames, uint64_t sample_offset_frames) {
-        const DWORD bytes = frames * AUDIO_OUT_CHANNELS * sizeof(int16_t);
+                                  const int16_t* pcm16, uint32_t frames, uint32_t sample_rate, uint32_t channels,
+                                  uint64_t sample_offset_frames) {
+        const DWORD bytes = frames * channels * sizeof(int16_t);
         wil::com_ptr<IMFMediaBuffer> buf;
         wil::com_ptr<IMFSample> sample;
         if (FAILED(MFCreateMemoryBuffer(bytes, &buf)) || !buf ||
@@ -197,8 +539,8 @@ private:
         buf->SetCurrentLength(bytes);
         sample->AddBuffer(buf.get());
 
-        const LONGLONG ts_100ns = static_cast<LONGLONG>((sample_offset_frames * 10'000'000ull) / AUDIO_OUT_SAMPLE_RATE);
-        const LONGLONG dur_100ns = static_cast<LONGLONG>((static_cast<uint64_t>(frames) * 10'000'000ull) / AUDIO_OUT_SAMPLE_RATE);
+        const LONGLONG ts_100ns = static_cast<LONGLONG>((sample_offset_frames * 10'000'000ull) / sample_rate);
+        const LONGLONG dur_100ns = static_cast<LONGLONG>((static_cast<uint64_t>(frames) * 10'000'000ull) / sample_rate);
         sample->SetSampleTime(ts_100ns);
         sample->SetSampleDuration(dur_100ns);
 
@@ -206,15 +548,15 @@ private:
         return SUCCEEDED(writer->WriteSample(audio_stream_idx, sample.get()));
     }
 
-    RecordingResult run_worker(RECT region, uint32_t w, uint32_t h, const fs::path& output_path,
-                               const RecordingConfig& cfg) {
+    RecordingResult run_mf_worker(RECT region, uint32_t src_w, uint32_t src_h, uint32_t w, uint32_t h,
+                                  const fs::path& output_path, const RecordingConfig& cfg) {
         RecordingResult res;
         res.path = output_path;
+        res.format_label = std::string{record_format_label_utf8(cfg.format)};
         res.width = w;
         res.height = h;
 
         const uint32_t fps = cfg.fps;
-        const uint32_t bitrate = cfg.bitrate_mbps * 1'000'000u;
 
         const ulp::win::COMWrapper<false> com{static_cast<DWORD>(COINIT_MULTITHREADED)};
         if (FAILED(MFStartup(MF_VERSION))) {
@@ -226,53 +568,78 @@ private:
         std::error_code ec;
         if (output_path.has_parent_path()) fs::create_directories(output_path.parent_path(), ec);
 
-        // Initialize requested WASAPI audio capture streams before creating the MP4 sink writer.
+        // Initialize requested WASAPI audio capture streams before creating the sink writer.
         WasapiCaptureStream desktop_cap;
         WasapiCaptureStream mic_cap;
-        bool desktop_ok = cfg.record_desktop_audio && desktop_cap.open(AudioFlow::Render, cfg.desktop_device_id);
-        bool mic_ok = cfg.record_mic_audio && mic_cap.open(AudioFlow::Capture, cfg.mic_device_id);
+        bool desktop_ok = cfg.record_desktop_audio && desktop_cap.open(AudioFlow::Render, cfg.desktop_device_id, cfg.audio_sample_rate);
+        bool mic_ok = cfg.record_mic_audio && mic_cap.open(AudioFlow::Capture, cfg.mic_device_id, cfg.audio_sample_rate);
         bool has_audio = desktop_ok || mic_ok;
-
-        wil::com_ptr<IMFAttributes> attrs;
-        if (FAILED(MFCreateAttributes(&attrs, 2)) || !attrs) {
-            res.error = "MFCreateAttributes failed";
-            return res;
-        }
-        attrs->SetUINT32(MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, TRUE);
-        attrs->SetUINT32(MF_SINK_WRITER_DISABLE_THROTTLING, TRUE);
 
         wil::com_ptr<IMFSinkWriter> writer;
         DWORD video_stream_idx = 0;
         DWORD audio_stream_idx = 0;
+        uint32_t actual_audio_sr = cfg.audio_sample_rate;
+        uint32_t actual_audio_ch = cfg.audio_channels;
 
-        auto init_writer = [&](bool with_audio) -> bool {
+        auto try_init_writer = [&](VideoCodec eff_codec, bool use_hw, bool with_audio) -> bool {
             writer.reset();
+            wil::com_ptr<IMFAttributes> attrs;
+            if (FAILED(MFCreateAttributes(&attrs, 3)) || !attrs) {
+                res.error = "MFCreateAttributes failed";
+                return false;
+            }
+            attrs->SetUINT32(MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, use_hw ? TRUE : FALSE);
+            attrs->SetUINT32(MF_SINK_WRITER_DISABLE_THROTTLING, TRUE);
+            if (cfg.format == RecordFormat::Wmv) {
+                attrs->SetGUID(MF_TRANSCODE_CONTAINERTYPE, MFTranscodeContainerType_ASF);
+            } else {
+                attrs->SetGUID(MF_TRANSCODE_CONTAINERTYPE,
+                               cfg.fragmented_mp4 ? MFTranscodeContainerType_FMPEG4 : MFTranscodeContainerType_MPEG4);
+            }
+
             if (FAILED(MFCreateSinkWriterFromURL(output_path.c_str(), nullptr, attrs.get(), &writer)) || !writer) {
-                res.error = "Failed to create Media Foundation MP4 sink writer";
+                res.error = (cfg.format == RecordFormat::Wmv)
+                    ? "Failed to create Media Foundation WMV sink writer"
+                    : "Failed to create Media Foundation MP4 sink writer";
                 return false;
             }
-            if (!configure_video_stream(writer.get(), w, h, fps, bitrate, video_stream_idx, res.error)) {
+            if (!configure_video_stream(writer.get(), w, h, fps, cfg, eff_codec, video_stream_idx, res.error)) {
                 return false;
             }
-            if (with_audio && !configure_audio_stream(writer.get(), audio_stream_idx)) {
+            if (with_audio && !configure_audio_stream(writer.get(), cfg, audio_stream_idx, actual_audio_sr, actual_audio_ch)) {
                 return false;
             }
             return true;
         };
 
+        auto init_with_fallbacks = [&](bool with_audio) -> bool {
+            if (try_init_writer(cfg.codec, cfg.hw_accel, with_audio)) return true;
+            if (cfg.hw_accel && try_init_writer(cfg.codec, false, with_audio)) return true;
+            if (cfg.format == RecordFormat::Mp4 && cfg.codec == VideoCodec::Hevc) {
+                if (try_init_writer(VideoCodec::H264, cfg.hw_accel, with_audio)) return true;
+                if (cfg.hw_accel && try_init_writer(VideoCodec::H264, false, with_audio)) return true;
+            }
+            return false;
+        };
+
         if (has_audio) {
-            if (!init_writer(true)) {
-                // Gracefully fall back to video-only if AAC stream setup fails on this system.
+            if (!init_with_fallbacks(true)) {
+                // Gracefully fall back to video-only if audio stream setup fails on this system.
                 desktop_cap.close();
                 mic_cap.close();
                 desktop_ok = false;
                 mic_ok = false;
                 has_audio = false;
                 res.error.clear();
-                if (!init_writer(false)) return res;
+                if (!init_with_fallbacks(false)) return res;
             }
         } else {
-            if (!init_writer(false)) return res;
+            if (!init_with_fallbacks(false)) return res;
+        }
+
+        if (has_audio && actual_audio_sr != cfg.audio_sample_rate) {
+            if (desktop_ok) desktop_cap.retarget_sample_rate(actual_audio_sr);
+            if (mic_ok) mic_cap.retarget_sample_rate(actual_audio_sr);
         }
 
         desktop_audio_active_.store(desktop_ok, std::memory_order_release);
@@ -283,29 +650,10 @@ private:
             return res;
         }
 
-        // Persistent GDI capture DIB section (top-down: biHeight = -h to match positive MF_MT_DEFAULT_STRIDE, zero per-frame allocations)
-        const wil::unique_hdc_window screen_dc{GetDC(nullptr)};
-        const wil::unique_hdc mem_dc{screen_dc ? CreateCompatibleDC(screen_dc.get()) : nullptr};
-        if (!screen_dc || !mem_dc) {
-            res.error = "Failed to create capture DC";
+        CaptureSurface surface;
+        if (!surface.init(src_w, src_h, w, h, res.error)) {
             return res;
         }
-
-        BITMAPINFO bmi{};
-        bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-        bmi.bmiHeader.biWidth = static_cast<LONG>(w);
-        bmi.bmiHeader.biHeight = -static_cast<LONG>(h); // negative = top-down RGB32
-        bmi.bmiHeader.biPlanes = 1;
-        bmi.bmiHeader.biBitCount = 32;
-        bmi.bmiHeader.biCompression = BI_RGB;
-
-        void* bits = nullptr;
-        const wil::unique_hbitmap dib{CreateDIBSection(mem_dc.get(), &bmi, DIB_RGB_COLORS, &bits, nullptr, 0)};
-        if (!dib || !bits) {
-            res.error = "CreateDIBSection failed";
-            return res;
-        }
-        const auto old_bmp = wil::SelectObject(mem_dc.get(), dib.get());
 
         if (desktop_ok && !desktop_cap.start()) desktop_ok = false;
         if (mic_ok && !mic_cap.start()) mic_ok = false;
@@ -317,18 +665,19 @@ private:
         std::jthread audio_thread;
 
         if (has_audio) {
-            audio_thread = std::jthread([&, t0, desktop_ok, mic_ok, audio_stream_idx] {
+            audio_thread = std::jthread([&, t0, desktop_ok, mic_ok, audio_stream_idx, actual_audio_sr, actual_audio_ch] {
                 const ulp::win::COMWrapper<false> audio_com{static_cast<DWORD>(COINIT_MULTITHREADED)};
-                StereoFloatFifo desktop_fifo{AUDIO_OUT_SAMPLE_RATE};
-                StereoFloatFifo mic_fifo{AUDIO_OUT_SAMPLE_RATE};
-                std::array<float, AUDIO_CHUNK_FRAMES * AUDIO_OUT_CHANNELS> mix_a{};
-                std::array<float, AUDIO_CHUNK_FRAMES * AUDIO_OUT_CHANNELS> mix_b{};
-                std::array<int16_t, AUDIO_CHUNK_FRAMES * AUDIO_OUT_CHANNELS> pcm16{};
+                const uint32_t chunk_frames = std::max<uint32_t>(256u, actual_audio_sr / 50u); // 20 ms chunks
+                StereoFloatFifo desktop_fifo{actual_audio_sr};
+                StereoFloatFifo mic_fifo{actual_audio_sr};
+                std::vector<float> mix_a(static_cast<size_t>(chunk_frames) * 2u, 0.0f);
+                std::vector<float> mix_b(static_cast<size_t>(chunk_frames) * 2u, 0.0f);
+                std::vector<int16_t> pcm16(static_cast<size_t>(chunk_frames) * actual_audio_ch, 0);
 
-                constexpr uint64_t kJitterCushionFrames = 1440u; // 30 ms
-                constexpr uint64_t kMaxLagBeforePad = 3840u;     // 80 ms
-                constexpr size_t kMaxBacklogFrames = 7680u;      // 160 ms
-                constexpr size_t kTrimTargetFrames = 1920u;      // 40 ms
+                const uint64_t jitter_cushion = (static_cast<uint64_t>(actual_audio_sr) * 30ull) / 1000ull;  // 30 ms
+                const uint64_t max_lag_pad = (static_cast<uint64_t>(actual_audio_sr) * 80ull) / 1000ull;     // 80 ms
+                const size_t max_backlog = (static_cast<size_t>(actual_audio_sr) * 160u) / 1000u;            // 160 ms
+                const size_t trim_target = (static_cast<size_t>(actual_audio_sr) * 40u) / 1000u;             // 40 ms
 
                 auto last_desktop_pkt = std::chrono::steady_clock::time_point{};
                 auto last_mic_pkt = std::chrono::steady_clock::time_point{};
@@ -338,43 +687,48 @@ private:
                     std::span<const float> sa{};
                     std::span<const float> sb{};
                     if (desktop_ok) {
-                        const size_t got = desktop_fifo.pop_frames(mix_a.data(), AUDIO_CHUNK_FRAMES);
-                        if (got < AUDIO_CHUNK_FRAMES) {
-                            std::fill(mix_a.begin() + static_cast<ptrdiff_t>(got * AUDIO_OUT_CHANNELS), mix_a.end(), 0.0f);
+                        const size_t got = desktop_fifo.pop_frames(mix_a.data(), chunk_frames);
+                        if (got < chunk_frames) {
+                            std::fill(mix_a.begin() + static_cast<ptrdiff_t>(got * 2u), mix_a.end(), 0.0f);
                         }
                         sa = mix_a;
                     }
                     if (mic_ok) {
-                        const size_t got = mic_fifo.pop_frames(mix_b.data(), AUDIO_CHUNK_FRAMES);
-                        if (got < AUDIO_CHUNK_FRAMES) {
-                            std::fill(mix_b.begin() + static_cast<ptrdiff_t>(got * AUDIO_OUT_CHANNELS), mix_b.end(), 0.0f);
+                        const size_t got = mic_fifo.pop_frames(mix_b.data(), chunk_frames);
+                        if (got < chunk_frames) {
+                            std::fill(mix_b.begin() + static_cast<ptrdiff_t>(got * 2u), mix_b.end(), 0.0f);
                         }
                         sb = mix_b;
                     }
-                    mix_stereo_to_pcm16(sa, sb, pcm16);
-                    (void)write_audio_chunk(writer.get(), writer_mx, audio_stream_idx, pcm16.data(), AUDIO_CHUNK_FRAMES, audio_frames_written);
-                    audio_frames_written += AUDIO_CHUNK_FRAMES;
+                    if (actual_audio_ch == 1u) {
+                        mix_stereo_to_mono_pcm16(sa, sb, pcm16);
+                    } else {
+                        mix_stereo_to_pcm16(sa, sb, pcm16);
+                    }
+                    (void)write_audio_chunk(writer.get(), writer_mx, audio_stream_idx, pcm16.data(),
+                                            chunk_frames, actual_audio_sr, actual_audio_ch, audio_frames_written);
+                    audio_frames_written += chunk_frames;
                 };
 
                 while (!stop_requested_.load(std::memory_order_acquire)) {
                     const auto now = std::chrono::steady_clock::now();
                     if (desktop_ok && desktop_cap.drain_into(desktop_fifo)) last_desktop_pkt = now;
                     if (mic_ok && mic_cap.drain_into(mic_fifo)) last_mic_pkt = now;
-                    desktop_fifo.trim_excess(kMaxBacklogFrames, kTrimTargetFrames);
-                    mic_fifo.trim_excess(kMaxBacklogFrames, kTrimTargetFrames);
+                    desktop_fifo.trim_excess(max_backlog, trim_target);
+                    mic_fifo.trim_excess(max_backlog, trim_target);
 
                     const auto elapsed_us = std::max<int64_t>(0, std::chrono::duration_cast<std::chrono::microseconds>(now - t0).count());
-                    const uint64_t target_frames = (static_cast<uint64_t>(elapsed_us) * AUDIO_OUT_SAMPLE_RATE) / 1'000'000ull;
-                    const uint64_t emit_limit = (target_frames > kJitterCushionFrames) ? (target_frames - kJitterCushionFrames) : 0ull;
+                    const uint64_t target_frames = (static_cast<uint64_t>(elapsed_us) * actual_audio_sr) / 1'000'000ull;
+                    const uint64_t emit_limit = (target_frames > jitter_cushion) ? (target_frames - jitter_cushion) : 0ull;
 
-                    while (audio_frames_written + AUDIO_CHUNK_FRAMES <= emit_limit) {
+                    while (audio_frames_written + chunk_frames <= emit_limit) {
                         const bool desktop_recent = desktop_ok && last_desktop_pkt.time_since_epoch().count() != 0 &&
                                                     (now - last_desktop_pkt) < std::chrono::milliseconds{50};
                         const bool mic_recent = mic_ok && last_mic_pkt.time_since_epoch().count() != 0 &&
                                                 (now - last_mic_pkt) < std::chrono::milliseconds{50};
-                        const bool desktop_waiting = desktop_recent && desktop_fifo.frames_available() < AUDIO_CHUNK_FRAMES;
-                        const bool mic_waiting = mic_recent && mic_fifo.frames_available() < AUDIO_CHUNK_FRAMES;
-                        if ((desktop_waiting || mic_waiting) && (target_frames - audio_frames_written) < kMaxLagBeforePad) {
+                        const bool desktop_waiting = desktop_recent && desktop_fifo.frames_available() < chunk_frames;
+                        const bool mic_waiting = mic_recent && mic_fifo.frames_available() < chunk_frames;
+                        if ((desktop_waiting || mic_waiting) && (target_frames - audio_frames_written) < max_lag_pad) {
                             break;
                         }
                         emit_one_chunk();
@@ -391,9 +745,9 @@ private:
 
                 const auto end_us = std::max<int64_t>(0, std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count());
                 const uint64_t final_target = std::max<uint64_t>(
-                    AUDIO_CHUNK_FRAMES,
-                    (static_cast<uint64_t>(end_us) * AUDIO_OUT_SAMPLE_RATE) / 1'000'000ull);
-                while (audio_frames_written + AUDIO_CHUNK_FRAMES <= final_target) {
+                    chunk_frames,
+                    (static_cast<uint64_t>(end_us) * actual_audio_sr) / 1'000'000ull);
+                while (audio_frames_written + chunk_frames <= final_target) {
                     emit_one_chunk();
                 }
                 if (audio_frames_written == 0) {
@@ -402,7 +756,7 @@ private:
             });
         }
 
-        const DWORD frame_bytes = w * h * 4u;
+        const DWORD frame_bytes = surface.frame_bytes();
         const LONGLONG frame_dur_100ns = 10'000'000ll / static_cast<LONGLONG>(fps);
         const auto frame_period = std::chrono::microseconds{1'000'000 / fps};
         auto next_tick = t0;
@@ -412,24 +766,9 @@ private:
             const auto now = std::chrono::steady_clock::now();
             const LONGLONG ts_100ns = std::chrono::duration_cast<std::chrono::nanoseconds>(now - t0).count() / 100ll;
 
-            BitBlt(mem_dc.get(), 0, 0, static_cast<int>(w), static_cast<int>(h),
-                   screen_dc.get(), region.left, region.top, SRCCOPY | CAPTUREBLT);
-            if (cfg.include_cursor) {
-                draw_cursor_into_dc(mem_dc.get(), region.left, region.top);
-            }
-            GdiFlush();
-
-            // Capture first frame (already top-down BGRA) for instant corner thumbnail toast
+            surface.grab(region, cfg.include_cursor);
             if (!res.first_frame) {
-                ui::Raster thumb;
-                thumb.w = w;
-                thumb.h = h;
-                thumb.pixels.resize(frame_bytes);
-                std::memcpy(thumb.pixels.data(), bits, frame_bytes);
-                const size_t pixel_count = static_cast<size_t>(w) * h;
-                auto* px32 = reinterpret_cast<uint32_t*>(thumb.pixels.data());
-                for (size_t i = 0; i < pixel_count; ++i) px32[i] |= 0xFF000000u;
-                res.first_frame = std::move(thumb);
+                res.first_frame = surface.copy_first_frame();
             }
 
             wil::com_ptr<IMFMediaBuffer> buf;
@@ -438,7 +777,7 @@ private:
                 SUCCEEDED(MFCreateSample(&sample)) && sample) {
                 BYTE* dst_ptr = nullptr;
                 if (SUCCEEDED(buf->Lock(&dst_ptr, nullptr, nullptr)) && dst_ptr) {
-                    std::memcpy(dst_ptr, bits, frame_bytes);
+                    std::memcpy(dst_ptr, surface.bits(), frame_bytes);
                     buf->Unlock();
                     buf->SetCurrentLength(frame_bytes);
                     sample->AddBuffer(buf.get());
@@ -478,7 +817,159 @@ private:
         } else {
             writer.reset();
             fs::remove(output_path, ec);
-            res.error = frames_written == 0 ? "No video frames were captured" : "Failed to finalize MP4 file";
+            res.error = frames_written == 0
+                ? "No video frames were captured"
+                : (cfg.format == RecordFormat::Wmv ? "Failed to finalize WMV file" : "Failed to finalize MP4 file");
+        }
+        return res;
+    }
+
+    RecordingResult run_gif_worker(RECT region, uint32_t src_w, uint32_t src_h, uint32_t w, uint32_t h,
+                                   const fs::path& output_path, const RecordingConfig& cfg) {
+        RecordingResult res;
+        res.path = output_path;
+        res.format_label = "GIF";
+        res.width = w;
+        res.height = h;
+
+        const uint32_t fps = cfg.fps;
+        const ulp::win::COMWrapper<false> com{static_cast<DWORD>(COINIT_MULTITHREADED)};
+
+        std::error_code ec;
+        if (output_path.has_parent_path()) fs::create_directories(output_path.parent_path(), ec);
+
+        wil::com_ptr<IWICImagingFactory> wic;
+        if (FAILED(CoCreateInstance(CLSID_WICImagingFactory2, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&wic))) || !wic) {
+            res.error = "Failed to initialize WIC for GIF recording";
+            return res;
+        }
+
+        wil::com_ptr<IWICStream> stream;
+        if (FAILED(wic->CreateStream(&stream)) || !stream ||
+            FAILED(stream->InitializeFromFilename(output_path.c_str(), GENERIC_WRITE))) {
+            res.error = "Failed to open GIF output file";
+            return res;
+        }
+
+        wil::com_ptr<IWICBitmapEncoder> encoder;
+        if (FAILED(wic->CreateEncoder(GUID_ContainerFormatGif, nullptr, &encoder)) || !encoder ||
+            FAILED(encoder->Initialize(stream.get(), WICBitmapEncoderNoCache))) {
+            res.error = "Failed to initialize WIC GIF encoder";
+            return res;
+        }
+
+        // Write NETSCAPE2.0 infinite loop application extension
+        wil::com_ptr<IWICMetadataQueryWriter> global_meta;
+        if (SUCCEEDED(encoder->GetMetadataQueryWriter(&global_meta)) && global_meta) {
+            std::array<BYTE, 11> app_id{'N', 'E', 'T', 'S', 'C', 'A', 'P', 'E', '2', '.', '0'};
+            PROPVARIANT pv_app{};
+            pv_app.vt = VT_UI1 | VT_VECTOR;
+            pv_app.caub.cElems = static_cast<ULONG>(app_id.size());
+            pv_app.caub.pElems = app_id.data();
+
+            std::array<BYTE, 4> loop_data{3, 1, 0, 0}; // 0 = loop infinitely
+            PROPVARIANT pv_data{};
+            pv_data.vt = VT_UI1 | VT_VECTOR;
+            pv_data.caub.cElems = static_cast<ULONG>(loop_data.size());
+            pv_data.caub.pElems = loop_data.data();
+
+            (void)global_meta->SetMetadataByName(L"/appext/Application", &pv_app);
+            (void)global_meta->SetMetadataByName(L"/appext/data", &pv_data);
+        }
+
+        CaptureSurface surface;
+        if (!surface.init(src_w, src_h, w, h, res.error)) {
+            return res;
+        }
+
+        const auto t0 = std::chrono::steady_clock::now();
+        const auto frame_period = std::chrono::microseconds{1'000'000 / fps};
+        const uint16_t nominal_delay_cs = gif_frame_delay_cs(fps);
+        const WICBitmapDitherType dither = cfg.gif_dither ? WICBitmapDitherTypeErrorDiffusion : WICBitmapDitherTypeNone;
+        const UINT stride = w * 4u;
+        const UINT frame_bytes = surface.frame_bytes();
+
+        auto next_tick = t0;
+        auto prev_capture_time = t0;
+        uint64_t frames_written = 0;
+
+        while (!stop_requested_.load(std::memory_order_acquire)) {
+            const auto cap_time = std::chrono::steady_clock::now();
+            surface.grab(region, cfg.include_cursor);
+            if (!res.first_frame) {
+                res.first_frame = surface.copy_first_frame();
+            }
+
+            uint16_t delay_cs = nominal_delay_cs;
+            if (frames_written > 0) {
+                const auto dt_ms = std::chrono::duration_cast<std::chrono::milliseconds>(cap_time - prev_capture_time).count();
+                if (dt_ms > 0) {
+                    delay_cs = static_cast<uint16_t>(std::clamp<int64_t>((dt_ms + 5) / 10, 2, 500));
+                }
+            }
+            prev_capture_time = cap_time;
+
+            wil::com_ptr<IWICBitmap> src_bmp;
+            if (SUCCEEDED(wic->CreateBitmapFromMemory(
+                    w, h, GUID_WICPixelFormat32bppBGR, stride, frame_bytes,
+                    const_cast<BYTE*>(reinterpret_cast<const BYTE*>(surface.bits())), &src_bmp)) && src_bmp) {
+                wil::com_ptr<IWICPalette> palette;
+                wil::com_ptr<IWICFormatConverter> conv;
+                wil::com_ptr<IWICBitmapFrameEncode> frame;
+                if (SUCCEEDED(wic->CreatePalette(&palette)) && palette &&
+                    SUCCEEDED(palette->InitializeFromBitmap(src_bmp.get(), cfg.gif_colors, FALSE)) &&
+                    SUCCEEDED(wic->CreateFormatConverter(&conv)) && conv &&
+                    SUCCEEDED(conv->Initialize(src_bmp.get(), GUID_WICPixelFormat8bppIndexed, dither,
+                                               palette.get(), 0.0, WICBitmapPaletteTypeCustom)) &&
+                    SUCCEEDED(encoder->CreateNewFrame(&frame, nullptr)) && frame &&
+                    SUCCEEDED(frame->Initialize(nullptr))) {
+                    (void)frame->SetSize(w, h);
+                    WICPixelFormatGUID pf = GUID_WICPixelFormat8bppIndexed;
+                    (void)frame->SetPixelFormat(&pf);
+                    (void)frame->SetPalette(palette.get());
+
+                    wil::com_ptr<IWICMetadataQueryWriter> fmeta;
+                    if (SUCCEEDED(frame->GetMetadataQueryWriter(&fmeta)) && fmeta) {
+                        PROPVARIANT pv_delay{};
+                        pv_delay.vt = VT_UI2;
+                        pv_delay.uiVal = delay_cs;
+                        (void)fmeta->SetMetadataByName(L"/grctlext/Delay", &pv_delay);
+
+                        PROPVARIANT pv_disp{};
+                        pv_disp.vt = VT_UI1;
+                        pv_disp.bVal = 1; // Do not dispose (full-frame overwrite)
+                        (void)fmeta->SetMetadataByName(L"/grctlext/Disposal", &pv_disp);
+                    }
+
+                    if (SUCCEEDED(frame->WriteSource(conv.get(), nullptr)) && SUCCEEDED(frame->Commit())) {
+                        ++frames_written;
+                    }
+                }
+            }
+
+            next_tick += frame_period;
+            const auto after = std::chrono::steady_clock::now();
+            if (next_tick > after) {
+                std::this_thread::sleep_until(next_tick);
+            } else {
+                next_tick = after;
+            }
+        }
+
+        const auto end_time = std::chrono::steady_clock::now();
+        res.duration_ms = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(end_time - t0).count());
+
+        if (frames_written > 0 && SUCCEEDED(encoder->Commit())) {
+            encoder.reset();
+            stream.reset();
+            res.size_bytes = fs::file_size(output_path, ec);
+            if (ec) res.size_bytes = 0;
+            res.ok = true;
+        } else {
+            encoder.reset();
+            stream.reset();
+            fs::remove(output_path, ec);
+            res.error = frames_written == 0 ? "No GIF frames were captured" : "Failed to finalize GIF file";
         }
         return res;
     }

@@ -49,12 +49,14 @@ public:
     [[nodiscard]] bool visible() const noexcept { return shown_; }
     [[nodiscard]] HWND hwnd() const noexcept { return hwnd_; }
 
-    void show_capture(const std::wstring& path, const Raster* raster, uint32_t cap_w, uint32_t cap_h, bool is_video, bool copied) {
+    void show_capture(const std::wstring& path, const Raster* raster, uint32_t cap_w, uint32_t cap_h,
+                      bool is_video, bool copied, std::wstring_view video_badge = L"MP4") {
         if (!hwnd_ || !sh_.settings.show_corner_toast) return;
         if (!sh_.gfx.ensure_device(hwnd_)) return;
 
         path_ = path;
         is_video_ = is_video;
+        video_badge_.assign(video_badge.empty() ? L"MP4" : video_badge);
         copied_ = copied;
         meta_w_ = cap_w;
         meta_h_ = cap_h;
@@ -198,7 +200,7 @@ private:
             if (is_video_) {
                 const D2D1_RECT_F badge = rect(img_r.right - 46.0f, img_r.top + 6.0f, 40.0f, 18.0f);
                 cv.fill_round(badge, 5.0f, with_alpha(cv.theme().surface_lowest, 0.85f));
-                cv.text(L"MP4", badge, Font::Label, cv.theme().amber, Align::Center);
+                cv.text(video_badge_, badge, Font::Label, cv.theme().amber, Align::Center);
             }
 
             // Footer metadata
@@ -293,6 +295,7 @@ private:
     uint32_t meta_w_ = 0;
     uint32_t meta_h_ = 0;
     bool is_video_ = false;
+    FixedWString<16> video_badge_{L"MP4"};
     bool copied_ = false;
     bool shown_ = false;
     bool fading_out_ = false;

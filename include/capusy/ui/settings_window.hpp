@@ -5,6 +5,7 @@
 #include "widgets.hpp"
 
 #include <capusy/audio_capture.hpp>
+#include <capusy/recorder.hpp>
 #include <capusy/updater.hpp>
 
 #include <algorithm>
@@ -190,17 +191,40 @@ private:
         IdSliderToastSize,
         IdSliderToastTimeout,
         IdTestToast,
-        IdFps30,
-        IdFps60,
-        IdBitrate6,
-        IdBitrate12,
-        IdBitrate20,
+        IdRecFmtMp4,
+        IdRecFmtWmv,
+        IdRecFmtGif,
+        IdRecCodecH264,
+        IdRecCodecHevc,
+        IdRecProfBase,
+        IdRecProfMain,
+        IdRecProfHigh,
+        IdRecGifColors,
+        IdToggleRecGifDither,
+        IdRecFpsPreset,
+        IdSliderRecFps,
+        IdRecScalePreset,
+        IdSliderRecScale,
+        IdRecRcVbr,
+        IdRecRcQuality,
+        IdRecRcCbr,
+        IdRecBitratePreset,
+        IdSliderRecBitrate,
+        IdSliderRecQuality,
+        IdRecKeyframe,
+        IdToggleRecHwAccel,
+        IdToggleRecFragMp4,
         IdToggleRecordCursor,
         IdToggleRecDesktop,
         IdDropRecDesktop,
         IdToggleRecMic,
         IdDropRecMic,
         IdRecAudioDropItem,
+        IdRecAudioBitrate,
+        IdRecAudioRate44,
+        IdRecAudioRate48,
+        IdRecAudioMono,
+        IdRecAudioStereo,
         IdToggleAutoUpdate,
         IdCheckUpdates,
         IdInstallUpdate,
@@ -271,12 +295,19 @@ private:
         sw_split_month_.set(sh_.settings.split_by_month ? 1.0f : 0.0f, animate);
         sw_toast_.set(sh_.settings.show_corner_toast ? 1.0f : 0.0f, animate);
         sw_rec_cursor_.set(sh_.settings.record_cursor ? 1.0f : 0.0f, animate);
+        sw_rec_hw_accel_.set(sh_.settings.record_hw_accel ? 1.0f : 0.0f, animate);
+        sw_rec_frag_mp4_.set(sh_.settings.record_fragmented_mp4 ? 1.0f : 0.0f, animate);
+        sw_rec_gif_dither_.set(sh_.settings.record_gif_dither ? 1.0f : 0.0f, animate);
         sw_rec_desktop_.set(sh_.settings.record_desktop_audio ? 1.0f : 0.0f, animate);
         sw_rec_mic_.set(sh_.settings.record_mic_audio ? 1.0f : 0.0f, animate);
         sw_auto_update_.set(sh_.settings.auto_check_updates ? 1.0f : 0.0f, animate);
         if (!animate) {
             desktop_devices_ = enumerate_audio_devices(AudioFlow::Render);
             mic_devices_ = enumerate_audio_devices(AudioFlow::Capture);
+            if (!hevc_probed_) {
+                hevc_available_ = is_hevc_encoder_available(true);
+                hevc_probed_ = true;
+            }
         }
     }
 
@@ -304,6 +335,9 @@ private:
         if (sw_split_month_.step(dt, 22.0f, 0.004f)) moving = true;
         if (sw_toast_.step(dt, 22.0f, 0.004f)) moving = true;
         if (sw_rec_cursor_.step(dt, 22.0f, 0.004f)) moving = true;
+        if (sw_rec_hw_accel_.step(dt, 22.0f, 0.004f)) moving = true;
+        if (sw_rec_frag_mp4_.step(dt, 22.0f, 0.004f)) moving = true;
+        if (sw_rec_gif_dither_.step(dt, 22.0f, 0.004f)) moving = true;
         if (sw_rec_desktop_.step(dt, 22.0f, 0.004f)) moving = true;
         if (sw_rec_mic_.step(dt, 22.0f, 0.004f)) moving = true;
         if (sw_auto_update_.step(dt, 22.0f, 0.004f)) moving = true;
@@ -498,16 +532,39 @@ private:
             case IdSliderToastSize:
             case IdSliderToastTimeout:
             case IdTestToast:
-            case IdFps30:
-            case IdFps60:
-            case IdBitrate6:
-            case IdBitrate12:
-            case IdBitrate20:
+            case IdRecFmtMp4:
+            case IdRecFmtWmv:
+            case IdRecFmtGif:
+            case IdRecCodecH264:
+            case IdRecCodecHevc:
+            case IdRecProfBase:
+            case IdRecProfMain:
+            case IdRecProfHigh:
+            case IdRecGifColors:
+            case IdToggleRecGifDither:
+            case IdRecFpsPreset:
+            case IdSliderRecFps:
+            case IdRecScalePreset:
+            case IdSliderRecScale:
+            case IdRecRcVbr:
+            case IdRecRcQuality:
+            case IdRecRcCbr:
+            case IdRecBitratePreset:
+            case IdSliderRecBitrate:
+            case IdSliderRecQuality:
+            case IdRecKeyframe:
+            case IdToggleRecHwAccel:
+            case IdToggleRecFragMp4:
             case IdToggleRecordCursor:
             case IdToggleRecDesktop:
             case IdDropRecDesktop:
             case IdToggleRecMic:
             case IdDropRecMic:
+            case IdRecAudioBitrate:
+            case IdRecAudioRate44:
+            case IdRecAudioRate48:
+            case IdRecAudioMono:
+            case IdRecAudioStereo:
             case IdToggleAutoUpdate:
             case IdCheckUpdates:
             case IdInstallUpdate:
@@ -578,11 +635,48 @@ private:
             case IdSliderToastSize: title = L"Adjust corner preview width (160–420 px)"; return true;
             case IdSliderToastTimeout: title = L"Adjust how long the corner preview stays visible (1–15 s)"; return true;
             case IdTestToast: title = L"Preview the corner thumbnail notification right now"; return true;
-            case IdFps30: title = L"Record at 30 frames per second (smaller files)"; return true;
-            case IdFps60: title = L"Record at 60 frames per second (smoother motion)"; return true;
-            case IdBitrate6: title = L"Standard video bitrate (6 Mbps)"; return true;
-            case IdBitrate12: title = L"High video bitrate (12 Mbps)"; return true;
-            case IdBitrate20: title = L"Ultra video bitrate (20 Mbps)"; return true;
+            case IdRecFmtMp4: title = L"MP4 container with H.264/HEVC video and AAC audio (recommended)"; return true;
+            case IdRecFmtWmv: title = L"WMV container with Windows Media Video 9 and WMA audio"; return true;
+            case IdRecFmtGif: title = L"Animated GIF via WIC (no audio, loops infinitely)"; return true;
+            case IdRecCodecH264: title = L"H.264 (AVC) — universal playback compatibility"; return true;
+            case IdRecCodecHevc:
+                title = L"HEVC (H.265) — smaller files at equivalent quality";
+                subtitle = hevc_available_ ? L"HEVC encoder detected on this PC" : L"No HEVC encoder detected — falls back to H.264";
+                return true;
+            case IdRecProfBase: title = L"H.264 Baseline profile — maximum legacy compatibility"; return true;
+            case IdRecProfMain: title = L"H.264 Main profile — balanced quality and compatibility"; return true;
+            case IdRecProfHigh: title = L"H.264 High profile — sharpest text and best compression"; return true;
+            case IdRecGifColors:
+                title = ulp::str::concat_strings(L"Quantize each GIF frame to ", to_fixed_wstr<16>(idx), L" adaptive colors");
+                return true;
+            case IdToggleRecGifDither: title = L"Enable Floyd-Steinberg error-diffusion dithering for smoother gradients"; return true;
+            case IdRecFpsPreset:
+                title = ulp::str::concat_strings(L"Set target frame rate to ", to_fixed_wstr<16>(idx), L" FPS");
+                return true;
+            case IdSliderRecFps:
+                title = (sh_.settings.resolved_record_format() == RecordFormat::Gif)
+                    ? L"Adjust GIF recording frame rate (5–30 FPS)"
+                    : L"Adjust video recording frame rate (5–60 FPS)";
+                return true;
+            case IdRecScalePreset:
+                title = (idx == 100)
+                    ? L"Record at native 100% pixel resolution"
+                    : ulp::str::concat_strings(L"Downscale recorded output to ", to_fixed_wstr<16>(idx), L"% resolution");
+                return true;
+            case IdSliderRecScale: title = L"Adjust output resolution scale (25%–100%)"; return true;
+            case IdRecRcVbr: title = L"Variable Bitrate — adapts to motion while targeting average bitrate"; return true;
+            case IdRecRcQuality: title = L"Quality-based VBR — targets consistent visual fidelity (ideal for screen text)"; return true;
+            case IdRecRcCbr: title = L"Constant Bitrate — strict steady bitrate for predictable file sizes"; return true;
+            case IdRecBitratePreset:
+                title = ulp::str::concat_strings(L"Set target video bitrate to ", to_fixed_wstr<16>(idx), L" Mbps");
+                return true;
+            case IdSliderRecBitrate: title = L"Fine-tune target video bitrate (1–50 Mbps)"; return true;
+            case IdSliderRecQuality: title = L"Adjust quality target (10–100; higher = sharper, larger files)"; return true;
+            case IdRecKeyframe:
+                title = ulp::str::concat_strings(L"Insert a full keyframe every ", to_fixed_wstr<16>(idx), idx == 1 ? L" second" : L" seconds");
+                return true;
+            case IdToggleRecHwAccel: title = L"Prefer GPU hardware video encoding when available (disable to force software encoder)"; return true;
+            case IdToggleRecFragMp4: title = L"Write fragmented MP4 (fMP4) chunks so recordings stay playable if interrupted"; return true;
             case IdToggleRecordCursor: title = L"Include the mouse pointer in screen recordings"; return true;
             case IdToggleRecDesktop: title = L"Capture system audio via WASAPI loopback"; return true;
             case IdDropRecDesktop:
@@ -594,6 +688,13 @@ private:
                 title = L"Select microphone input device";
                 subtitle = resolve_audio_device_label(sh_.settings.record_mic_device_id, mic_devices_, L"System Default");
                 return true;
+            case IdRecAudioBitrate:
+                title = ulp::str::concat_strings(L"Encode audio track at ", to_fixed_wstr<16>(idx), L" kbps");
+                return true;
+            case IdRecAudioRate44: title = L"Record audio at 44.1 kHz sample rate"; return true;
+            case IdRecAudioRate48: title = L"Record audio at 48 kHz sample rate (standard for video)"; return true;
+            case IdRecAudioMono: title = L"Downmix audio to 1 channel (Mono — compact for voice)"; return true;
+            case IdRecAudioStereo: title = L"Record 2-channel Stereo audio"; return true;
             case IdToggleAutoUpdate: title = L"Check GitHub Releases automatically once every 24 hours"; return true;
             case IdCheckUpdates: title = L"Check GitHub Releases for a newer version now"; return true;
             case IdInstallUpdate:
@@ -913,71 +1014,414 @@ private:
             y = next_y;
         }
 
-        // 2. Region Screen Recording card
+        // 2. Region Screen Recording — Format & Video card
         {
-            const CardHeader hd = make_header(cv, rw, L"Region Screen Recording", cv.theme().on_surface,
-                                              L"Native Windows Media Foundation H.264 + AAC MP4 encoder");
+            const RecordFormat fmt = sh_.settings.resolved_record_format();
+            const VideoCodec codec = sh_.settings.resolved_record_codec();
+            const H264Profile prof = sh_.settings.resolved_h264_profile();
+            const RateControlMode rc = sh_.settings.resolved_rate_control();
+            const bool is_mp4 = (fmt == RecordFormat::Mp4);
+            const bool is_wmv = (fmt == RecordFormat::Wmv);
+            const bool is_gif = (fmt == RecordFormat::Gif);
+            const uint32_t eff_fps = effective_record_fps(sh_.settings.record_fps, fmt);
+
+            const CardHeader hd = make_header(
+                cv, rw, L"Screen Recording — Format & Video", cv.theme().on_surface,
+                L"Container format, codec, frame rate, resolution scale, and compression quality");
+
+            Flow fmt_row{8.0f, 8.0f};
+            flow_text(cv, fmt_row, L"Output format:", Font::Body, cv.theme().on_surface, 130.0f, 32.0f);
+            fmt_row.add(78.0f, 32.0f, [&](D2D1_RECT_F r) {
+                draw_button(cv, hover_.alpha(IdRecFmtMp4), r, 0, L"MP4", IdRecFmtMp4, 0, is_mp4 ? 1 : 0);
+            });
+            fmt_row.add(78.0f, 32.0f, [&](D2D1_RECT_F r) {
+                draw_button(cv, hover_.alpha(IdRecFmtWmv), r, 0, L"WMV", IdRecFmtWmv, 0, is_wmv ? 1 : 0);
+            });
+            fmt_row.add(78.0f, 32.0f, [&](D2D1_RECT_F r) {
+                draw_button(cv, hover_.alpha(IdRecFmtGif), r, 0, L"GIF", IdRecFmtGif, 0, is_gif ? 1 : 0);
+            });
+
+            Flow codec_row{8.0f, 8.0f};
+            Flow prof_row{8.0f, 8.0f};
+            Flow gif_row{8.0f, 8.0f};
+            std::wstring_view format_note;
+            if (is_mp4) {
+                flow_text(cv, codec_row, L"Video codec:", Font::Body, cv.theme().on_surface, 130.0f, 32.0f);
+                codec_row.add(86.0f, 32.0f, [&](D2D1_RECT_F r) {
+                    draw_button(cv, hover_.alpha(IdRecCodecH264), r, 0, L"H.264", IdRecCodecH264, 0, codec == VideoCodec::H264 ? 1 : 0);
+                });
+                codec_row.add(124.0f, 32.0f, [&](D2D1_RECT_F r) {
+                    draw_button(cv, hover_.alpha(IdRecCodecHevc), r, 0, L"HEVC (H.265)", IdRecCodecHevc, 0, codec == VideoCodec::Hevc ? 1 : 0);
+                });
+                if (codec == VideoCodec::H264) {
+                    flow_text(cv, prof_row, L"H.264 profile:", Font::Body, cv.theme().on_surface, 130.0f, 32.0f);
+                    prof_row.add(88.0f, 32.0f, [&](D2D1_RECT_F r) {
+                        draw_button(cv, hover_.alpha(IdRecProfBase), r, 0, L"Baseline", IdRecProfBase, 0, prof == H264Profile::Baseline ? 1 : 0);
+                    });
+                    prof_row.add(78.0f, 32.0f, [&](D2D1_RECT_F r) {
+                        draw_button(cv, hover_.alpha(IdRecProfMain), r, 0, L"Main", IdRecProfMain, 0, prof == H264Profile::Main ? 1 : 0);
+                    });
+                    prof_row.add(78.0f, 32.0f, [&](D2D1_RECT_F r) {
+                        draw_button(cv, hover_.alpha(IdRecProfHigh), r, 0, L"High", IdRecProfHigh, 0, prof == H264Profile::High ? 1 : 0);
+                    });
+                } else if (!hevc_available_) {
+                    format_note = L"No HEVC encoder detected on this PC — recordings will automatically fall back to H.264.";
+                }
+            } else if (is_wmv) {
+                format_note = L"Windows Media Video 9 (WMV3) + WMA audio inside a native ASF/WMV container.";
+            } else {
+                flow_text(cv, gif_row, L"GIF palette:", Font::Body, cv.theme().on_surface, 130.0f, 32.0f);
+                for (const int c : {64, 128, 256}) {
+                    const FixedWString<24> clbl = [&] {
+                        FixedWString<24> t{to_fixed_wstr<8>(c)};
+                        t.append(L" colors");
+                        return t;
+                    }();
+                    gif_row.add(92.0f, 32.0f, [&, c, clbl](D2D1_RECT_F r) {
+                        draw_button(cv, hover_.alpha(IdRecGifColors, c), r, 0, clbl, IdRecGifColors, c,
+                                    sh_.settings.record_gif_colors == static_cast<uint32_t>(c) ? 1 : 0);
+                    });
+                }
+            }
 
             Flow fps_row{8.0f, 8.0f};
             flow_text(cv, fps_row, L"Frame rate:", Font::Body, cv.theme().on_surface, 130.0f, 32.0f);
-            fps_row.add(88.0f, 32.0f, [&](D2D1_RECT_F r) {
-                draw_button(cv, hover_.alpha(IdFps30), r, 0, L"30 FPS", IdFps30, 0, sh_.settings.record_fps == 30 ? 1 : 0);
-            });
-            fps_row.add(88.0f, 32.0f, [&](D2D1_RECT_F r) {
-                draw_button(cv, hover_.alpha(IdFps60), r, 0, L"60 FPS", IdFps60, 0, sh_.settings.record_fps == 60 ? 1 : 0);
-            });
+            const std::array<int, 4> fps_presets = is_gif ? std::array<int, 4>{10, 15, 20, 30} : std::array<int, 4>{15, 24, 30, 60};
+            for (const int fp : fps_presets) {
+                FixedWString<16> flbl{to_fixed_wstr<8>(fp)};
+                flbl.append(L" FPS");
+                fps_row.add(78.0f, 32.0f, [&, fp, flbl](D2D1_RECT_F r) {
+                    draw_button(cv, hover_.alpha(IdRecFpsPreset, fp), r, 0, flbl, IdRecFpsPreset, fp,
+                                eff_fps == static_cast<uint32_t>(fp) ? 1 : 0);
+                });
+            }
 
+            Flow scale_row{8.0f, 8.0f};
+            flow_text(cv, scale_row, L"Resolution:", Font::Body, cv.theme().on_surface, 130.0f, 32.0f);
+            for (const int sc : {100, 75, 50}) {
+                const wchar_t* slbl = (sc == 100) ? L"100% (Native)" : (sc == 75 ? L"75%" : L"50%");
+                const float sw = (sc == 100) ? 118.0f : 68.0f;
+                scale_row.add(sw, 32.0f, [&, sc, slbl](D2D1_RECT_F r) {
+                    draw_button(cv, hover_.alpha(IdRecScalePreset, sc), r, 0, slbl, IdRecScalePreset, sc,
+                                sh_.settings.record_scale_pct == static_cast<uint32_t>(sc) ? 1 : 0);
+                });
+            }
+
+            Flow rc_row{8.0f, 8.0f};
             Flow br_row{8.0f, 8.0f};
-            flow_text(cv, br_row, L"Video quality:", Font::Body, cv.theme().on_surface, 130.0f, 32.0f);
-            br_row.add(118.0f, 32.0f, [&](D2D1_RECT_F r) {
-                draw_button(cv, hover_.alpha(IdBitrate6), r, 0, L"Standard (6M)", IdBitrate6, 0, sh_.settings.record_bitrate_mbps == 6 ? 1 : 0);
-            });
-            br_row.add(108.0f, 32.0f, [&](D2D1_RECT_F r) {
-                draw_button(cv, hover_.alpha(IdBitrate12), r, 0, L"High (12M)", IdBitrate12, 0, sh_.settings.record_bitrate_mbps == 12 ? 1 : 0);
-            });
-            br_row.add(112.0f, 32.0f, [&](D2D1_RECT_F r) {
-                draw_button(cv, hover_.alpha(IdBitrate20), r, 0, L"Ultra (20M)", IdBitrate20, 0, sh_.settings.record_bitrate_mbps == 20 ? 1 : 0);
-            });
+            Flow kf_row{8.0f, 8.0f};
+            if (!is_gif) {
+                flow_text(cv, rc_row, L"Rate control:", Font::Body, cv.theme().on_surface, 130.0f, 32.0f);
+                rc_row.add(76.0f, 32.0f, [&](D2D1_RECT_F r) {
+                    draw_button(cv, hover_.alpha(IdRecRcVbr), r, 0, L"VBR", IdRecRcVbr, 0, rc == RateControlMode::Vbr ? 1 : 0);
+                });
+                rc_row.add(86.0f, 32.0f, [&](D2D1_RECT_F r) {
+                    draw_button(cv, hover_.alpha(IdRecRcQuality), r, 0, L"Quality", IdRecRcQuality, 0, rc == RateControlMode::Quality ? 1 : 0);
+                });
+                rc_row.add(76.0f, 32.0f, [&](D2D1_RECT_F r) {
+                    draw_button(cv, hover_.alpha(IdRecRcCbr), r, 0, L"CBR", IdRecRcCbr, 0, rc == RateControlMode::Cbr ? 1 : 0);
+                });
 
-            const float r1_y = y + 16.0f + hd.h + 14.0f;
-            const float r2_y = r1_y + fps_row.height(rw) + 12.0f;
-            const float r3_y = r2_y + br_row.height(rw) + 14.0f;
-            const float sep_y = r3_y + 40.0f;
-            const float desk_y = sep_y + 14.0f;
-            const float desk_drop_y = desk_y + 36.0f;
-            const float mic_y = desk_drop_y + 44.0f;
-            const float mic_drop_y = mic_y + 36.0f;
-            const float card_h = (mic_drop_y + 34.0f + 16.0f) - y;
+                if (rc != RateControlMode::Quality) {
+                    flow_text(cv, br_row, L"Bitrate presets:", Font::Body, cv.theme().on_surface, 130.0f, 32.0f);
+                    for (const int mb : {4, 8, 12, 20, 35}) {
+                        FixedWString<16> blbl{to_fixed_wstr<8>(mb)};
+                        blbl.append(L" Mbps");
+                        br_row.add(78.0f, 32.0f, [&, mb, blbl](D2D1_RECT_F r) {
+                            draw_button(cv, hover_.alpha(IdRecBitratePreset, mb), r, 0, blbl, IdRecBitratePreset, mb,
+                                        sh_.settings.record_bitrate_mbps == static_cast<uint32_t>(mb) ? 1 : 0);
+                        });
+                    }
+                }
+
+                flow_text(cv, kf_row, L"Keyframe every:", Font::Body, cv.theme().on_surface, 130.0f, 32.0f);
+                for (const int ks : {1, 2, 5, 10}) {
+                    FixedWString<16> klbl{to_fixed_wstr<8>(ks)};
+                    klbl.append(L" s");
+                    kf_row.add(64.0f, 32.0f, [&, ks, klbl](D2D1_RECT_F r) {
+                        draw_button(cv, hover_.alpha(IdRecKeyframe, ks), r, 0, klbl, IdRecKeyframe, ks,
+                                    sh_.settings.record_keyframe_s == static_cast<uint32_t>(ks) ? 1 : 0);
+                    });
+                }
+            }
+
+            // Compute exact vertical layout
+            float cy = y + 16.0f + hd.h + 14.0f;
+            const float fmt_y = cy;
+            cy += fmt_row.height(rw) + 10.0f;
+
+            float codec_y = 0.0f;
+            float prof_y = 0.0f;
+            float gif_y = 0.0f;
+            float gif_dither_y = 0.0f;
+            float fmt_note_y = 0.0f;
+            float fmt_note_h = 0.0f;
+
+            if (is_mp4) {
+                codec_y = cy;
+                cy += codec_row.height(rw) + 10.0f;
+                if (codec == VideoCodec::H264) {
+                    prof_y = cy;
+                    cy += prof_row.height(rw) + 10.0f;
+                } else if (!format_note.empty()) {
+                    fmt_note_y = cy;
+                    fmt_note_h = text_height(cv, format_note, Font::Caption, rw, 18.0f);
+                    cy += fmt_note_h + 10.0f;
+                }
+            } else if (is_wmv) {
+                fmt_note_y = cy;
+                fmt_note_h = text_height(cv, format_note, Font::Caption, rw, 18.0f);
+                cy += fmt_note_h + 10.0f;
+            } else {
+                gif_y = cy;
+                cy += gif_row.height(rw) + 10.0f;
+                gif_dither_y = cy;
+                cy += 36.0f;
+            }
+
+            const float sep1_y = cy + 2.0f;
+            cy = sep1_y + 14.0f;
+
+            const float fps_y = cy;
+            cy += fps_row.height(rw) + 8.0f;
+            const float fps_slider_y = cy;
+            cy += 38.0f;
+
+            const float scale_y = cy;
+            cy += scale_row.height(rw) + 8.0f;
+            const float scale_slider_y = cy;
+            cy += 38.0f;
+
+            float sep2_y = 0.0f;
+            float rc_y = 0.0f;
+            float br_y = 0.0f;
+            float br_slider_y = 0.0f;
+            float q_slider_y = 0.0f;
+            float q_note_y = 0.0f;
+            float q_note_h = 0.0f;
+            float kf_y = 0.0f;
+            float hw_y = 0.0f;
+            float frag_y = 0.0f;
+            const std::wstring_view q_note = L"Quality-based VBR adapts bitrate automatically — crisp text with compact static frames.";
+
+            if (!is_gif) {
+                sep2_y = cy + 2.0f;
+                cy = sep2_y + 14.0f;
+
+                rc_y = cy;
+                cy += rc_row.height(rw) + 10.0f;
+
+                if (rc == RateControlMode::Quality) {
+                    q_slider_y = cy;
+                    cy += 36.0f;
+                    q_note_y = cy;
+                    q_note_h = text_height(cv, q_note, Font::Caption, rw, 18.0f);
+                    cy += q_note_h + 12.0f;
+                } else {
+                    br_y = cy;
+                    cy += br_row.height(rw) + 8.0f;
+                    br_slider_y = cy;
+                    cy += 40.0f;
+                }
+
+                kf_y = cy;
+                cy += kf_row.height(rw) + 12.0f;
+
+                hw_y = cy;
+                cy += 36.0f;
+                if (is_mp4) {
+                    frag_y = cy;
+                    cy += 36.0f;
+                }
+            }
+
+            const float sep3_y = cy + 2.0f;
+            const float cur_y = sep3_y + 12.0f;
+            const float card_h = (cur_y + 34.0f + 16.0f) - y;
             const float next_y = card_begin(cv, x, y, w, card_h, CARD_GAP);
 
             (void)draw_header(cv, lx, y, rw, hd);
-            fps_row.draw(lx, r1_y, rw);
-            br_row.draw(lx, r2_y, rw);
+            fmt_row.draw(lx, fmt_y, rw);
+            if (is_mp4) {
+                codec_row.draw(lx, codec_y, rw);
+                if (codec == VideoCodec::H264) {
+                    prof_row.draw(lx, prof_y, rw);
+                } else if (fmt_note_h > 0.0f) {
+                    cv.text_wrap(format_note, rect(lx, fmt_note_y, rw, fmt_note_h), Font::Caption, cv.theme().amber);
+                }
+            } else if (is_wmv) {
+                cv.text_wrap(format_note, rect(lx, fmt_note_y, rw, fmt_note_h), Font::Caption, cv.theme().on_surface_variant);
+            } else {
+                gif_row.draw(lx, gif_y, rw);
+                cv.text(L"Error-diffusion dithering (smoother gradients)", rect(lx, gif_dither_y, rw - 60.0f, 32.0f), Font::Body, cv.theme().on_surface);
+                draw_switch(cv, hover_.alpha(IdToggleRecGifDither), sw_rec_gif_dither_.value, lx + rw, gif_dither_y + 16.0f, IdToggleRecGifDither);
+            }
 
-            cv.text(L"Include mouse cursor in recordings", rect(lx, r3_y, rw - 60.0f, 32.0f), Font::Body, cv.theme().on_surface);
-            draw_switch(cv, hover_.alpha(IdToggleRecordCursor), sw_rec_cursor_.value, lx + rw, r3_y + 16.0f, IdToggleRecordCursor);
+            cv.hline(lx, lx + rw, sep1_y, with_alpha(cv.theme().outline_variant, 0.5f));
+            fps_row.draw(lx, fps_y, rw);
+            {
+                FixedWString<48> fps_lbl{L"Target FPS: "};
+                fps_lbl.append(to_fixed_wstr<8>(eff_fps));
+                if (is_gif && sh_.settings.record_fps > RECORD_GIF_FPS_MAX) fps_lbl.append(L" (GIF max)");
+                cv.text(fps_lbl, rect(lx, fps_slider_y, 180.0f, 32.0f), Font::Body, cv.theme().on_surface);
+                slider_rec_fps_r_ = rect(lx + 190.0f, fps_slider_y, std::max(100.0f, rw - 190.0f), 32.0f);
+                const float max_fps_f = static_cast<float>(is_gif ? RECORD_GIF_FPS_MAX : RECORD_FPS_MAX);
+                const float fps_ratio = std::clamp(
+                    (static_cast<float>(eff_fps) - static_cast<float>(RECORD_FPS_MIN)) / (max_fps_f - static_cast<float>(RECORD_FPS_MIN)),
+                    0.0f, 1.0f);
+                draw_slider(cv, hover_.alpha(IdSliderRecFps), slider_rec_fps_r_, fps_ratio, dragging_slider_ == IdSliderRecFps, IdSliderRecFps);
+            }
 
-            cv.hline(lx, lx + rw, sep_y, with_alpha(cv.theme().outline_variant, 0.5f));
+            scale_row.draw(lx, scale_y, rw);
+            {
+                FixedWString<48> sc_lbl{L"Output scale: "};
+                sc_lbl.append(to_fixed_wstr<8>(sh_.settings.record_scale_pct));
+                sc_lbl.append(L"%");
+                cv.text(sc_lbl, rect(lx, scale_slider_y, 180.0f, 32.0f), Font::Body, cv.theme().on_surface);
+                slider_rec_scale_r_ = rect(lx + 190.0f, scale_slider_y, std::max(100.0f, rw - 190.0f), 32.0f);
+                const float sc_ratio = std::clamp(
+                    static_cast<float>(sh_.settings.record_scale_pct - RECORD_SCALE_MIN_PCT) /
+                        static_cast<float>(RECORD_SCALE_MAX_PCT - RECORD_SCALE_MIN_PCT),
+                    0.0f, 1.0f);
+                draw_slider(cv, hover_.alpha(IdSliderRecScale), slider_rec_scale_r_, sc_ratio, dragging_slider_ == IdSliderRecScale, IdSliderRecScale);
+            }
 
-            cv.text(L"Record desktop audio", rect(lx, desk_y, rw - 60.0f, 32.0f), Font::Body, cv.theme().on_surface);
-            draw_switch(cv, hover_.alpha(IdToggleRecDesktop), sw_rec_desktop_.value, lx + rw, desk_y + 16.0f, IdToggleRecDesktop);
-            desktop_drop_r_ = rect(lx, desk_drop_y, rw, 34.0f);
-            const std::wstring desk_lbl = resolve_audio_device_label(sh_.settings.record_desktop_device_id, desktop_devices_, L"System Default");
-            draw_dropdown_field(cv, hover_.alpha(IdDropRecDesktop), desktop_drop_r_, desk_lbl,
-                                open_audio_drop_ == AudioDropdown::Desktop,
-                                sh_.settings.record_desktop_audio && !desktop_devices_.empty(),
-                                desktop_devices_.empty() ? IdNone : IdDropRecDesktop);
+            if (!is_gif) {
+                cv.hline(lx, lx + rw, sep2_y, with_alpha(cv.theme().outline_variant, 0.5f));
+                rc_row.draw(lx, rc_y, rw);
+                if (rc == RateControlMode::Quality) {
+                    FixedWString<48> qlbl{L"Quality target: "};
+                    qlbl.append(to_fixed_wstr<8>(sh_.settings.record_quality));
+                    qlbl.append(L" / 100");
+                    cv.text(qlbl, rect(lx, q_slider_y, 180.0f, 32.0f), Font::Body, cv.theme().on_surface);
+                    slider_rec_quality_r_ = rect(lx + 190.0f, q_slider_y, std::max(100.0f, rw - 190.0f), 32.0f);
+                    const float q_ratio = std::clamp(
+                        static_cast<float>(sh_.settings.record_quality - RECORD_QUALITY_MIN) /
+                            static_cast<float>(RECORD_QUALITY_MAX - RECORD_QUALITY_MIN),
+                        0.0f, 1.0f);
+                    draw_slider(cv, hover_.alpha(IdSliderRecQuality), slider_rec_quality_r_, q_ratio, dragging_slider_ == IdSliderRecQuality, IdSliderRecQuality);
+                    cv.text_wrap(q_note, rect(lx, q_note_y, rw, q_note_h), Font::Caption, cv.theme().on_surface_variant);
+                } else {
+                    br_row.draw(lx, br_y, rw);
+                    FixedWString<48> blbl{L"Video bitrate: "};
+                    blbl.append(to_fixed_wstr<8>(sh_.settings.record_bitrate_mbps));
+                    blbl.append(L" Mbps");
+                    cv.text(blbl, rect(lx, br_slider_y, 180.0f, 32.0f), Font::Body, cv.theme().on_surface);
+                    slider_rec_bitrate_r_ = rect(lx + 190.0f, br_slider_y, std::max(100.0f, rw - 190.0f), 32.0f);
+                    const float br_ratio = std::clamp(
+                        static_cast<float>(sh_.settings.record_bitrate_mbps - RECORD_BITRATE_MIN_MBPS) /
+                            static_cast<float>(RECORD_BITRATE_MAX_MBPS - RECORD_BITRATE_MIN_MBPS),
+                        0.0f, 1.0f);
+                    draw_slider(cv, hover_.alpha(IdSliderRecBitrate), slider_rec_bitrate_r_, br_ratio, dragging_slider_ == IdSliderRecBitrate, IdSliderRecBitrate);
+                }
 
-            cv.text(L"Record microphone audio", rect(lx, mic_y, rw - 60.0f, 32.0f), Font::Body, cv.theme().on_surface);
-            draw_switch(cv, hover_.alpha(IdToggleRecMic), sw_rec_mic_.value, lx + rw, mic_y + 16.0f, IdToggleRecMic);
-            mic_drop_r_ = rect(lx, mic_drop_y, rw, 34.0f);
-            const std::wstring mic_lbl = resolve_audio_device_label(sh_.settings.record_mic_device_id, mic_devices_, L"System Default");
-            draw_dropdown_field(cv, hover_.alpha(IdDropRecMic), mic_drop_r_, mic_lbl,
-                                open_audio_drop_ == AudioDropdown::Mic,
-                                sh_.settings.record_mic_audio && !mic_devices_.empty(),
-                                mic_devices_.empty() ? IdNone : IdDropRecMic);
+                kf_row.draw(lx, kf_y, rw);
+
+                cv.text(L"Use hardware video encoder (GPU)", rect(lx, hw_y, rw - 60.0f, 32.0f), Font::Body, cv.theme().on_surface);
+                draw_switch(cv, hover_.alpha(IdToggleRecHwAccel), sw_rec_hw_accel_.value, lx + rw, hw_y + 16.0f, IdToggleRecHwAccel);
+
+                if (is_mp4) {
+                    cv.text(L"Crash-safe fragmented MP4 (resilient to power loss)", rect(lx, frag_y, rw - 60.0f, 32.0f), Font::Body, cv.theme().on_surface);
+                    draw_switch(cv, hover_.alpha(IdToggleRecFragMp4), sw_rec_frag_mp4_.value, lx + rw, frag_y + 16.0f, IdToggleRecFragMp4);
+                }
+            }
+
+            cv.hline(lx, lx + rw, sep3_y, with_alpha(cv.theme().outline_variant, 0.5f));
+            cv.text(L"Include mouse cursor in recordings", rect(lx, cur_y, rw - 60.0f, 32.0f), Font::Body, cv.theme().on_surface);
+            draw_switch(cv, hover_.alpha(IdToggleRecordCursor), sw_rec_cursor_.value, lx + rw, cur_y + 16.0f, IdToggleRecordCursor);
 
             y = next_y;
+        }
+
+        // 3. Region Screen Recording — Audio card
+        {
+            const RecordFormat fmt = sh_.settings.resolved_record_format();
+            const bool audio_supported = record_format_supports_audio(fmt);
+            const CardHeader hd = make_header(
+                cv, rw, L"Screen Recording — Audio", cv.theme().on_surface,
+                L"WASAPI desktop loopback, microphone mixing, and audio encoding quality");
+
+            if (!audio_supported) {
+                const std::wstring_view no_aud = L"Animated GIF recordings do not include audio tracks. Switch format to MP4 or WMV to record audio.";
+                const float ny = y + 16.0f + hd.h + 12.0f;
+                const float nh = text_height(cv, no_aud, Font::Caption, rw, 20.0f);
+                const float card_h = (ny + nh + 16.0f) - y;
+                const float next_y = card_begin(cv, x, y, w, card_h, CARD_GAP);
+                (void)draw_header(cv, lx, y, rw, hd);
+                cv.text_wrap(no_aud, rect(lx, ny, rw, nh), Font::Caption, cv.theme().on_surface_variant);
+                y = next_y;
+            } else {
+                Flow abr_row{8.0f, 8.0f};
+                flow_text(cv, abr_row, L"Audio bitrate:", Font::Body, cv.theme().on_surface, 130.0f, 32.0f);
+                for (const int kb : {96, 128, 160, 192}) {
+                    FixedWString<16> klbl{to_fixed_wstr<8>(kb)};
+                    klbl.append(L" kbps");
+                    abr_row.add(84.0f, 32.0f, [&, kb, klbl](D2D1_RECT_F r) {
+                        draw_button(cv, hover_.alpha(IdRecAudioBitrate, kb), r, 0, klbl, IdRecAudioBitrate, kb,
+                                    sh_.settings.record_audio_bitrate_kbps == static_cast<uint32_t>(kb) ? 1 : 0);
+                    });
+                }
+
+                Flow asr_row{8.0f, 8.0f};
+                flow_text(cv, asr_row, L"Sample rate:", Font::Body, cv.theme().on_surface, 130.0f, 32.0f);
+                asr_row.add(92.0f, 32.0f, [&](D2D1_RECT_F r) {
+                    draw_button(cv, hover_.alpha(IdRecAudioRate44), r, 0, L"44.1 kHz", IdRecAudioRate44, 0,
+                                sh_.settings.record_audio_sample_rate == 44100u ? 1 : 0);
+                });
+                asr_row.add(92.0f, 32.0f, [&](D2D1_RECT_F r) {
+                    draw_button(cv, hover_.alpha(IdRecAudioRate48), r, 0, L"48 kHz", IdRecAudioRate48, 0,
+                                sh_.settings.record_audio_sample_rate == 48000u ? 1 : 0);
+                });
+
+                Flow ach_row{8.0f, 8.0f};
+                flow_text(cv, ach_row, L"Channels:", Font::Body, cv.theme().on_surface, 130.0f, 32.0f);
+                ach_row.add(84.0f, 32.0f, [&](D2D1_RECT_F r) {
+                    draw_button(cv, hover_.alpha(IdRecAudioMono), r, 0, L"Mono", IdRecAudioMono, 0,
+                                sh_.settings.record_audio_channels == 1u ? 1 : 0);
+                });
+                ach_row.add(84.0f, 32.0f, [&](D2D1_RECT_F r) {
+                    draw_button(cv, hover_.alpha(IdRecAudioStereo), r, 0, L"Stereo", IdRecAudioStereo, 0,
+                                sh_.settings.record_audio_channels == 2u ? 1 : 0);
+                });
+
+                const float desk_y = y + 16.0f + hd.h + 14.0f;
+                const float desk_drop_y = desk_y + 36.0f;
+                const float mic_y = desk_drop_y + 44.0f;
+                const float mic_drop_y = mic_y + 36.0f;
+                const float sep_y = mic_drop_y + 44.0f;
+                const float abr_y = sep_y + 14.0f;
+                const float asr_y = abr_y + abr_row.height(rw) + 10.0f;
+                const float ach_y = asr_y + asr_row.height(rw) + 10.0f;
+                const float card_h = (ach_y + ach_row.height(rw) + 16.0f) - y;
+                const float next_y = card_begin(cv, x, y, w, card_h, CARD_GAP);
+
+                (void)draw_header(cv, lx, y, rw, hd);
+
+                cv.text(L"Record desktop audio", rect(lx, desk_y, rw - 60.0f, 32.0f), Font::Body, cv.theme().on_surface);
+                draw_switch(cv, hover_.alpha(IdToggleRecDesktop), sw_rec_desktop_.value, lx + rw, desk_y + 16.0f, IdToggleRecDesktop);
+                desktop_drop_r_ = rect(lx, desk_drop_y, rw, 34.0f);
+                const std::wstring desk_lbl = resolve_audio_device_label(sh_.settings.record_desktop_device_id, desktop_devices_, L"System Default");
+                draw_dropdown_field(cv, hover_.alpha(IdDropRecDesktop), desktop_drop_r_, desk_lbl,
+                                    open_audio_drop_ == AudioDropdown::Desktop,
+                                    sh_.settings.record_desktop_audio && !desktop_devices_.empty(),
+                                    desktop_devices_.empty() ? IdNone : IdDropRecDesktop);
+
+                cv.text(L"Record microphone audio", rect(lx, mic_y, rw - 60.0f, 32.0f), Font::Body, cv.theme().on_surface);
+                draw_switch(cv, hover_.alpha(IdToggleRecMic), sw_rec_mic_.value, lx + rw, mic_y + 16.0f, IdToggleRecMic);
+                mic_drop_r_ = rect(lx, mic_drop_y, rw, 34.0f);
+                const std::wstring mic_lbl = resolve_audio_device_label(sh_.settings.record_mic_device_id, mic_devices_, L"System Default");
+                draw_dropdown_field(cv, hover_.alpha(IdDropRecMic), mic_drop_r_, mic_lbl,
+                                    open_audio_drop_ == AudioDropdown::Mic,
+                                    sh_.settings.record_mic_audio && !mic_devices_.empty(),
+                                    mic_devices_.empty() ? IdNone : IdDropRecMic);
+
+                cv.hline(lx, lx + rw, sep_y, with_alpha(cv.theme().outline_variant, 0.5f));
+                abr_row.draw(lx, abr_y, rw);
+                asr_row.draw(lx, asr_y, rw);
+                ach_row.draw(lx, ach_y, rw);
+
+                y = next_y;
+            }
         }
 
         return y;
@@ -1291,18 +1735,59 @@ private:
     }
 
     void update_slider_from_x(int slider_id, float x) {
-        const D2D1_RECT_F r = (slider_id == IdSliderToastSize)
-            ? slider_size_r_
-            : (slider_id == IdSliderImageQuality ? slider_quality_r_ : slider_timeout_r_);
+        D2D1_RECT_F r{};
+        switch (slider_id) {
+            case IdSliderToastSize: r = slider_size_r_; break;
+            case IdSliderToastTimeout: r = slider_timeout_r_; break;
+            case IdSliderImageQuality: r = slider_quality_r_; break;
+            case IdSliderRecFps: r = slider_rec_fps_r_; break;
+            case IdSliderRecScale: r = slider_rec_scale_r_; break;
+            case IdSliderRecBitrate: r = slider_rec_bitrate_r_; break;
+            case IdSliderRecQuality: r = slider_rec_quality_r_; break;
+            default: return;
+        }
         const float l = r.left + 8.0f;
         const float ri = std::max(l + 4.0f, r.right - 8.0f);
         const float k = std::clamp((x - l) / (ri - l), 0.0f, 1.0f);
-        if (slider_id == IdSliderToastSize) {
-            sh_.settings.toast_width_dip = std::round((160.0f + (k * 260.0f)) / 5.0f) * 5.0f;
-        } else if (slider_id == IdSliderImageQuality) {
-            sh_.settings.image_quality = std::clamp(static_cast<int>(std::lround((10.0f + (k * 90.0f)) / 5.0f)) * 5, 10, 100);
-        } else {
-            sh_.settings.toast_timeout_s = std::round((1.0f + (k * 14.0f)) * 2.0f) / 2.0f;
+        switch (slider_id) {
+            case IdSliderToastSize:
+                sh_.settings.toast_width_dip = std::round((160.0f + (k * 260.0f)) / 5.0f) * 5.0f;
+                break;
+            case IdSliderImageQuality:
+                sh_.settings.image_quality = std::clamp(static_cast<int>(std::lround((10.0f + (k * 90.0f)) / 5.0f)) * 5, 10, 100);
+                break;
+            case IdSliderToastTimeout:
+                sh_.settings.toast_timeout_s = std::round((1.0f + (k * 14.0f)) * 2.0f) / 2.0f;
+                break;
+            case IdSliderRecFps: {
+                const bool is_gif = (sh_.settings.resolved_record_format() == RecordFormat::Gif);
+                const float hi = static_cast<float>(is_gif ? RECORD_GIF_FPS_MAX : RECORD_FPS_MAX);
+                const float lo = static_cast<float>(RECORD_FPS_MIN);
+                sh_.settings.record_fps = clamp_record_fps(static_cast<uint32_t>(std::lround(lo + (k * (hi - lo)))));
+                break;
+            }
+            case IdSliderRecScale: {
+                const float lo = static_cast<float>(RECORD_SCALE_MIN_PCT);
+                const float span = static_cast<float>(RECORD_SCALE_MAX_PCT - RECORD_SCALE_MIN_PCT);
+                const auto stepped = static_cast<uint32_t>(std::lround((lo + (k * span)) / 5.0f)) * 5u;
+                sh_.settings.record_scale_pct = clamp_record_scale_pct(stepped);
+                break;
+            }
+            case IdSliderRecBitrate: {
+                const float lo = static_cast<float>(RECORD_BITRATE_MIN_MBPS);
+                const float span = static_cast<float>(RECORD_BITRATE_MAX_MBPS - RECORD_BITRATE_MIN_MBPS);
+                sh_.settings.record_bitrate_mbps = clamp_record_bitrate_mbps(static_cast<uint32_t>(std::lround(lo + (k * span))));
+                break;
+            }
+            case IdSliderRecQuality: {
+                const float lo = static_cast<float>(RECORD_QUALITY_MIN);
+                const float span = static_cast<float>(RECORD_QUALITY_MAX - RECORD_QUALITY_MIN);
+                const auto stepped = static_cast<uint32_t>(std::lround((lo + (k * span)) / 5.0f)) * 5u;
+                sh_.settings.record_quality = clamp_record_quality(stepped);
+                break;
+            }
+            default:
+                return;
         }
         sh_.save();
         invalidate();
@@ -1438,6 +1923,10 @@ private:
             case IdSliderToastSize:
             case IdSliderToastTimeout:
             case IdSliderImageQuality:
+            case IdSliderRecFps:
+            case IdSliderRecScale:
+            case IdSliderRecBitrate:
+            case IdSliderRecQuality:
                 dragging_slider_ = h->id;
                 SetCapture(hwnd_);
                 update_slider_from_x(h->id, p.x);
@@ -1445,11 +1934,85 @@ private:
             case IdTestToast:
                 if (sh_.on_test_toast) sh_.on_test_toast();
                 return;
-            case IdFps30: sh_.settings.record_fps = 30; sh_.save(); invalidate(); return;
-            case IdFps60: sh_.settings.record_fps = 60; sh_.save(); invalidate(); return;
-            case IdBitrate6: sh_.settings.record_bitrate_mbps = 6; sh_.save(); invalidate(); return;
-            case IdBitrate12: sh_.settings.record_bitrate_mbps = 12; sh_.save(); invalidate(); return;
-            case IdBitrate20: sh_.settings.record_bitrate_mbps = 20; sh_.save(); invalidate(); return;
+            case IdRecFmtMp4:
+                sh_.settings.record_format = "mp4";
+                sh_.save();
+                scroll_ = target_scroll_ = std::clamp(scroll_, 0.0f, max_scroll());
+                invalidate();
+                return;
+            case IdRecFmtWmv:
+                sh_.settings.record_format = "wmv";
+                sh_.save();
+                scroll_ = target_scroll_ = std::clamp(scroll_, 0.0f, max_scroll());
+                invalidate();
+                return;
+            case IdRecFmtGif:
+                open_audio_drop_ = AudioDropdown::None;
+                sh_.settings.record_format = "gif";
+                sh_.save();
+                scroll_ = target_scroll_ = std::clamp(scroll_, 0.0f, max_scroll());
+                invalidate();
+                return;
+            case IdRecCodecH264: sh_.settings.record_codec = "h264"; sh_.save(); invalidate(); return;
+            case IdRecCodecHevc: sh_.settings.record_codec = "hevc"; sh_.save(); invalidate(); return;
+            case IdRecProfBase: sh_.settings.record_h264_profile = "baseline"; sh_.save(); invalidate(); return;
+            case IdRecProfMain: sh_.settings.record_h264_profile = "main"; sh_.save(); invalidate(); return;
+            case IdRecProfHigh: sh_.settings.record_h264_profile = "high"; sh_.save(); invalidate(); return;
+            case IdRecGifColors:
+                sh_.settings.record_gif_colors = normalize_gif_colors(static_cast<uint32_t>(std::max(0, h->index)));
+                sh_.save();
+                invalidate();
+                return;
+            case IdToggleRecGifDither:
+                sh_.settings.record_gif_dither = !sh_.settings.record_gif_dither;
+                sh_.save();
+                sync_state(true);
+                start_anim();
+                return;
+            case IdRecFpsPreset:
+                sh_.settings.record_fps = clamp_record_fps(static_cast<uint32_t>(std::max(0, h->index)));
+                sh_.save();
+                invalidate();
+                return;
+            case IdRecScalePreset:
+                sh_.settings.record_scale_pct = clamp_record_scale_pct(static_cast<uint32_t>(std::max(0, h->index)));
+                sh_.save();
+                invalidate();
+                return;
+            case IdRecRcVbr: sh_.settings.record_rate_control = "vbr"; sh_.save(); invalidate(); return;
+            case IdRecRcQuality: sh_.settings.record_rate_control = "quality"; sh_.save(); invalidate(); return;
+            case IdRecRcCbr: sh_.settings.record_rate_control = "cbr"; sh_.save(); invalidate(); return;
+            case IdRecBitratePreset:
+                sh_.settings.record_bitrate_mbps = clamp_record_bitrate_mbps(static_cast<uint32_t>(std::max(0, h->index)));
+                sh_.save();
+                invalidate();
+                return;
+            case IdRecKeyframe:
+                sh_.settings.record_keyframe_s = clamp_record_keyframe_s(static_cast<uint32_t>(std::max(0, h->index)));
+                sh_.save();
+                invalidate();
+                return;
+            case IdToggleRecHwAccel:
+                sh_.settings.record_hw_accel = !sh_.settings.record_hw_accel;
+                sh_.save();
+                sync_state(true);
+                start_anim();
+                return;
+            case IdToggleRecFragMp4:
+                sh_.settings.record_fragmented_mp4 = !sh_.settings.record_fragmented_mp4;
+                sh_.save();
+                sync_state(true);
+                start_anim();
+                return;
+            case IdRecAudioBitrate:
+                sh_.settings.record_audio_bitrate_kbps = normalize_audio_bitrate_kbps(static_cast<uint32_t>(std::max(0, h->index)));
+                sh_.save();
+                invalidate();
+                return;
+            case IdRecAudioRate44: sh_.settings.record_audio_sample_rate = 44100u; sh_.save(); invalidate(); return;
+            case IdRecAudioRate48: sh_.settings.record_audio_sample_rate = 48000u; sh_.save(); invalidate(); return;
+            case IdRecAudioMono: sh_.settings.record_audio_channels = 1u; sh_.save(); invalidate(); return;
+            case IdRecAudioStereo: sh_.settings.record_audio_channels = 2u; sh_.save(); invalidate(); return;
             case IdToggleRecordCursor:
                 sh_.settings.record_cursor = !sh_.settings.record_cursor;
                 sh_.save();
@@ -1753,6 +2316,9 @@ private:
     AnimFloat sw_split_month_;
     AnimFloat sw_toast_;
     AnimFloat sw_rec_cursor_;
+    AnimFloat sw_rec_hw_accel_;
+    AnimFloat sw_rec_frag_mp4_;
+    AnimFloat sw_rec_gif_dither_;
     AnimFloat sw_rec_desktop_;
     AnimFloat sw_rec_mic_;
     AnimFloat sw_auto_update_;
@@ -1762,6 +2328,8 @@ private:
     std::vector<AudioDeviceInfo> mic_devices_;
     D2D1_RECT_F desktop_drop_r_{};
     D2D1_RECT_F mic_drop_r_{};
+    bool hevc_probed_ = false;
+    bool hevc_available_ = false;
 
     bool startup_enabled_ = false;
     bool win_prtscn_disabled_ = false;
@@ -1794,6 +2362,10 @@ private:
     D2D1_RECT_F slider_size_r_{};
     D2D1_RECT_F slider_timeout_r_{};
     D2D1_RECT_F slider_quality_r_{};
+    D2D1_RECT_F slider_rec_fps_r_{};
+    D2D1_RECT_F slider_rec_scale_r_{};
+    D2D1_RECT_F slider_rec_bitrate_r_{};
+    D2D1_RECT_F slider_rec_quality_r_{};
     bool dragging_scroll_ = false;
     bool in_sizemove_ = false;
     float scroll_drag_offset_ = 0.0f;

@@ -233,10 +233,25 @@ private:
 
     void start_region_recording(RECT region, WindowInfo win_info) {
         if (recorder_.recording()) return;
-        const fs::path out = make_capture_path(resolve_save_dir(sh_.settings), L".mp4", sh_.settings.split_by_month);
+        const RecordFormat fmt = sh_.settings.resolved_record_format();
+        const fs::path out = make_capture_path(resolve_save_dir(sh_.settings), record_format_ext(fmt), sh_.settings.split_by_month);
         RecordingConfig cfg{
+            .format = fmt,
+            .codec = sh_.settings.resolved_record_codec(),
+            .h264_profile = sh_.settings.resolved_h264_profile(),
+            .rate_control = sh_.settings.resolved_rate_control(),
             .fps = sh_.settings.record_fps,
             .bitrate_mbps = sh_.settings.record_bitrate_mbps,
+            .quality = sh_.settings.record_quality,
+            .scale_pct = sh_.settings.record_scale_pct,
+            .keyframe_s = sh_.settings.record_keyframe_s,
+            .hw_accel = sh_.settings.record_hw_accel,
+            .fragmented_mp4 = sh_.settings.record_fragmented_mp4,
+            .audio_bitrate_kbps = sh_.settings.record_audio_bitrate_kbps,
+            .audio_sample_rate = sh_.settings.record_audio_sample_rate,
+            .audio_channels = sh_.settings.record_audio_channels,
+            .gif_colors = sh_.settings.record_gif_colors,
+            .gif_dither = sh_.settings.record_gif_dither,
             .include_cursor = sh_.settings.record_cursor,
             .record_desktop_audio = sh_.settings.record_desktop_audio,
             .record_mic_audio = sh_.settings.record_mic_audio,
@@ -287,7 +302,7 @@ private:
         entry.duration_ms = res.duration_ms;
         entry.window_title = std::move(win_info.title);
         entry.process_name = std::move(win_info.process_name);
-        entry.format = "MP4";
+        entry.format = res.format_label.empty() ? "MP4" : res.format_label;
         (void)sh_.history.insert(entry);
 
         bool copied = false;
@@ -296,8 +311,9 @@ private:
         }
         if (history_win_->visible()) history_win_->reload_entries(false);
         if (sh_.settings.show_corner_toast) {
+            const std::wstring badge = to_wide(entry.format);
             toast_win_->show_capture(res.path.wstring(), res.first_frame ? &*res.first_frame : nullptr,
-                                     res.width, res.height, true, copied);
+                                     res.width, res.height, true, copied, badge);
         }
         schedule_idle_trim();
     }

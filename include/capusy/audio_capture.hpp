@@ -292,19 +292,36 @@ private:
     StereoFrame prev_{};
 };
 
-/// Mixes two interleaved stereo float buffers (`a` and `b`, either may be empty) into interleaved 16-bit PCM.
+/// Mixes two interleaved stereo float buffers (`a` and `b`, either may be empty) into interleaved 16-bit PCM (stereo).
 inline void mix_stereo_to_pcm16(std::span<const float> a, std::span<const float> b, std::span<int16_t> out) noexcept {
     const size_t n = out.size();
     for (size_t i = 0; i < n; ++i) {
         float sum = 0.0f;
         if (i < a.size()) sum += a[i];
         if (i < b.size()) sum += b[i];
-        // Soft-limit slightly above 0.98f before clamping so simultaneous desktop + mic never harsh-clips
+        // Soft-limit slightly above 1.0f before clamping so simultaneous desktop + mic never harsh-clips
         if (sum > 1.0f || sum < -1.0f) {
             sum = std::tanh(sum);
         }
         const float clamped = std::clamp(sum, -1.0f, 1.0f);
         out[i] = static_cast<int16_t>(std::lround(clamped * 32767.0f));
+    }
+}
+
+/// Mixes two interleaved stereo float buffers (`a` and `b`, either may be empty) into mono 16-bit PCM (`out.size()` frames).
+inline void mix_stereo_to_mono_pcm16(std::span<const float> a, std::span<const float> b, std::span<int16_t> out) noexcept {
+    const size_t frames = out.size();
+    for (size_t f = 0; f < frames; ++f) {
+        const size_t i0 = f * 2u;
+        const size_t i1 = i0 + 1u;
+        float sum = 0.0f;
+        if (i1 < a.size()) sum += (a[i0] + a[i1]) * 0.5f;
+        if (i1 < b.size()) sum += (b[i0] + b[i1]) * 0.5f;
+        if (sum > 1.0f || sum < -1.0f) {
+            sum = std::tanh(sum);
+        }
+        const float clamped = std::clamp(sum, -1.0f, 1.0f);
+        out[f] = static_cast<int16_t>(std::lround(clamped * 32767.0f));
     }
 }
 
@@ -462,7 +479,7 @@ public:
     WasapiCaptureStream& operator=(WasapiCaptureStream&&) = delete;
     ~WasapiCaptureStream() { close(); }
 
-    bool open(AudioFlow flow, std::string_view device_id_utf8) {
+    bool open(AudioFlow flow, std::string_view device_id_utf8, uint32_t target_sample_rate = AUDIO_OUT_SAMPLE_RATE) {
         close();
         wil::com_ptr<IMMDeviceEnumerator> enumerator;
         if (FAILED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL, IID_PPV_ARGS(&enumerator))) || !enumerator) {
@@ -518,12 +535,18 @@ public:
             return false;
         }
 
-        resampler_.reset(sample_rate_, AUDIO_OUT_SAMPLE_RATE);
+        resampler_.reset(sample_rate_, target_sample_rate > 0 ? target_sample_rate : AUDIO_OUT_SAMPLE_RATE);
         scratch_.reserve(4096);
         return true;
     }
 
     [[nodiscard]] bool opened() const noexcept { return client_ != nullptr && capture_ != nullptr; }
+
+    void retarget_sample_rate(uint32_t target_sample_rate) noexcept {
+        if (sample_rate_ > 0 && target_sample_rate > 0) {
+            resampler_.reset(sample_rate_, target_sample_rate);
+        }
+    }
 
     bool start() noexcept {
         if (!client_) return false;

@@ -3,6 +3,7 @@
 #include "capture_logic.hpp"
 #include "common.hpp"
 #include "hotkeys.hpp"
+#include "recording_logic.hpp"
 #include "startup_logic.hpp"
 
 #include <glaze/glaze.hpp>
@@ -36,9 +37,23 @@ struct Settings {
     float toast_timeout_s = 4.0f;  // 1.0 .. 15.0 seconds
     float toast_width_dip = 260.0f; // 160 .. 420 DIPs
 
-    // Region screen recording (Windows native Media Foundation H.264 + AAC MP4)
-    uint32_t record_fps = 30;            // 30 or 60
-    uint32_t record_bitrate_mbps = 12;   // 6, 12, or 20
+    // Region screen recording (Windows native Media Foundation MP4/WMV + WIC GIF)
+    std::string record_format = "mp4";         // "mp4", "wmv", "gif"
+    std::string record_codec = "h264";         // "h264", "hevc" (MP4)
+    std::string record_h264_profile = "high";  // "baseline", "main", "high" (MP4 H.264)
+    std::string record_rate_control = "vbr";   // "vbr", "quality", "cbr" (MP4/WMV)
+    uint32_t record_fps = 30;                  // 5 .. 60 (GIF effective max 30)
+    uint32_t record_bitrate_mbps = 12;         // 1 .. 50 Mbps (VBR/CBR)
+    uint32_t record_quality = 80;              // 10 .. 100 (Quality mode)
+    uint32_t record_scale_pct = 100;           // 25 .. 100% resolution scale
+    uint32_t record_keyframe_s = 2;            // 1 .. 10 seconds keyframe interval
+    bool record_hw_accel = true;               // Prefer GPU hardware encoder MFTs
+    bool record_fragmented_mp4 = false;        // Crash-safe fragmented MP4 container
+    uint32_t record_audio_bitrate_kbps = 192;  // 96, 128, 160, 192 kbps
+    uint32_t record_audio_sample_rate = 48000; // 44100 or 48000 Hz
+    uint32_t record_audio_channels = 2;        // 1 (Mono) or 2 (Stereo)
+    uint32_t record_gif_colors = 256;          // 64, 128, 256 palette colors
+    bool record_gif_dither = false;            // Error-diffusion dithering for GIF
     bool record_cursor = true;
     bool record_desktop_audio = true;
     bool record_mic_audio = false;
@@ -54,6 +69,22 @@ struct Settings {
 
     [[nodiscard]] ImageFormat resolved_image_format() const noexcept {
         return parse_image_format(image_format);
+    }
+
+    [[nodiscard]] RecordFormat resolved_record_format() const noexcept {
+        return parse_record_format(record_format);
+    }
+
+    [[nodiscard]] VideoCodec resolved_record_codec() const noexcept {
+        return parse_video_codec(record_codec);
+    }
+
+    [[nodiscard]] H264Profile resolved_h264_profile() const noexcept {
+        return parse_h264_profile(record_h264_profile);
+    }
+
+    [[nodiscard]] RateControlMode resolved_rate_control() const noexcept {
+        return parse_rate_control(record_rate_control);
     }
 
     [[nodiscard]] HotkeyBinding& hotkey(HotkeyAction a) noexcept {
@@ -138,8 +169,19 @@ inline Settings load_settings(bool* corrupt_recovered = nullptr) {
     s.image_quality = std::clamp(s.image_quality, 10, 100);
     s.toast_timeout_s = std::clamp(s.toast_timeout_s, 1.0f, 15.0f);
     s.toast_width_dip = std::clamp(s.toast_width_dip, 160.0f, 420.0f);
-    if (s.record_fps != 30 && s.record_fps != 60) s.record_fps = 30;
-    if (s.record_bitrate_mbps < 2 || s.record_bitrate_mbps > 50) s.record_bitrate_mbps = 12;
+    s.record_format = std::string{record_format_key(parse_record_format(s.record_format))};
+    s.record_codec = std::string{video_codec_key(parse_video_codec(s.record_codec))};
+    s.record_h264_profile = std::string{h264_profile_key(parse_h264_profile(s.record_h264_profile))};
+    s.record_rate_control = std::string{rate_control_key(parse_rate_control(s.record_rate_control))};
+    s.record_fps = clamp_record_fps(s.record_fps);
+    s.record_bitrate_mbps = clamp_record_bitrate_mbps(s.record_bitrate_mbps);
+    s.record_quality = clamp_record_quality(s.record_quality);
+    s.record_scale_pct = clamp_record_scale_pct(s.record_scale_pct);
+    s.record_keyframe_s = clamp_record_keyframe_s(s.record_keyframe_s);
+    s.record_audio_bitrate_kbps = normalize_audio_bitrate_kbps(s.record_audio_bitrate_kbps);
+    s.record_audio_sample_rate = normalize_audio_sample_rate(s.record_audio_sample_rate);
+    s.record_audio_channels = normalize_audio_channels(s.record_audio_channels);
+    s.record_gif_colors = normalize_gif_colors(s.record_gif_colors);
     if (!existed) save_json_file(settings_path(), s);
     return s;
 }
