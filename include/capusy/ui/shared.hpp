@@ -137,19 +137,82 @@ inline bool reveal_in_explorer(const std::wstring& path) {
     return SUCCEEDED(hr);
 }
 
-/// Moves a file to the Windows Recycle Bin (falls back to std::filesystem::remove if Recycle Bin fails).
-inline bool delete_file_to_recycle_bin(const std::wstring& path) {
+inline bool reveal_in_explorer(std::span<const std::wstring> paths) {
+    if (paths.empty()) return false;
+    if (paths.size() == 1) return reveal_in_explorer(paths[0]);
+
+    std::vector<PIDLIST_ABSOLUTE> pidls;
+    pidls.reserve(paths.size());
+    for (const auto& p : paths) {
+        if (PIDLIST_ABSOLUTE id = ILCreateFromPathW(p.c_str())) {
+            pidls.push_back(id);
+        }
+    }
+    const auto free_pidls = wil::scope_exit([&] {
+        for (auto* id : pidls) ILFree(id);
+    });
+    if (pidls.empty()) return false;
+    if (pidls.size() == 1) {
+        return SUCCEEDED(SHOpenFolderAndSelectItems(pidls[0], 0, nullptr, 0));
+    }
+
+    PIDLIST_ABSOLUTE parent = ILCloneFull(pidls.front());
+    if (!parent) return false;
+    const auto free_parent = wil::scope_exit([&] { ILFree(parent); });
+    ILRemoveLastID(parent);
+
+    std::vector<PCUITEMID_CHILD> children;
+    children.reserve(pidls.size());
+    for (auto* id : pidls) {
+        PIDLIST_ABSOLUTE pp = ILCloneFull(id);
+        if (!pp) continue;
+        ILRemoveLastID(pp);
+        const bool same = ILIsEqual(pp, parent) != FALSE;
+        ILFree(pp);
+        if (same) children.push_back(ILFindLastID(id));
+    }
+    if (children.size() <= 1) {
+        return SUCCEEDED(SHOpenFolderAndSelectItems(pidls.front(), 0, nullptr, 0));
+    }
+    return SUCCEEDED(SHOpenFolderAndSelectItems(parent, static_cast<UINT>(children.size()), children.data(), 0));
+}
+
+/// Moves one or more files to the Windows Recycle Bin in a single shell operation
+/// (falls back to std::filesystem::remove per file if Recycle Bin fails).
+inline bool delete_files_to_recycle_bin(std::span<const std::wstring> paths) {
+    std::wstring double_nul;
+    std::vector<std::wstring_view> existing;
+    existing.reserve(paths.size());
     std::error_code ec;
-    if (!fs::exists(path, ec)) return true;
-    std::wstring double_nul = path;
+    for (const auto& path : paths) {
+        if (fs::exists(path, ec)) {
+            existing.push_back(path);
+            double_nul.append(path);
+            double_nul.push_back(L'\0');
+        }
+    }
+    if (existing.empty()) return true;
     double_nul.push_back(L'\0');
-    double_nul.push_back(L'\0');
+
     SHFILEOPSTRUCTW op{};
     op.wFunc = FO_DELETE;
     op.pFrom = double_nul.c_str();
     op.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_NOERRORUI | FOF_SILENT;
     if (SHFileOperationW(&op) == 0 && !op.fAnyOperationsAborted) return true;
-    return fs::remove(path, ec);
+
+    bool all_ok = true;
+    for (const auto path : existing) {
+        std::error_code rm_ec;
+        if (fs::exists(path, rm_ec) && !fs::remove(path, rm_ec)) {
+            all_ok = false;
+        }
+    }
+    return all_ok;
+}
+
+/// Moves a file to the Windows Recycle Bin (falls back to std::filesystem::remove if Recycle Bin fails).
+inline bool delete_file_to_recycle_bin(const std::wstring& path) {
+    return delete_files_to_recycle_bin(std::span<const std::wstring>{&path, 1});
 }
 
 inline std::optional<std::wstring> browse_folder_dialog(HWND owner, const wchar_t* title, const std::wstring& initial) {
@@ -396,20 +459,25 @@ inline wil::com_ptr<IDataObject> clipboard_data_object(const ClipboardPayload& p
     return obj;
 }
 
-inline bool copy_capture_to_clipboard(const std::wstring& path, bool is_image, const Raster* raster = nullptr) {
+inline bool copy_captures_to_clipboard(std::span<const std::wstring> paths, bool single_is_image, const Raster* raster = nullptr) {
+    if (paths.empty()) return false;
     ClipboardPayload payload;
-    payload.paths.push_back(path);
+    payload.paths.assign(paths.begin(), paths.end());
     std::optional<Raster> decoded;
-    if (is_image) {
+    if (paths.size() == 1 && single_is_image) {
         if (!raster) {
-            decoded = decode_image(path, 0, false);
+            decoded = decode_image(paths[0], 0, false);
             if (decoded) raster = &*decoded;
         }
-        populate_clipboard_payload(payload, raster, &path);
+        populate_clipboard_payload(payload, raster, &paths[0]);
     }
     auto obj = clipboard_data_object(payload);
     if (!obj) return false;
     return SUCCEEDED(OleSetClipboard(obj.get()));
+}
+
+inline bool copy_capture_to_clipboard(const std::wstring& path, bool is_image, const Raster* raster = nullptr) {
+    return copy_captures_to_clipboard(std::span<const std::wstring>{&path, 1}, is_image, raster);
 }
 
 } // namespace capusy::ui

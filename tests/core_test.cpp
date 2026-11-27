@@ -188,6 +188,26 @@ static void test_history_store() {
     const auto after = store.list_recent(100);
     CHECK(after.has_value() && after->size() == 1);
 
+    // Verify batch removal in a transaction
+    CaptureEntry e3{
+        .path = "C:\\Captures\\2026-11\\shot2.png",
+        .kind = CaptureKind::Image,
+        .mode = CaptureMode::Region,
+        .created_at = 3000,
+    };
+    CaptureEntry e4{
+        .path = "C:\\Captures\\2026-11\\shot3.png",
+        .kind = CaptureKind::Image,
+        .mode = CaptureMode::Region,
+        .created_at = 4000,
+    };
+    CHECK(store.insert(e3, &err));
+    CHECK(store.insert(e4, &err));
+    const std::array<int64_t, 2> batch_ids = {e2.id, e4.id};
+    CHECK(store.remove_many(batch_ids, &err));
+    const auto after_batch = store.list_recent(100);
+    CHECK(after_batch.has_value() && after_batch->size() == 1 && (*after_batch)[0].id == e3.id);
+
     store.close();
     fs::remove(tmp, ec);
     fs::remove(tmp.wstring() + L"-wal", ec);
@@ -240,6 +260,73 @@ static void test_capture_paths_and_formats() {
     CHECK(image_format_ext(ImageFormat::Jpeg) == L".jpg");
     CHECK(image_format_supports_quality(ImageFormat::Jpeg));
     CHECK(!image_format_supports_quality(ImageFormat::Png));
+}
+
+static void test_history_selection() {
+    using namespace capusy;
+    std::vector<CaptureEntry> items;
+    for (int64_t id = 10; id <= 50; id += 10) {
+        CaptureEntry e;
+        e.id = id;
+        items.push_back(std::move(e));
+    }
+
+    HistorySelection sel;
+    sel.reconcile(items, true);
+    CHECK(sel.count() == 1 && sel.focus == 0 && sel.anchor == 0 && sel.contains(10));
+
+    // Shift+click selects contiguous range and keeps anchor fixed
+    CHECK(!sel.click(items, 3, false, true));
+    CHECK(sel.count() == 4 && sel.focus == 3 && sel.anchor == 0);
+    CHECK(sel.contains(10) && sel.contains(20) && sel.contains(30) && sel.contains(40) && !sel.contains(50));
+
+    // Second Shift+click shrinks range back toward the same anchor
+    CHECK(!sel.click(items, 1, false, true));
+    CHECK(sel.count() == 2 && sel.focus == 1 && sel.anchor == 0);
+    CHECK(sel.contains(10) && sel.contains(20) && !sel.contains(30));
+
+    // Ctrl+click toggles individual item without clearing existing selection
+    CHECK(!sel.click(items, 4, true, false));
+    CHECK(sel.count() == 3 && sel.focus == 4 && sel.anchor == 4);
+    CHECK(sel.contains(10) && sel.contains(20) && sel.contains(50));
+
+    // Ctrl+click on already-selected focused item removes it and moves focus to closest remaining selected
+    CHECK(!sel.click(items, 4, true, false));
+    CHECK(sel.count() == 2 && sel.focus == 1 && !sel.contains(50));
+
+    // Plain click on already-selected item in multi-select returns deferred=true (for drag-out)
+    CHECK(sel.click(items, 0, false, false));
+    CHECK(sel.count() == 2);
+
+    // Ctrl+Shift+click adds range to existing selection without clearing
+    CHECK(!sel.click(items, 3, true, false)); // select 40, anchor=3
+    CHECK(!sel.click(items, 4, true, true));  // add range 3..4 (40, 50) while keeping 10, 20
+    CHECK(sel.count() == 4 && sel.contains(10) && sel.contains(20) && sel.contains(40) && sel.contains(50));
+
+    // Plain click on unselected item collapses immediately
+    CHECK(!sel.click(items, 2, false, false));
+    CHECK(sel.count() == 1 && sel.focus == 2 && sel.anchor == 2 && sel.contains(30));
+
+    // Keyboard Shift+Down / Shift+Up extends and shrinks range around anchor
+    CHECK(sel.move(items, 1, true));
+    CHECK(sel.move(items, 1, true));
+    CHECK(sel.count() == 3 && sel.focus == 4 && sel.anchor == 2 && sel.contains(30) && sel.contains(40) && sel.contains(50));
+    CHECK(sel.move(items, -1, true));
+    CHECK(sel.count() == 2 && sel.focus == 3 && sel.anchor == 2 && !sel.contains(50));
+
+    // Reconcile preserves still-visible multi-selection & tracks anchor across index shifts
+    std::vector<CaptureEntry> shifted;
+    CaptureEntry newest;
+    newest.id = 99;
+    shifted.push_back(newest);
+    shifted.push_back(items[2]); // id 30 (old anchor)
+    shifted.push_back(items[3]); // id 40 (old focus)
+    sel.reconcile(shifted, true, 40);
+    CHECK(sel.count() == 2 && sel.focus == 2 && sel.anchor == 1 && sel.contains(30) && sel.contains(40));
+
+    // Select all
+    sel.select_all(shifted);
+    CHECK(sel.count() == 3 && sel.selected_indices(shifted).size() == 3);
 }
 
 static void test_history_search() {
@@ -478,6 +565,7 @@ int main() {
     test_startup_logic();
     test_hotkey_collisions();
     test_history_store();
+    test_history_selection();
     test_capture_paths_and_formats();
     test_history_search();
     test_update_logic();

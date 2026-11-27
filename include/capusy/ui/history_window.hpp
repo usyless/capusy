@@ -108,6 +108,8 @@ public:
         raw_hover_index_ = 0;
         set_search_focus(false);
         dragging_search_ = false;
+        delete_confirm_ = {};
+        deferred_select_idx_ = -1;
         video_.close();
         sh_.previews.clear();
         sh_.thumbs.clear();
@@ -124,8 +126,8 @@ public:
     }
 
     void reload_entries(bool keep_selection = true) {
-        const int64_t prev_id = (keep_selection && selected_idx_ >= 0 && std::cmp_less(selected_idx_, entries_.size()))
-            ? entries_[static_cast<size_t>(selected_idx_)].id : -1;
+        const int64_t prev_id = (keep_selection && selection_.focus >= 0 && std::cmp_less(selection_.focus, entries_.size()))
+            ? entries_[static_cast<size_t>(selection_.focus)].id : -1;
 
         std::optional<CaptureKind> filter;
         if (filter_ == Filter::Images) filter = CaptureKind::Image;
@@ -189,12 +191,12 @@ public:
             all_cache_.push_back(std::move(rc));
         }
 
-        apply_search_filter(prev_id);
+        apply_search_filter(prev_id, keep_selection);
     }
 
-    void apply_search_filter(int64_t preferred_id = -1) {
-        if (preferred_id < 0 && selected_idx_ >= 0 && std::cmp_less(selected_idx_, entries_.size())) {
-            preferred_id = entries_[static_cast<size_t>(selected_idx_)].id;
+    void apply_search_filter(int64_t preferred_id = -1, bool keep_selection = true) {
+        if (preferred_id < 0 && keep_selection && selection_.focus >= 0 && std::cmp_less(selection_.focus, entries_.size())) {
+            preferred_id = entries_[static_cast<size_t>(selection_.focus)].id;
         }
         const std::wstring q = lower(trim(search_field_.text));
 
@@ -214,16 +216,8 @@ public:
             }
         }
 
-        selected_idx_ = -1;
-        if (preferred_id >= 0) {
-            for (size_t i = 0; i < entries_.size(); ++i) {
-                if (entries_[i].id == preferred_id) {
-                    selected_idx_ = static_cast<int>(i);
-                    break;
-                }
-            }
-        }
-        if (selected_idx_ < 0 && !entries_.empty()) selected_idx_ = 0;
+        selection_.reconcile(entries_, keep_selection, preferred_id);
+        deferred_select_idx_ = -1;
 
         sync_preview_media();
         clamp_scroll();
@@ -296,6 +290,20 @@ private:
         IdVideoMute,
         IdVideoScrub,
         IdFooterInfo,
+        IdConfirmBackdrop,
+        IdConfirmDialog,
+        IdConfirmCancel,
+        IdConfirmOk,
+    };
+
+    struct DeleteConfirm {
+        bool open = false;
+        bool delete_files = true;
+        int first_idx = 0;
+        std::vector<int64_t> ids;
+        std::vector<std::wstring> paths;
+        std::wstring first_filename;
+        uint64_t total_bytes = 0;
     };
 
     enum CtxCmd : UINT {
@@ -308,8 +316,16 @@ private:
     };
 
     [[nodiscard]] const CaptureEntry* selected_entry() const noexcept {
-        if (selected_idx_ < 0 || std::cmp_greater_equal(selected_idx_, entries_.size())) return nullptr;
-        return &entries_[static_cast<size_t>(selected_idx_)];
+        if (selection_.focus < 0 || std::cmp_greater_equal(selection_.focus, entries_.size())) return nullptr;
+        return &entries_[static_cast<size_t>(selection_.focus)];
+    }
+
+    [[nodiscard]] size_t selection_count() const noexcept {
+        return selection_.count();
+    }
+
+    [[nodiscard]] std::vector<int> selected_indices() const {
+        return selection_.selected_indices(entries_);
     }
 
     [[nodiscard]] static bool is_playable_video(const CaptureEntry& e) noexcept {
@@ -453,7 +469,11 @@ private:
         draw_sidebar(cv, D2D1::RectF(0.0f, body_top, sidebar_w, sz.height));
         cv.vline(sidebar_w, body_top, sz.height, with_alpha(cv.theme().outline_variant, 0.65f));
         draw_preview_pane(cv, D2D1::RectF(sidebar_w + 1.0f, body_top, sz.width, sz.height));
-        draw_tooltip(cv, sz, tooltip_.anchor, tooltip_.title, tooltip_.subtitle, tooltip_.alpha.value);
+        if (delete_confirm_.open) {
+            draw_delete_confirm(cv, sz);
+        } else {
+            draw_tooltip(cv, sz, tooltip_.anchor, tooltip_.title, tooltip_.subtitle, tooltip_.alpha.value);
+        }
     }
 
     [[nodiscard]] std::wstring hotkey_subtitle(HotkeyAction a) const {
@@ -465,6 +485,7 @@ private:
     }
 
     [[nodiscard]] bool has_tooltip(int id, int idx) const noexcept {
+        if (delete_confirm_.open) return false;
         switch (id) {
             case IdBtnFull:
             case IdBtnRegion:
@@ -486,15 +507,17 @@ private:
             case IdRow:
                 return idx >= 0 && std::cmp_less(idx, row_cache_.size());
             case IdFooterInfo:
-                return selected_idx_ >= 0 && std::cmp_less(selected_idx_, row_cache_.size());
+                return selection_.focus >= 0 && std::cmp_less(selection_.focus, row_cache_.size());
             default:
                 return false;
         }
     }
 
     bool build_tooltip(int id, int idx, std::wstring& title, std::wstring& subtitle) const {
+        if (delete_confirm_.open) return false;
         title.clear();
         subtitle.clear();
+        const size_t sel_n = selection_count();
         switch (id) {
             case IdBtnFull:
                 title = L"Capture full screen";
@@ -538,8 +561,13 @@ private:
                 }
                 return false;
             case IdFooterInfo:
-                if (selected_idx_ >= 0 && std::cmp_less(selected_idx_, row_cache_.size())) {
-                    const RowCache& rc = row_cache_[static_cast<size_t>(selected_idx_)];
+                if (sel_n > 1) {
+                    title = ulp::str::concat_strings(format_count(sel_n).view(), L" captures selected");
+                    subtitle = L"Ctrl+click to toggle, Shift+click for range, Esc to clear";
+                    return true;
+                }
+                if (selection_.focus >= 0 && std::cmp_less(selection_.focus, row_cache_.size())) {
+                    const RowCache& rc = row_cache_[static_cast<size_t>(selection_.focus)];
                     title = !rc.window_title.empty()
                         ? ulp::str::concat_strings(rc.window_title, L"  —  ", rc.filename)
                         : rc.filename;
@@ -548,18 +576,30 @@ private:
                 }
                 return false;
             case IdActCopy: {
+                if (sel_n > 1) {
+                    title = ulp::str::concat_strings(L"Copy ", format_count(sel_n).view(), L" files (Ctrl+C)");
+                    return true;
+                }
                 const CaptureEntry* e = selected_entry();
                 title = (e && e->kind == CaptureKind::Video) ? L"Copy video file (Ctrl+C)" : L"Copy image (Ctrl+C)";
                 return true;
             }
             case IdActOpen:
-                title = L"Open in default app (Enter)";
+                if (sel_n > 1) {
+                    title = sel_n > 8
+                        ? L"Open first 8 selected items in default app (Enter)"
+                        : ulp::str::concat_strings(L"Open ", format_count(sel_n).view(), L" items in default app (Enter)");
+                } else {
+                    title = L"Open in default app (Enter)";
+                }
                 return true;
             case IdActExplorer:
-                title = L"Show in Explorer";
+                title = sel_n > 1 ? L"Show selected files in Explorer" : L"Show in Explorer";
                 return true;
             case IdActDelete:
-                title = L"Delete file & remove from history (Del)";
+                title = sel_n > 1
+                    ? ulp::str::concat_strings(L"Delete ", format_count(sel_n).view(), L" files & remove from history (Del)")
+                    : L"Delete file & remove from history (Del)";
                 return true;
             case IdVideoPlay: {
                 const bool playing = video_.is_scrubbing() ? video_.want_play() : video_.is_playing();
@@ -642,15 +682,21 @@ private:
         draw_button(cv, hover_.alpha(IdFilterImages), rect(fx + 58.0f, fy, 72.0f, 28.0f), 0, L"Images", IdFilterImages, 0, filter_ == Filter::Images ? 1 : 3);
         draw_button(cv, hover_.alpha(IdFilterVideos), rect(fx + 134.0f, fy, 72.0f, 28.0f), 0, L"Videos", IdFilterVideos, 0, filter_ == Filter::Videos ? 1 : 3);
 
+        const size_t sel_n = selection_count();
         FixedWString<48> cnt;
-        if (has_q && entries_.size() != all_entries_.size()) {
+        if (sel_n > 1) {
+            cnt.assign(format_count(sel_n));
+            cnt.append(L" selected");
+        } else if (has_q && entries_.size() != all_entries_.size()) {
             cnt.assign(format_count(entries_.size()));
             cnt.append(L" / ");
             cnt.append(format_count(all_entries_.size()));
         } else {
             cnt.assign(format_count(entries_.size()));
         }
-        cv.text(cnt, rect(area.right - 92.0f, fy, 80.0f, 28.0f), Font::Caption, cv.theme().outline, Align::Right);
+        const float cnt_left = std::min(area.right - 20.0f, fx + 210.0f);
+        cv.text(cnt, D2D1::RectF(cnt_left, fy, area.right - 12.0f, fy + 28.0f), Font::Caption,
+                sel_n > 1 ? cv.theme().primary : cv.theme().outline, Align::Right);
         cv.hline(area.left, area.right, area.top + SIDEBAR_TOP_H - 1.0f, with_alpha(cv.theme().outline_variant, 0.45f));
 
         const D2D1_RECT_F list_r = D2D1::RectF(area.left, area.top + SIDEBAR_TOP_H, area.right, area.bottom);
@@ -678,14 +724,18 @@ private:
             const CaptureEntry& e = entries_[static_cast<size_t>(i)];
             const float ry = list_r.top + 6.0f + (static_cast<float>(i) * step) - scroll_;
             const D2D1_RECT_F rr = rect(list_r.left + 8.0f, ry, width(list_r) - 20.0f, ROW_H);
-            const bool sel = (i == selected_idx_);
+            const bool sel = selection_.contains(e.id);
+            const bool active = (i == selection_.focus);
             const float ha = hover_.alpha(IdRow, i);
 
             const D2D1_COLOR_F bg = sel
                 ? lerp_color(with_alpha(cv.theme().primary_container, 0.55f), with_alpha(cv.theme().primary_container, 0.72f), ha)
                 : with_alpha(cv.theme().surface_high, 0.45f * ha);
             if (bg.a > 0.002f) cv.fill_round(rr, 10.0f, bg);
-            if (sel) cv.stroke_round(rr, 10.0f, with_alpha(cv.theme().primary, 0.75f), 1.2f);
+            if (sel) {
+                const bool active_multi = active && sel_n > 1;
+                cv.stroke_round(rr, 10.0f, with_alpha(cv.theme().primary, active_multi ? 0.95f : 0.75f), active_multi ? 1.5f : 1.2f);
+            }
 
             // Thumbnail box
             const RowCache& rc = row_cache_[static_cast<size_t>(i)];
@@ -757,7 +807,12 @@ private:
                                        static_cast<uint32_t>(std::lround(fb.height * target_.scale())));
                 cv.bitmap(video_.bitmap(), rect(fb.left, fb.top, fb.width, fb.height));
             } else if (ID2D1Bitmap1* tb = sh_.thumbs.get(static_cast<uint64_t>(e->id))) {
-                cv.fill_bitmap_round(tb, media_box, 8.0f, ThumbFit::Contain);
+                const D2D1_SIZE_U ps = tb->GetPixelSize();
+                const uint32_t src_w = (e->width > 0 && e->height > 0) ? e->width : ps.width;
+                const uint32_t src_h = (e->width > 0 && e->height > 0) ? e->height : ps.height;
+                const FitBox fb = compute_preview_box(src_w, src_h, e->width, e->height, target_.scale(),
+                                                      {.left = media_box.left, .top = media_box.top, .width = width(media_box), .height = height(media_box)});
+                cv.bitmap(tb, rect(fb.left, fb.top, fb.width, fb.height));
             } else {
                 cv.text(video_.failed() ? L"Video preview unavailable — double-click to open externally" : L"Loading video…",
                         media_box, Font::Body, cv.theme().outline, Align::Center);
@@ -792,7 +847,7 @@ private:
             const uint64_t tid = static_cast<uint64_t>(e->id);
             ID2D1Bitmap1* bmp = sh_.previews.get(tid);
             if (!bmp) {
-                sh_.previews.request(tid, row_cache_[static_cast<size_t>(selected_idx_)].wpath, 2048);
+                sh_.previews.request(tid, row_cache_[static_cast<size_t>(selection_.focus)].wpath, 2048);
                 bmp = sh_.thumbs.get(tid);
             }
             if (bmp) {
@@ -809,7 +864,14 @@ private:
         cv.fill_round(foot, 10.0f, with_alpha(cv.theme().surface, 0.90f));
         cv.stroke_round(foot, 10.0f, with_alpha(cv.theme().outline_variant, 0.6f));
 
-        const float del_w = button_width(cv, L"Delete", true, 84.0f);
+        const size_t sel_n = selection_count();
+        FixedWString<32> del_lbl{L"Delete"};
+        if (sel_n > 1) {
+            del_lbl.append(L" (");
+            del_lbl.append(format_count(sel_n));
+            del_lbl.push_back(L')');
+        }
+        const float del_w = button_width(cv, del_lbl, true, 84.0f);
         const float exp_w = button_width(cv, L"Folder", true, 84.0f);
         const float open_w = button_width(cv, L"Open", true, 78.0f);
         const float copy_w = button_width(cv, L"Copy", true, 78.0f);
@@ -817,7 +879,7 @@ private:
         float bx = foot.right - 10.0f;
         const float by = foot.top + ((height(foot) - 32.0f) * 0.5f);
         bx -= del_w;
-        draw_button(cv, hover_.alpha(IdActDelete), rect(bx, by, del_w, 32.0f), glyph::del, L"Delete", IdActDelete, 0, 2);
+        draw_button(cv, hover_.alpha(IdActDelete), rect(bx, by, del_w, 32.0f), glyph::del, del_lbl, IdActDelete, 0, 2);
         bx -= 6.0f + exp_w;
         draw_button(cv, hover_.alpha(IdActExplorer), rect(bx, by, exp_w, 32.0f), glyph::folder, L"Folder", IdActExplorer, 0, 3);
         bx -= 6.0f + open_w;
@@ -826,36 +888,147 @@ private:
         draw_button(cv, hover_.alpha(IdActCopy), rect(bx, by, copy_w, 32.0f), glyph::copy, L"Copy", IdActCopy, 0, 1);
 
         const float info_w = std::max(40.0f, bx - foot.left - 18.0f);
-        const RowCache& sel_rc = row_cache_[static_cast<size_t>(selected_idx_)];
-        std::wstring top_line;
-        if (!sel_rc.window_title.empty()) {
-            top_line = ulp::str::concat_strings(sel_rc.window_title, L"  —  ", sel_rc.filename);
-        } else {
-            top_line = sel_rc.filename;
-        }
-        cv.text(top_line, rect(foot.left + 12.0f, foot.top + 8.0f, info_w, 20.0f), Font::SmallSemi, cv.theme().on_surface);
+        if (sel_n > 1) {
+            size_t img_count = 0;
+            size_t vid_count = 0;
+            uint64_t total_bytes = 0;
+            for (const CaptureEntry& item : entries_) {
+                if (!selection_.contains(item.id)) continue;
+                if (item.kind == CaptureKind::Video) ++vid_count;
+                else ++img_count;
+                total_bytes += item.size_bytes;
+            }
+            FixedWString<64> top_line;
+            top_line.assign(format_count(sel_n));
+            top_line.append(L" captures selected");
+            cv.text(top_line, rect(foot.left + 12.0f, foot.top + 8.0f, info_w, 20.0f), Font::SmallSemi, cv.theme().on_surface);
 
-        std::wstring sub;
-        if (!sel_rc.process_name.empty()) {
-            append_to(sub, sel_rc.process_name, L"  •  ");
+            std::wstring sub;
+            if (img_count > 0) {
+                append_to(sub, format_count(img_count).view(), img_count == 1 ? L" image" : L" images");
+            }
+            if (vid_count > 0) {
+                if (!sub.empty()) sub += L"  •  ";
+                append_to(sub, format_count(vid_count).view(), vid_count == 1 ? L" video" : L" videos");
+            }
+            if (total_bytes > 0) {
+                if (!sub.empty()) sub += L"  •  ";
+                append_to(sub, format_size(total_bytes).view(), L" total");
+            }
+            cv.text(sub, rect(foot.left + 12.0f, foot.top + 28.0f, info_w, 18.0f), Font::Caption, cv.theme().on_surface_variant);
+        } else {
+            const RowCache& sel_rc = row_cache_[static_cast<size_t>(selection_.focus)];
+            std::wstring top_line;
+            if (!sel_rc.window_title.empty()) {
+                top_line = ulp::str::concat_strings(sel_rc.window_title, L"  —  ", sel_rc.filename);
+            } else {
+                top_line = sel_rc.filename;
+            }
+            cv.text(top_line, rect(foot.left + 12.0f, foot.top + 8.0f, info_w, 20.0f), Font::SmallSemi, cv.theme().on_surface);
+
+            std::wstring sub;
+            if (!sel_rc.process_name.empty()) {
+                append_to(sub, sel_rc.process_name, L"  •  ");
+            }
+            sub += (e->mode == CaptureMode::Full ? L"Full Screen" : (e->mode == CaptureMode::Region ? L"Region" : L"Recording"));
+            if (!sel_rc.format.empty()) {
+                append_to(sub, L"  •  ", sel_rc.format);
+            }
+            if (e->width > 0 && e->height > 0) {
+                append_to(sub, L"  •  ", to_fixed_wstr<16>(e->width), L"×", to_fixed_wstr<16>(e->height));
+            }
+            if (e->size_bytes > 0) {
+                append_to(sub, L"  •  ", format_size(e->size_bytes));
+            }
+            if (!sel_rc.ts.empty()) {
+                append_to(sub, L"  •  ", sel_rc.ts);
+            }
+            cv.text(sub, rect(foot.left + 12.0f, foot.top + 28.0f, info_w, 18.0f), Font::Caption, cv.theme().on_surface_variant);
         }
-        sub += (e->mode == CaptureMode::Full ? L"Full Screen" : (e->mode == CaptureMode::Region ? L"Region" : L"Recording"));
-        if (!sel_rc.format.empty()) {
-            append_to(sub, L"  •  ", sel_rc.format);
-        }
-        if (e->width > 0 && e->height > 0) {
-            append_to(sub, L"  •  ", to_fixed_wstr<16>(e->width), L"×", to_fixed_wstr<16>(e->height));
-        }
-        if (e->size_bytes > 0) {
-            append_to(sub, L"  •  ", format_size(e->size_bytes));
-        }
-        if (!sel_rc.ts.empty()) {
-            append_to(sub, L"  •  ", sel_rc.ts);
-        }
-        cv.text(sub, rect(foot.left + 12.0f, foot.top + 28.0f, info_w, 18.0f), Font::Caption, cv.theme().on_surface_variant);
         if (info_w > 40.0f) {
             cv.hit(D2D1::RectF(foot.left + 8.0f, foot.top + 4.0f, foot.left + 12.0f + info_w, foot.bottom - 4.0f), IdFooterInfo);
         }
+    }
+
+    void draw_delete_confirm(Canvas& cv, D2D1_SIZE_F sz) {
+        const D2D1_RECT_F full = D2D1::RectF(0.0f, 0.0f, sz.width, sz.height);
+        cv.fill(full, hex(0x000000, 0.56f));
+        cv.hit(full, IdConfirmBackdrop);
+
+        const size_t n = delete_confirm_.ids.size();
+        FixedWString<64> title;
+        if (n <= 1) {
+            title.assign(delete_confirm_.delete_files ? L"Delete capture?" : L"Remove capture from history?");
+        } else {
+            title.assign(delete_confirm_.delete_files ? L"Delete " : L"Remove ");
+            title.append(format_count(n));
+            title.append(delete_confirm_.delete_files ? L" captures?" : L" captures from history?");
+        }
+
+        std::wstring body;
+        if (delete_confirm_.delete_files) {
+            if (n <= 1) {
+                body = ulp::str::concat_strings(
+                    L"Move \"", delete_confirm_.first_filename,
+                    L"\" to the Recycle Bin and remove it from history?");
+            } else {
+                body = ulp::str::concat_strings(L"Move ", format_count(n).view(), L" selected files");
+                if (delete_confirm_.total_bytes > 0) {
+                    append_to(body, L" (", format_size(delete_confirm_.total_bytes).view(), L")");
+                }
+                body += L" to the Recycle Bin and remove them from history?";
+            }
+        } else {
+            if (n <= 1) {
+                body = ulp::str::concat_strings(
+                    L"Remove \"", delete_confirm_.first_filename,
+                    L"\" from history? The file on disk will not be deleted.");
+            } else {
+                body = ulp::str::concat_strings(
+                    L"Remove ", format_count(n).view(),
+                    L" selected captures from history? The files on disk will not be deleted.");
+            }
+        }
+
+        const float card_w = std::clamp(sz.width - 48.0f, 280.0f, 430.0f);
+        const float pad = 20.0f;
+        const float body_w = std::max(120.0f, card_w - (pad * 2.0f));
+        const float body_h = std::max(22.0f, cv.measure_height(body, Font::BodyWrap, body_w));
+        const float header_h = 30.0f;
+        const float btn_h = 34.0f;
+        const float card_h = pad + header_h + 12.0f + body_h + 22.0f + btn_h + pad;
+        const float cx = std::round((sz.width - card_w) * 0.5f);
+        const float cy = std::round((sz.height - card_h) * 0.5f);
+        const D2D1_RECT_F card = rect(cx, cy, card_w, card_h);
+
+        cv.shadow(card, 14.0f, 18.0f, 0.55f);
+        cv.fill_round(card, 14.0f, cv.theme().surface);
+        cv.stroke_round(card, 14.0f, with_alpha(cv.theme().outline_variant, 0.9f), 1.0f);
+        cv.hit(card, IdConfirmDialog);
+
+        const D2D1_RECT_F icon_box = rect(card.left + pad, card.top + pad, 30.0f, 30.0f);
+        cv.fill_round(icon_box, 8.0f, with_alpha(cv.theme().error_container, 0.65f));
+        cv.icon(glyph::del, icon_box, cv.theme().error, Font::Icon);
+        cv.text(title, rect(icon_box.right + 12.0f, card.top + pad, card.right - pad - icon_box.right - 12.0f, 30.0f),
+                Font::Large, cv.theme().on_surface);
+
+        cv.text_wrap(body, rect(card.left + pad, card.top + pad + header_h + 12.0f, body_w, body_h + 4.0f),
+                     Font::BodyWrap, cv.theme().on_surface_variant);
+
+        FixedWString<32> ok_lbl{delete_confirm_.delete_files ? L"Delete" : L"Remove"};
+        if (n > 1) {
+            ok_lbl.append(L" (");
+            ok_lbl.append(format_count(n));
+            ok_lbl.push_back(L')');
+        }
+        const float ok_w = button_width(cv, ok_lbl, true, 96.0f);
+        const float cancel_w = button_width(cv, L"Cancel", false, 84.0f);
+        const float by = card.bottom - pad - btn_h;
+        const D2D1_RECT_F ok_r = rect(card.right - pad - ok_w, by, ok_w, btn_h);
+        const D2D1_RECT_F cancel_r = rect(ok_r.left - 8.0f - cancel_w, by, cancel_w, btn_h);
+
+        draw_button(cv, hover_.alpha(IdConfirmCancel), cancel_r, 0, L"Cancel", IdConfirmCancel, 0, 0);
+        draw_button(cv, hover_.alpha(IdConfirmOk), ok_r, glyph::del, ok_lbl, IdConfirmOk, 0, 2);
     }
 
     // ------------------------------------------------------------------------------------------
@@ -867,30 +1040,111 @@ private:
         (void)open_file(to_wide(entries_[static_cast<size_t>(idx)].path));
     }
 
-    void copy_entry(int idx) {
-        if (idx < 0 || std::cmp_greater_equal(idx, entries_.size())) return;
-        const CaptureEntry& e = entries_[static_cast<size_t>(idx)];
-        (void)copy_capture_to_clipboard(to_wide(e.path), e.kind == CaptureKind::Image);
+    void open_selected_entries() {
+        const auto indices = selected_indices();
+        constexpr size_t MAX_OPEN = 8;
+        for (size_t i = 0; i < indices.size() && i < MAX_OPEN; ++i) {
+            open_entry(indices[i]);
+        }
     }
 
-    void delete_entry(int idx, bool delete_file) {
-        if (idx < 0 || std::cmp_greater_equal(idx, entries_.size())) return;
-        const CaptureEntry e = entries_[static_cast<size_t>(idx)];
-        const std::wstring wpath = to_wide(e.path);
-        if (e.kind == CaptureKind::Video && video_.path() == wpath) {
-            video_.close();
+    void copy_selected_entries() {
+        const auto indices = selected_indices();
+        if (indices.empty()) return;
+        std::vector<std::wstring> paths;
+        paths.reserve(indices.size());
+        for (const int idx : indices) {
+            paths.push_back(row_cache_[static_cast<size_t>(idx)].wpath);
         }
-        if (delete_file) {
-            (void)delete_file_to_recycle_bin(wpath);
-        }
-        (void)sh_.history.remove(e.id);
-        sh_.thumbs.evict(static_cast<uint64_t>(e.id));
-        sh_.previews.evict(static_cast<uint64_t>(e.id));
+        const bool single_image = (indices.size() == 1 && entries_[static_cast<size_t>(indices[0])].kind == CaptureKind::Image);
+        (void)copy_captures_to_clipboard(paths, single_image);
+    }
 
-        const int next_sel = std::min(idx, static_cast<int>(entries_.size()) - 2);
+    void reveal_selected_entries() {
+        const auto indices = selected_indices();
+        if (indices.empty()) return;
+        std::vector<std::wstring> paths;
+        paths.reserve(indices.size());
+        for (const int idx : indices) {
+            paths.push_back(row_cache_[static_cast<size_t>(idx)].wpath);
+        }
+        (void)reveal_in_explorer(paths);
+    }
+
+    void request_delete_selected(bool delete_files) {
+        const auto indices = selected_indices();
+        if (indices.empty()) return;
+        DeleteConfirm req;
+        req.open = true;
+        req.delete_files = delete_files;
+        req.first_idx = indices.front();
+        req.ids.reserve(indices.size());
+        req.paths.reserve(indices.size());
+        for (const int idx : indices) {
+            const CaptureEntry& e = entries_[static_cast<size_t>(idx)];
+            const RowCache& rc = row_cache_[static_cast<size_t>(idx)];
+            req.ids.push_back(e.id);
+            req.paths.push_back(rc.wpath);
+            req.total_bytes += e.size_bytes;
+        }
+        req.first_filename = row_cache_[static_cast<size_t>(indices.front())].filename;
+
+        delete_confirm_ = std::move(req);
+        drag_pending_ = false;
+        deferred_select_idx_ = -1;
+        dragging_scroll_ = false;
+        dragging_search_ = false;
+        if (scrubbing_video_) {
+            scrubbing_video_ = false;
+            video_.end_scrub();
+        }
+        if (GetCapture() == hwnd_) ReleaseCapture();
+        set_search_focus(false);
+        dismiss_tooltip();
+        raw_hover_id_ = IdNone;
+        raw_hover_index_ = 0;
+        hover_.set(IdNone, 0, false);
+        invalidate();
+    }
+
+    void cancel_delete_confirm() {
+        if (!delete_confirm_.open) return;
+        delete_confirm_ = {};
+        raw_hover_id_ = IdNone;
+        raw_hover_index_ = 0;
+        hover_.set(IdNone, 0, false);
+        invalidate();
+    }
+
+    void execute_delete_confirm() {
+        if (!delete_confirm_.open) return;
+        const DeleteConfirm req = std::exchange(delete_confirm_, {});
+        delete_entries_immediate(req.ids, req.paths, req.first_idx, req.delete_files);
+    }
+
+    void delete_entries_immediate(std::span<const int64_t> ids, std::span<const std::wstring> paths, int first_idx, bool delete_files) {
+        if (ids.empty()) return;
+        if (video_.active()) {
+            for (const auto& p : paths) {
+                if (video_.path() == p) {
+                    video_.close();
+                    break;
+                }
+            }
+        }
+        if (delete_files) {
+            (void)delete_files_to_recycle_bin(paths);
+        }
+        (void)sh_.history.remove_many(ids);
+        for (const int64_t id : ids) {
+            sh_.thumbs.evict(static_cast<uint64_t>(id));
+            sh_.previews.evict(static_cast<uint64_t>(id));
+        }
+
         reload_entries(false);
-        if (next_sel >= 0 && std::cmp_less(next_sel, entries_.size())) {
-            selected_idx_ = next_sel;
+        if (!entries_.empty()) {
+            const int next_sel = std::clamp(first_idx, 0, static_cast<int>(entries_.size()) - 1);
+            selection_.select_single(entries_, next_sel);
             sync_preview_media();
         }
         invalidate();
@@ -898,19 +1152,41 @@ private:
 
     void show_context_menu(int idx) {
         if (idx < 0 || std::cmp_greater_equal(idx, entries_.size())) return;
-        selected_idx_ = idx;
-        sync_preview_media();
-        render();
+        if (!selection_.contains(entries_[static_cast<size_t>(idx)].id)) {
+            selection_.select_single(entries_, idx);
+            sync_preview_media();
+            render();
+        }
 
-        const CaptureEntry& e = entries_[static_cast<size_t>(idx)];
+        const auto indices = selected_indices();
+        if (indices.empty()) return;
+        const size_t n = indices.size();
+        const CaptureEntry& primary = entries_[static_cast<size_t>(indices.front())];
+
         const wil::unique_hmenu menu{CreatePopupMenu()};
-        AppendMenuW(menu.get(), MF_STRING, CmdOpen, L"Open in Default App");
-        AppendMenuW(menu.get(), MF_STRING, CmdCopy, e.kind == CaptureKind::Image ? L"Copy Image" : L"Copy Video File");
-        AppendMenuW(menu.get(), MF_STRING, CmdCopyPath, L"Copy File Path");
-        AppendMenuW(menu.get(), MF_STRING, CmdExplorer, L"Show in Explorer");
-        AppendMenuW(menu.get(), MF_SEPARATOR, 0, nullptr);
-        AppendMenuW(menu.get(), MF_STRING, CmdRemoveHistory, L"Remove from History");
-        AppendMenuW(menu.get(), MF_STRING, CmdDeleteFile, L"Delete File & History");
+        if (n > 1) {
+            const auto cnt = format_count(n);
+            const std::wstring open_lbl = ulp::str::concat_strings(L"Open ", cnt.view(), L" Items in Default App");
+            const std::wstring copy_lbl = ulp::str::concat_strings(L"Copy ", cnt.view(), L" Files");
+            const std::wstring path_lbl = ulp::str::concat_strings(L"Copy ", cnt.view(), L" File Paths");
+            const std::wstring rem_lbl = ulp::str::concat_strings(L"Remove ", cnt.view(), L" Items from History");
+            const std::wstring del_lbl = ulp::str::concat_strings(L"Delete ", cnt.view(), L" Files & History");
+            AppendMenuW(menu.get(), MF_STRING, CmdOpen, open_lbl.c_str());
+            AppendMenuW(menu.get(), MF_STRING, CmdCopy, copy_lbl.c_str());
+            AppendMenuW(menu.get(), MF_STRING, CmdCopyPath, path_lbl.c_str());
+            AppendMenuW(menu.get(), MF_STRING, CmdExplorer, L"Show in Explorer");
+            AppendMenuW(menu.get(), MF_SEPARATOR, 0, nullptr);
+            AppendMenuW(menu.get(), MF_STRING, CmdRemoveHistory, rem_lbl.c_str());
+            AppendMenuW(menu.get(), MF_STRING, CmdDeleteFile, del_lbl.c_str());
+        } else {
+            AppendMenuW(menu.get(), MF_STRING, CmdOpen, L"Open in Default App");
+            AppendMenuW(menu.get(), MF_STRING, CmdCopy, primary.kind == CaptureKind::Image ? L"Copy Image" : L"Copy Video File");
+            AppendMenuW(menu.get(), MF_STRING, CmdCopyPath, L"Copy File Path");
+            AppendMenuW(menu.get(), MF_STRING, CmdExplorer, L"Show in Explorer");
+            AppendMenuW(menu.get(), MF_SEPARATOR, 0, nullptr);
+            AppendMenuW(menu.get(), MF_STRING, CmdRemoveHistory, L"Remove from History");
+            AppendMenuW(menu.get(), MF_STRING, CmdDeleteFile, L"Delete File & History");
+        }
         SetMenuDefaultItem(menu.get(), CmdOpen, FALSE);
 
         POINT pt{};
@@ -920,12 +1196,31 @@ private:
         PostMessageW(hwnd_, WM_NULL, 0, 0);
 
         switch (cmd) {
-            case CmdOpen: open_entry(idx); break;
-            case CmdCopy: copy_entry(idx); break;
-            case CmdCopyPath: (void)set_clipboard_text(hwnd_, to_wide(e.path)); break;
-            case CmdExplorer: (void)reveal_in_explorer(to_wide(e.path)); break;
-            case CmdRemoveHistory: delete_entry(idx, false); break;
-            case CmdDeleteFile: delete_entry(idx, true); break;
+            case CmdOpen: open_selected_entries(); break;
+            case CmdCopy: copy_selected_entries(); break;
+            case CmdCopyPath: {
+                std::wstring all;
+                for (const int sel_i : indices) {
+                    if (!all.empty()) all += L"\r\n";
+                    all += row_cache_[static_cast<size_t>(sel_i)].wpath;
+                }
+                (void)set_clipboard_text(hwnd_, all);
+                break;
+            }
+            case CmdExplorer: reveal_selected_entries(); break;
+            case CmdRemoveHistory: {
+                std::vector<int64_t> ids;
+                std::vector<std::wstring> paths;
+                ids.reserve(indices.size());
+                paths.reserve(indices.size());
+                for (const int sel_i : indices) {
+                    ids.push_back(entries_[static_cast<size_t>(sel_i)].id);
+                    paths.push_back(row_cache_[static_cast<size_t>(sel_i)].wpath);
+                }
+                delete_entries_immediate(ids, paths, indices.front(), false);
+                break;
+            }
+            case CmdDeleteFile: request_delete_selected(true); break;
             default: break;
         }
     }
@@ -933,9 +1228,21 @@ private:
     void start_drag_out(int idx) {
         if (dragging_out_ || idx < 0 || std::cmp_greater_equal(idx, entries_.size())) return;
         drag_pending_ = false;
+        deferred_select_idx_ = -1;
         if (GetCapture() == hwnd_) ReleaseCapture();
 
-        const std::array<std::wstring, 1> paths = {to_wide(entries_[static_cast<size_t>(idx)].path)};
+        std::vector<std::wstring> paths;
+        if (selection_.contains(entries_[static_cast<size_t>(idx)].id)) {
+            const auto indices = selected_indices();
+            paths.reserve(indices.size());
+            for (const int sel_i : indices) {
+                paths.push_back(row_cache_[static_cast<size_t>(sel_i)].wpath);
+            }
+        } else {
+            paths.push_back(row_cache_[static_cast<size_t>(idx)].wpath);
+        }
+        if (paths.empty()) return;
+
         wil::com_ptr<AsyncDataObject> async_drop;
         {
             dragging_out_ = true;
@@ -971,6 +1278,14 @@ private:
     void on_lbutton_down(LPARAM lp) {
         const D2D1_POINT_2F p = to_dip(lp);
         const Hit* h = hit_test(hits_, p);
+        if (delete_confirm_.open) {
+            if (!h || h->id == IdConfirmBackdrop || h->id == IdConfirmCancel) {
+                cancel_delete_confirm();
+            } else if (h->id == IdConfirmOk) {
+                execute_delete_confirm();
+            }
+            return;
+        }
         if (!h) {
             set_search_focus(false);
             return;
@@ -1005,12 +1320,10 @@ private:
             case IdFilterAll: filter_ = Filter::All; reload_entries(true); return;
             case IdFilterImages: filter_ = Filter::Images; reload_entries(true); return;
             case IdFilterVideos: filter_ = Filter::Videos; reload_entries(true); return;
-            case IdActCopy: copy_entry(selected_idx_); return;
-            case IdActOpen: open_entry(selected_idx_); return;
-            case IdActExplorer:
-                if (const auto* e = selected_entry()) (void)reveal_in_explorer(to_wide(e->path));
-                return;
-            case IdActDelete: delete_entry(selected_idx_, true); return;
+            case IdActCopy: copy_selected_entries(); return;
+            case IdActOpen: open_selected_entries(); return;
+            case IdActExplorer: reveal_selected_entries(); return;
+            case IdActDelete: request_delete_selected(true); return;
             case IdVideoPlay:
                 if (!video_.active() || video_.failed()) {
                     sync_preview_media();
@@ -1039,19 +1352,27 @@ private:
                 return;
             }
             case IdRow: {
-                selected_idx_ = h->index;
-                sync_preview_media();
-                drag_pending_ = true;
-                drag_idx_ = h->index;
-                drag_start_px_ = {GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
-                SetCapture(hwnd_);
+                const bool ctrl = GetKeyState(VK_CONTROL) < 0;
+                const bool shift = GetKeyState(VK_SHIFT) < 0;
+                const int prev_focus = selection_.focus;
+                const bool deferred = selection_.click(entries_, h->index, ctrl, shift);
+                deferred_select_idx_ = deferred ? h->index : -1;
+                if (selection_.focus != prev_focus) {
+                    sync_preview_media();
+                }
+                if (!ctrl && !shift && h->index >= 0 && std::cmp_less(h->index, entries_.size())) {
+                    drag_pending_ = true;
+                    drag_idx_ = h->index;
+                    drag_start_px_ = {GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+                    SetCapture(hwnd_);
+                }
                 invalidate();
                 return;
             }
             case IdPreviewArea: {
-                if (selected_idx_ >= 0) {
+                if (selection_.focus >= 0) {
                     drag_pending_ = true;
-                    drag_idx_ = selected_idx_;
+                    drag_idx_ = selection_.focus;
                     drag_start_px_ = {GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
                     SetCapture(hwnd_);
                 }
@@ -1063,27 +1384,42 @@ private:
     }
 
     void on_lbutton_dblclk(LPARAM lp) {
+        if (delete_confirm_.open) return;
         const Hit* h = hit_test(hits_, to_dip(lp));
         if (!h) return;
         if (h->id == IdRow) {
             open_entry(h->index);
         } else if (h->id == IdPreviewArea) {
-            open_entry(selected_idx_);
+            open_entry(selection_.focus);
         }
     }
 
     void on_rbutton_up(LPARAM lp) {
+        if (delete_confirm_.open) return;
         const Hit* h = hit_test(hits_, to_dip(lp));
         if (!h) return;
         if (h->id == IdRow) {
             show_context_menu(h->index);
-        } else if (h->id == IdPreviewArea && selected_idx_ >= 0) {
-            show_context_menu(selected_idx_);
+        } else if (h->id == IdPreviewArea && selection_.focus >= 0) {
+            show_context_menu(selection_.focus);
         }
     }
 
     void on_mouse_move(LPARAM lp) {
         const D2D1_POINT_2F p = to_dip(lp);
+        if (delete_confirm_.open) {
+            const Hit* h = hit_test(hits_, p);
+            const int nid = (h && (h->id == IdConfirmCancel || h->id == IdConfirmOk)) ? h->id : IdNone;
+            if (nid != raw_hover_id_ || raw_hover_index_ != 0) {
+                raw_hover_id_ = nid;
+                raw_hover_index_ = 0;
+                if (hover_.set(nid, 0, true)) start_anim();
+            }
+            SetCursor(nid != IdNone ? cursor_hand_ : cursor_arrow_);
+            TRACKMOUSEEVENT tme{.cbSize = sizeof(tme), .dwFlags = TME_LEAVE, .hwndTrack = hwnd_};
+            TrackMouseEvent(&tme);
+            return;
+        }
         if (dragging_search_) {
             if (target_.ready()) {
                 std::vector<Hit> dummy;
@@ -1134,6 +1470,15 @@ private:
         drag_pending_ = false;
         dragging_scroll_ = false;
         dragging_search_ = false;
+        if (deferred_select_idx_ >= 0 && std::cmp_less(deferred_select_idx_, entries_.size())) {
+            const int idx = std::exchange(deferred_select_idx_, -1);
+            const int prev_focus = selection_.focus;
+            selection_.select_single(entries_, idx);
+            if (selection_.focus != prev_focus) sync_preview_media();
+            invalidate();
+        } else {
+            deferred_select_idx_ = -1;
+        }
         if (scrubbing_video_) {
             scrubbing_video_ = false;
             video_.end_scrub();
@@ -1144,7 +1489,7 @@ private:
     }
 
     void on_char(wchar_t ch) {
-        if (!search_field_.focused) return;
+        if (delete_confirm_.open || !search_field_.focused) return;
         if (ch < 0x20 || ch == 0x7F) return;
         const std::wstring_view sv{&ch, 1};
         if (search_field_.replace_selection(sv)) {
@@ -1154,7 +1499,13 @@ private:
     }
 
     void on_key_down(UINT vk) {
+        if (delete_confirm_.open) {
+            if (vk == VK_ESCAPE) cancel_delete_confirm();
+            else if (vk == VK_RETURN) execute_delete_confirm();
+            return;
+        }
         const bool ctrl = GetKeyState(VK_CONTROL) < 0;
+        const bool shift = GetKeyState(VK_SHIFT) < 0;
         if (ctrl && vk == 'F') {
             set_search_focus(true);
             search_field_.select_all();
@@ -1162,18 +1513,13 @@ private:
             invalidate();
             return;
         }
-        if (vk == VK_UP && selected_idx_ > 0) {
-            --selected_idx_;
-            sync_preview_media();
-            ensure_row_visible(selected_idx_);
-            invalidate();
-            return;
-        }
-        if (vk == VK_DOWN && selected_idx_ + 1 < static_cast<int>(entries_.size())) {
-            ++selected_idx_;
-            sync_preview_media();
-            ensure_row_visible(selected_idx_);
-            invalidate();
+        if (vk == VK_UP || vk == VK_DOWN) {
+            const int prev_focus = selection_.focus;
+            if (selection_.move(entries_, vk == VK_UP ? -1 : 1, shift)) {
+                if (selection_.focus != prev_focus) sync_preview_media();
+                ensure_row_visible(selection_.focus);
+                invalidate();
+            }
             return;
         }
         if (search_field_.focused) {
@@ -1186,8 +1532,8 @@ private:
                 }
                 return;
             }
-            if (vk == VK_RETURN && selected_idx_ >= 0) {
-                open_entry(selected_idx_);
+            if (vk == VK_RETURN && !selection_.empty()) {
+                open_selected_entries();
                 return;
             }
             bool handled = false;
@@ -1198,11 +1544,27 @@ private:
                 else invalidate();
                 return;
             }
+            return;
         }
-        if (vk == VK_ESCAPE) { hide(); return; }
-        if (vk == VK_RETURN && selected_idx_ >= 0) { open_entry(selected_idx_); return; }
-        if (vk == VK_DELETE && selected_idx_ >= 0) { delete_entry(selected_idx_, true); return; }
-        if (ctrl && vk == 'C' && selected_idx_ >= 0) { copy_entry(selected_idx_); return; }
+        if (ctrl && vk == 'A' && !entries_.empty()) {
+            const int prev_focus = selection_.focus;
+            selection_.select_all(entries_);
+            if (selection_.focus != prev_focus) sync_preview_media();
+            invalidate();
+            return;
+        }
+        if (vk == VK_ESCAPE) {
+            if (selection_count() > 1 && selection_.focus >= 0 && std::cmp_less(selection_.focus, entries_.size())) {
+                selection_.select_single(entries_, selection_.focus);
+                invalidate();
+                return;
+            }
+            hide();
+            return;
+        }
+        if (vk == VK_RETURN && !selection_.empty()) { open_selected_entries(); return; }
+        if (vk == VK_DELETE && !selection_.empty()) { request_delete_selected(true); return; }
+        if (ctrl && vk == 'C' && !selection_.empty()) { copy_selected_entries(); return; }
         if (vk == VK_SPACE && selected_entry() && is_playable_video(*selected_entry())) {
             if (!video_.active() || video_.failed()) {
                 sync_preview_media();
@@ -1316,6 +1678,7 @@ private:
                 }
                 return 0;
             case WM_MOUSEWHEEL: {
+                if (delete_confirm_.open) return 0;
                 dismiss_tooltip();
                 const float delta = static_cast<float>(GET_WHEEL_DELTA_WPARAM(wp)) / 120.0f;
                 target_scroll_ = std::clamp(target_scroll_ - (delta * 96.0f), 0.0f, max_scroll());
@@ -1371,7 +1734,9 @@ private:
     std::vector<RowCache> all_cache_;
     std::vector<CaptureEntry> entries_;
     std::vector<RowCache> row_cache_;
-    int selected_idx_ = -1;
+    HistorySelection selection_;
+    int deferred_select_idx_ = -1;
+    DeleteConfirm delete_confirm_;
 
     std::vector<Hit> hits_;
     HoverTracker hover_;

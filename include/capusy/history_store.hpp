@@ -2,13 +2,19 @@
 
 #include <sqlite3.h>
 
+#include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <filesystem>
+#include <limits>
 #include <mutex>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <unordered_set>
+#include <utility>
 #include <vector>
 
 namespace capusy {
@@ -63,6 +69,216 @@ struct HistoryStats {
     uint64_t image_count = 0;
     uint64_t video_count = 0;
     uint64_t db_bytes = 0;
+};
+
+/// Multi-select state for the history list (Ctrl toggle, Shift range, Ctrl+Shift additive range,
+/// keyboard navigation, deferred single-select on multi-drag, and reconciliation across reloads).
+struct HistorySelection {
+    std::unordered_set<int64_t> ids;
+    int focus = -1;
+    int anchor = -1;
+    int64_t anchor_id = -1;
+
+    [[nodiscard]] bool empty() const noexcept { return ids.empty(); }
+    [[nodiscard]] size_t count() const noexcept { return ids.size(); }
+    [[nodiscard]] bool contains(int64_t id) const noexcept { return ids.contains(id); }
+
+    void clear() noexcept {
+        ids.clear();
+        focus = -1;
+        anchor = -1;
+        anchor_id = -1;
+    }
+
+    void select_single(std::span<const CaptureEntry> entries, int idx) {
+        if (idx < 0 || std::cmp_greater_equal(idx, entries.size())) {
+            clear();
+            return;
+        }
+        const int64_t id = entries[static_cast<size_t>(idx)].id;
+        ids.clear();
+        ids.insert(id);
+        focus = idx;
+        anchor = idx;
+        anchor_id = id;
+    }
+
+    /// Handles a left-click on `idx`.
+    /// Returns true if the click landed on an already-selected row in a multi-selection without
+    /// modifiers (caller should defer collapsing to `idx` until mouse-up if no drag started).
+    bool click(std::span<const CaptureEntry> entries, int idx, bool ctrl, bool shift) {
+        if (idx < 0 || std::cmp_greater_equal(idx, entries.size())) return false;
+        const int64_t cid = entries[static_cast<size_t>(idx)].id;
+
+        if (shift) {
+            const int base = (anchor >= 0 && std::cmp_less(anchor, entries.size()))
+                ? anchor
+                : ((focus >= 0 && std::cmp_less(focus, entries.size())) ? focus : idx);
+            if (!ctrl) ids.clear();
+            const int lo = std::min(base, idx);
+            const int hi = std::max(base, idx);
+            for (int k = lo; k <= hi; ++k) {
+                ids.insert(entries[static_cast<size_t>(k)].id);
+            }
+            anchor = base;
+            anchor_id = entries[static_cast<size_t>(base)].id;
+            focus = idx;
+            return false;
+        }
+
+        if (ctrl) {
+            if (ids.erase(cid) > 0) {
+                anchor = idx;
+                anchor_id = cid;
+                if (focus == idx) {
+                    focus = find_closest_selected(entries, idx);
+                }
+            } else {
+                ids.insert(cid);
+                focus = idx;
+                anchor = idx;
+                anchor_id = cid;
+            }
+            return false;
+        }
+
+        if (ids.contains(cid) && ids.size() > 1) {
+            return true;
+        }
+
+        select_single(entries, idx);
+        return false;
+    }
+
+    /// Handles Up/Down keyboard navigation (`delta` = -1 or +1). Returns true if selection changed.
+    bool move(std::span<const CaptureEntry> entries, int delta, bool shift) {
+        if (entries.empty()) return false;
+        const int last = static_cast<int>(entries.size()) - 1;
+        int next = focus;
+        if (next < 0 || next > last) {
+            next = delta >= 0 ? 0 : last;
+        } else {
+            next = std::clamp(next + delta, 0, last);
+        }
+
+        if (shift) {
+            const int base = (anchor >= 0 && anchor <= last)
+                ? anchor
+                : ((focus >= 0 && focus <= last) ? focus : next);
+            const int lo = std::min(base, next);
+            const int hi = std::max(base, next);
+            ids.clear();
+            for (int k = lo; k <= hi; ++k) {
+                ids.insert(entries[static_cast<size_t>(k)].id);
+            }
+            anchor = base;
+            anchor_id = entries[static_cast<size_t>(base)].id;
+            focus = next;
+            return true;
+        }
+
+        const bool changed = (focus != next || ids.size() != 1 || !ids.contains(entries[static_cast<size_t>(next)].id));
+        select_single(entries, next);
+        return changed;
+    }
+
+    void select_all(std::span<const CaptureEntry> entries) {
+        ids.clear();
+        ids.reserve(entries.size());
+        for (const auto& e : entries) ids.insert(e.id);
+        if (entries.empty()) {
+            focus = -1;
+            anchor = -1;
+            anchor_id = -1;
+        } else {
+            if (focus < 0 || std::cmp_greater_equal(focus, entries.size())) focus = 0;
+            if (anchor < 0 || std::cmp_greater_equal(anchor, entries.size())) {
+                anchor = focus;
+                anchor_id = entries[static_cast<size_t>(anchor)].id;
+            }
+        }
+    }
+
+    /// Reconciles selection against a newly filtered/reloaded `entries` list.
+    void reconcile(std::span<const CaptureEntry> entries, bool keep_selection, int64_t preferred_focus_id = -1) {
+        if (entries.empty()) {
+            clear();
+            return;
+        }
+        if (!keep_selection) {
+            ids.clear();
+            anchor_id = -1;
+        } else if (!ids.empty()) {
+            std::unordered_set<int64_t> visible;
+            visible.reserve(entries.size());
+            for (const auto& e : entries) visible.insert(e.id);
+            std::erase_if(ids, [&](int64_t id) { return !visible.contains(id); });
+        }
+
+        focus = -1;
+        if (preferred_focus_id >= 0) {
+            for (size_t i = 0; i < entries.size(); ++i) {
+                if (entries[i].id == preferred_focus_id) {
+                    focus = static_cast<int>(i);
+                    break;
+                }
+            }
+        }
+        if (focus < 0 && !ids.empty()) {
+            for (size_t i = 0; i < entries.size(); ++i) {
+                if (ids.contains(entries[i].id)) {
+                    focus = static_cast<int>(i);
+                    break;
+                }
+            }
+        }
+        if (focus < 0) {
+            focus = 0;
+        }
+        if (ids.empty()) {
+            ids.insert(entries[static_cast<size_t>(focus)].id);
+        }
+
+        anchor = -1;
+        if (anchor_id >= 0) {
+            for (size_t i = 0; i < entries.size(); ++i) {
+                if (entries[i].id == anchor_id) {
+                    anchor = static_cast<int>(i);
+                    break;
+                }
+            }
+        }
+        if (anchor < 0) {
+            anchor = focus;
+            anchor_id = entries[static_cast<size_t>(anchor)].id;
+        }
+    }
+
+    [[nodiscard]] std::vector<int> selected_indices(std::span<const CaptureEntry> entries) const {
+        std::vector<int> out;
+        out.reserve(ids.size());
+        for (size_t i = 0; i < entries.size(); ++i) {
+            if (ids.contains(entries[i].id)) out.push_back(static_cast<int>(i));
+        }
+        return out;
+    }
+
+private:
+    [[nodiscard]] int find_closest_selected(std::span<const CaptureEntry> entries, int from_idx) const noexcept {
+        if (ids.empty() || entries.empty()) return -1;
+        int best = -1;
+        int best_dist = std::numeric_limits<int>::max();
+        for (size_t i = 0; i < entries.size(); ++i) {
+            if (ids.contains(entries[i].id)) {
+                const int d = std::abs(static_cast<int>(i) - from_idx);
+                if (d < best_dist) {
+                    best_dist = d;
+                    best = static_cast<int>(i);
+                }
+            }
+        }
+        return best;
+    }
 };
 
 /// Thread-safe SQLite (WAL) store for screenshot & recording history (modeled on usyseek::TagStore).
@@ -240,6 +456,34 @@ public:
         if (!prepare_locked("DELETE FROM captures WHERE id = ?1;", st, error)) return false;
         sqlite3_bind_int64(st.s, 1, id);
         return step_done_locked(st.s, error);
+    }
+
+    bool remove_many(std::span<const int64_t> ids, std::string* error = nullptr) {
+        if (ids.empty()) return true;
+        const std::scoped_lock lk{mx_};
+        if (!require_open_locked(error)) return false;
+        if (ids.size() == 1) {
+            Stmt st;
+            if (!prepare_locked("DELETE FROM captures WHERE id = ?1;", st, error)) return false;
+            sqlite3_bind_int64(st.s, 1, ids[0]);
+            return step_done_locked(st.s, error);
+        }
+        if (!exec_locked("BEGIN IMMEDIATE;", error)) return false;
+        Stmt st;
+        if (!prepare_locked("DELETE FROM captures WHERE id = ?1;", st, error)) {
+            (void)exec_locked("ROLLBACK;", nullptr);
+            return false;
+        }
+        for (const int64_t id : ids) {
+            sqlite3_reset(st.s);
+            sqlite3_clear_bindings(st.s);
+            sqlite3_bind_int64(st.s, 1, id);
+            if (!step_done_locked(st.s, error)) {
+                (void)exec_locked("ROLLBACK;", nullptr);
+                return false;
+            }
+        }
+        return exec_locked("COMMIT;", error);
     }
 
     [[nodiscard]] std::optional<HistoryStats> stats(std::string* error = nullptr) {
