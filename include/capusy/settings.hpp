@@ -24,6 +24,7 @@ struct Settings {
     HotkeyBinding hk_history = default_hotkey(HotkeyAction::OpenHistory);
     HotkeyBinding hk_color_picker = default_hotkey(HotkeyAction::ColorPicker);
     HotkeyBinding hk_full_record = default_hotkey(HotkeyAction::FullRecord);
+    HotkeyBinding hk_open_folder = default_hotkey(HotkeyAction::OpenFolder);
 
     // Capture behavior & output format
     std::string save_dir;
@@ -33,6 +34,9 @@ struct Settings {
     bool auto_copy_clipboard = true;
     bool capture_cursor = false;
     bool region_instant_capture = true; // Capture immediately on click/release instead of opening annotation toolbar
+    bool thin_selection_border = false; // Use crisp 1px borders during region selection and screen recording
+    bool region_show_magnifier = true;  // Show pixel magnifier loupe during region select and corner/edge resize
+    bool region_show_crosshairs = false; // Show full-screen horizontal/vertical alignment lines from cursor
 
     // Corner preview thumbnail toast (on primary monitor)
     bool show_corner_toast = true;
@@ -97,6 +101,7 @@ struct Settings {
             case HotkeyAction::OpenHistory: return hk_history;
             case HotkeyAction::ColorPicker: return hk_color_picker;
             case HotkeyAction::FullRecord: return hk_full_record;
+            case HotkeyAction::OpenFolder: return hk_open_folder;
             case HotkeyAction::Count: break;
         }
         return hk_full;
@@ -110,13 +115,14 @@ struct Settings {
             case HotkeyAction::OpenHistory: return hk_history;
             case HotkeyAction::ColorPicker: return hk_color_picker;
             case HotkeyAction::FullRecord: return hk_full_record;
+            case HotkeyAction::OpenFolder: return hk_open_folder;
             case HotkeyAction::Count: break;
         }
         return hk_full;
     }
 
     [[nodiscard]] std::array<HotkeyBinding, HOTKEY_COUNT> all_hotkeys() const noexcept {
-        return {hk_full, hk_region, hk_record, hk_history, hk_color_picker, hk_full_record};
+        return {hk_full, hk_region, hk_record, hk_history, hk_color_picker, hk_full_record, hk_open_folder};
     }
 };
 
@@ -200,6 +206,20 @@ inline fs::path resolve_save_dir(const Settings& s) {
     fs::path d = s.save_dir.empty() ? default_captures_dir() : fs::path{to_wide(s.save_dir)};
     std::error_code ec;
     fs::create_directories(d, ec);
+    return d;
+}
+
+/// Resolves the active screenshots folder: returns `save_dir / YYYY-MM` when `split_by_month` is enabled, otherwise `save_dir`.
+inline fs::path resolve_current_capture_dir(const Settings& s) {
+    fs::path d = resolve_save_dir(s);
+    if (s.split_by_month) {
+        SYSTEMTIME st{};
+        GetLocalTime(&st);
+        const CaptureDateTime dt{.year = st.wYear, .month = st.wMonth};
+        d = resolve_active_capture_dir_for_time(d, dt, true);
+        std::error_code ec;
+        fs::create_directories(d, ec);
+    }
     return d;
 }
 

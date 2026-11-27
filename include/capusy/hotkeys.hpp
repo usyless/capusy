@@ -27,7 +27,8 @@ enum class HotkeyAction : uint8_t {
     OpenHistory = 3,
     ColorPicker = 4,
     FullRecord = 5,
-    Count = 6,
+    OpenFolder = 6,
+    Count = 7,
 };
 
 inline constexpr size_t HOTKEY_COUNT = static_cast<size_t>(HotkeyAction::Count);
@@ -67,6 +68,7 @@ inline constexpr uint32_t VK_PRINTSCREEN_CODE = 0x2Cu;
         case HotkeyAction::OpenHistory: return L"Open Screenshot History";
         case HotkeyAction::ColorPicker: return L"Screen Color Picker";
         case HotkeyAction::FullRecord: return L"Full-Screen Recording (Start / Stop)";
+        case HotkeyAction::OpenFolder: return L"Open Screenshots Folder";
         case HotkeyAction::Count: break;
     }
     return L"Shortcut";
@@ -80,6 +82,7 @@ inline constexpr uint32_t VK_PRINTSCREEN_CODE = 0x2Cu;
         case HotkeyAction::OpenHistory: return L"Shows the screenshot history and preview window";
         case HotkeyAction::ColorPicker: return L"Freezes all monitors, shows RGB under cursor, and copies #HEX on click";
         case HotkeyAction::FullRecord: return L"Records a full monitor without overlay (click to pick monitor on multi-display); click tray icon or press again to stop";
+        case HotkeyAction::OpenFolder: return L"Opens the active screenshots folder in Explorer (opens the current YYYY-MM subfolder when monthly folders are enabled)";
         case HotkeyAction::Count: break;
     }
     return L"";
@@ -95,6 +98,7 @@ inline constexpr uint32_t VK_PRINTSCREEN_CODE = 0x2Cu;
         case HotkeyAction::OpenHistory: return {.enabled = true, .mods = kAltShift, .vk = 'H'};
         case HotkeyAction::ColorPicker: return {.enabled = true, .mods = kAltShift, .vk = 'C'};
         case HotkeyAction::FullRecord: return {.enabled = true, .mods = kAltShift, .vk = '4'};
+        case HotkeyAction::OpenFolder: return {.enabled = false, .mods = kAltShift, .vk = 'F'};
         case HotkeyAction::Count: break;
     }
 #else

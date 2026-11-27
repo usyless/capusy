@@ -52,9 +52,9 @@ public:
 
         if (!sh_.gfx.ensure_device(nullptr)) return false;
 
-        // 1. Click-through border window wrapping the recorded region by 3px.
+        // 1. Click-through border window wrapping the recorded region by 1px (thin) or 3px (default).
         // WS_EX_LAYERED | WS_EX_TRANSPARENT is required for true cross-process mouse click-through.
-        constexpr int pad = 3;
+        const int pad = sh_.settings.thin_selection_border ? 1 : 3;
         const int bx = region.left - pad;
         const int by = region.top - pad;
         const int bw = (region.right - region.left) + (pad * 2);
@@ -147,7 +147,8 @@ private:
         (void)border_target_.render_frame(true, {}, WindowTarget::PresentMode::Immediate, [&](std::optional<D2D1_RECT_F> clip, bool) {
             Canvas cv{border_target_, sh_.fonts, unused, default_theme(), clip};
             const D2D1_SIZE_F sz = border_target_.size();
-            cv.stroke(D2D1::RectF(0.0f, 0.0f, sz.width, sz.height), hex(0xff4d4f, 0.92f), 2.5f);
+            const float stroke_w = sh_.settings.thin_selection_border ? (1.0f / border_target_.scale()) : 2.5f;
+            cv.stroke(D2D1::RectF(0.0f, 0.0f, sz.width, sz.height), hex(0xff4d4f, 0.92f), stroke_w);
         });
     }
 

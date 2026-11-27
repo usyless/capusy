@@ -45,6 +45,7 @@ enum TrayMenuId : uint8_t {
     IdTrayCancelRecord,
     IdTrayColorPicker,
     IdTrayHistory,
+    IdTrayOpenFolder,
     IdTraySettings,
     IdTrayUpdate,
     IdTrayQuit,
@@ -169,6 +170,7 @@ private:
             history_win_->show();
             settings_win_->maybe_auto_check_updates();
         };
+        sh_.on_open_folder = [this] { open_current_captures_folder(); };
         sh_.on_open_settings = [this](int tab) {
             settings_win_->show(tab);
             settings_win_->maybe_auto_check_updates();
@@ -294,6 +296,10 @@ private:
             if (same) return;
         }
         (void)region_overlay_->start(inst_, OverlayMode::ColorPicker, false);
+    }
+
+    void open_current_captures_folder() const {
+        (void)open_file(resolve_current_capture_dir(sh_.settings).wstring());
     }
 
     void start_recording(RECT region, WindowInfo win_info, bool force_tray_only) {
@@ -853,6 +859,7 @@ private:
             AppendMenuW(menu.get(), MF_SEPARATOR, 0, nullptr);
         }
         AppendMenuW(menu.get(), MF_STRING, IdTrayHistory, menu_label(L"Open History", HotkeyAction::OpenHistory).c_str());
+        AppendMenuW(menu.get(), MF_STRING, IdTrayOpenFolder, menu_label(L"Open Screenshots Folder", HotkeyAction::OpenFolder).c_str());
         AppendMenuW(menu.get(), MF_STRING, IdTraySettings, L"Settings");
         if (sh_.has_update_available()) {
             const std::wstring upd_lbl = ulp::str::concat_strings(
@@ -883,6 +890,9 @@ private:
             case IdTrayHistory:
                 history_win_->show();
                 settings_win_->maybe_auto_check_updates();
+                break;
+            case IdTrayOpenFolder:
+                open_current_captures_folder();
                 break;
             case IdTraySettings:
                 settings_win_->show(0);
@@ -933,6 +943,8 @@ private:
                     history_win_->show();
                 } else if (idx == static_cast<int>(HotkeyAction::ColorPicker)) {
                     trigger_color_picker();
+                } else if (idx == static_cast<int>(HotkeyAction::OpenFolder)) {
+                    open_current_captures_folder();
                 }
                 return 0;
             }

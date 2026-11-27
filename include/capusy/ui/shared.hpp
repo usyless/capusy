@@ -53,6 +53,7 @@ struct Shared {
     std::function<void()> on_toggle_record;
     std::function<void()> on_color_picker;
     std::function<void()> on_open_history;
+    std::function<void()> on_open_folder;
     std::function<void(int)> on_open_settings;
     std::function<void()> on_reload_hotkeys;
     std::function<void(bool)> on_suspend_hotkeys;

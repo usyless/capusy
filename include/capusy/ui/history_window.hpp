@@ -745,21 +745,85 @@ private:
         }
     }
 
-    [[nodiscard]] double max_scroll() const noexcept {
-        const double list_h = std::max(0.0, static_cast<double>(target_.size().height) - HEADER_H - SIDEBAR_TOP_H);
+    struct HeaderBtn {
+        int id = IdNone;
+        wchar_t icon = 0;
+        const wchar_t* label = L"";
+        int style = 0;
+        float width = 0.0f;
+        bool update_dot = false;
+    };
+
+    struct HeaderLayout {
+        std::array<HeaderBtn, 6> btns{};
+        size_t btn_count = 0;
+        std::array<FlowPlacement, 7> placements{};
+        float height = HEADER_H;
+    };
+
+    [[nodiscard]] HeaderLayout header_layout(float total_w) const {
+        HeaderLayout out;
+        const auto add_btn = [&](int id, wchar_t icon, const wchar_t* label, int style, float min_w, bool update_dot = false) {
+            const float bw = std::max(min_w, sh_.fonts.measure(label, Font::SmallSemi) + 24.0f + 28.0f);
+            out.btns[out.btn_count++] = HeaderBtn{
+                .id = id, .icon = icon, .label = label, .style = style, .width = bw, .update_dot = update_dot,
+            };
+        };
+
+        const wchar_t* rec_lbl = sh_.recording_active ? L"Stop Rec" : L"Record";
+        add_btn(IdBtnFull, glyph::monitor, L"Full Screen", 1, 112.0f);
+        add_btn(IdBtnRegion, glyph::crop, L"Region", 0, 92.0f);
+        if (!sh_.recording_active) {
+            add_btn(IdBtnFullRecord, glyph::video, L"Full Rec", 0, 96.0f);
+        }
+        add_btn(IdBtnRecord, sh_.recording_active ? glyph::stop : glyph::video, rec_lbl, sh_.recording_active ? 2 : 0, 96.0f);
+        add_btn(IdBtnColorPicker, glyph::eyedropper, L"Color", 0, 78.0f);
+        add_btn(IdBtnSettings, glyph::settings, L"Settings", 3, 98.0f, sh_.has_update_available());
+
+        constexpr float pad_x = 14.0f;
+        constexpr float pad_y = 11.0f;
+        constexpr float item_h = 32.0f;
+        constexpr float gap_x = 8.0f;
+        constexpr float gap_y = 8.0f;
+        constexpr float brand_w = 126.0f;
+        const float avail = std::max(1.0f, total_w - (pad_x * 2.0f));
+
+        float total_single = brand_w;
+        for (size_t i = 0; i < out.btn_count; ++i) {
+            total_single += gap_x + out.btns[i].width;
+        }
+        const bool single_line = (total_single <= avail + 0.001f);
+
+        std::array<FlowItem, 7> items; // NOLINT(cppcoreguidelines-pro-type-member-init)
+        items[0] = {.width = brand_w, .height = item_h, .grow = single_line};
+        for (size_t i = 0; i < out.btn_count; ++i) {
+            items[1 + i] = {.width = out.btns[i].width, .height = item_h, .grow = false};
+        }
+        const size_t n = 1 + out.btn_count;
+        const float flow_h = flow_layout_into(
+            std::span<const FlowItem>{items.data(), n}, gap_x, gap_y, avail,
+            std::span<FlowPlacement>{out.placements.data(), n});
+        out.height = flow_h + (pad_y * 2.0f);
+        return out;
+    }
+
+    [[nodiscard]] double max_scroll() const {
+        const double hdr_h = static_cast<double>(header_layout(target_.size().width).height);
+        const double list_h = std::max(0.0, static_cast<double>(target_.size().height) - hdr_h - SIDEBAR_TOP_H);
         const double total_h = (total_count_ <= 0) ? 0.0 : ((static_cast<double>(total_count_) * (ROW_H + ROW_GAP)) + 12.0);
         return std::max(0.0, total_h - list_h);
     }
 
-    void clamp_scroll() noexcept {
+    void clamp_scroll() {
         const double ms = max_scroll();
         target_scroll_ = std::clamp(target_scroll_, 0.0, ms);
         scroll_ = std::clamp(scroll_, 0.0, ms);
     }
 
-    void ensure_row_visible(int idx) noexcept {
+    void ensure_row_visible(int idx) {
         if (idx < 0) return;
-        const double list_h = std::max(1.0, static_cast<double>(target_.size().height) - HEADER_H - SIDEBAR_TOP_H);
+        const double hdr_h = static_cast<double>(header_layout(target_.size().width).height);
+        const double list_h = std::max(1.0, static_cast<double>(target_.size().height) - hdr_h - SIDEBAR_TOP_H);
         const double top = 6.0 + (static_cast<double>(idx) * (ROW_H + ROW_GAP));
         const double bot = top + ROW_H;
         if (top < target_scroll_) {
@@ -930,9 +994,10 @@ private:
         const D2D1_SIZE_F sz = target_.size();
         cv.fill(D2D1::RectF(0.0f, 0.0f, sz.width, sz.height), with_alpha(cv.theme().bg, cv.theme().window_bg_alpha));
 
-        draw_header(cv, sz);
+        const HeaderLayout hl = header_layout(sz.width);
+        draw_header(cv, sz, hl);
 
-        const float body_top = HEADER_H;
+        const float body_top = hl.height;
         const float sidebar_w = std::min(SIDEBAR_W, sz.width * 0.45f);
         draw_sidebar(cv, D2D1::RectF(0.0f, body_top, sidebar_w, sz.height));
         cv.vline(sidebar_w, body_top, sz.height, with_alpha(cv.theme().outline_variant, 0.65f));
@@ -1102,42 +1167,28 @@ private:
         }
     }
 
-    void draw_header(Canvas& cv, D2D1_SIZE_F sz) {
-        if (cv.has_dirty_clip() && !cv.intersects_clip(D2D1::RectF(0.0f, 0.0f, sz.width, HEADER_H + 2.0f), 2.0f)) return;
-        cv.fill(D2D1::RectF(0.0f, 0.0f, sz.width, HEADER_H), with_alpha(cv.theme().surface_lowest, 0.78f));
-        cv.hline(0.0f, sz.width, HEADER_H, with_alpha(cv.theme().outline_variant, 0.65f));
+    void draw_header(Canvas& cv, D2D1_SIZE_F sz, const HeaderLayout& hl) {
+        if (cv.has_dirty_clip() && !cv.intersects_clip(D2D1::RectF(0.0f, 0.0f, sz.width, hl.height + 2.0f), 2.0f)) return;
+        cv.fill(D2D1::RectF(0.0f, 0.0f, sz.width, hl.height), with_alpha(cv.theme().surface_lowest, 0.78f));
+        cv.hline(0.0f, sz.width, hl.height, with_alpha(cv.theme().outline_variant, 0.65f));
 
-        cv.icon(glyph::camera, rect(14.0f, 11.0f, 32.0f, 32.0f), cv.theme().primary, Font::IconLarge);
-        cv.text(L"capusy", rect(50.0f, 0.0f, 90.0f, HEADER_H), Font::Title, cv.theme().on_surface);
+        constexpr float pad_x = 14.0f;
+        constexpr float pad_y = 11.0f;
+        constexpr float item_h = 32.0f;
 
-        // Action buttons on right
-        const float set_w = button_width(cv, L"Settings", true, 98.0f);
-        const float color_w = button_width(cv, L"Color", true, 78.0f);
-        const wchar_t* rec_lbl = sh_.recording_active ? L"Stop Rec" : L"Record";
-        const float rec_w = button_width(cv, rec_lbl, true, 96.0f);
-        const float frec_w = button_width(cv, L"Full Rec", true, 96.0f);
-        const float reg_w = button_width(cv, L"Region", true, 92.0f);
-        const float full_w = button_width(cv, L"Full Screen", true, 112.0f);
+        const FlowPlacement& brand_p = hl.placements[0];
+        cv.icon(glyph::camera, rect(pad_x + brand_p.x, pad_y + brand_p.y, 32.0f, item_h), cv.theme().primary, Font::IconLarge);
+        cv.text(L"capusy", rect(pad_x + brand_p.x + 36.0f, pad_y + brand_p.y, 90.0f, item_h), Font::Title, cv.theme().on_surface);
 
-        float rx = sz.width - 14.0f;
-        rx -= set_w;
-        const D2D1_RECT_F set_r = rect(rx, 11.0f, set_w, 32.0f);
-        draw_button(cv, hover_.alpha(IdBtnSettings), set_r, glyph::settings, L"Settings", IdBtnSettings, 0, 3);
-        if (sh_.has_update_available()) {
-            cv.fill_circle({.x = set_r.right - 7.0f, .y = set_r.top + 7.0f}, 4.0f, cv.theme().primary);
+        for (size_t i = 0; i < hl.btn_count; ++i) {
+            const HeaderBtn& b = hl.btns[i];
+            const FlowPlacement& p = hl.placements[1 + i];
+            const D2D1_RECT_F r = rect(pad_x + p.x, pad_y + p.y, p.width, item_h);
+            draw_button(cv, hover_.alpha(b.id), r, b.icon, b.label, b.id, 0, b.style);
+            if (b.update_dot) {
+                cv.fill_circle({.x = r.right - 7.0f, .y = r.top + 7.0f}, 4.0f, cv.theme().primary);
+            }
         }
-        rx -= 8.0f + color_w;
-        draw_button(cv, hover_.alpha(IdBtnColorPicker), rect(rx, 11.0f, color_w, 32.0f), glyph::eyedropper, L"Color", IdBtnColorPicker, 0, 0);
-        rx -= 8.0f + rec_w;
-        draw_button(cv, hover_.alpha(IdBtnRecord), rect(rx, 11.0f, rec_w, 32.0f), sh_.recording_active ? glyph::stop : glyph::video, rec_lbl, IdBtnRecord, 0, sh_.recording_active ? 2 : 0);
-        if (!sh_.recording_active) {
-            rx -= 8.0f + frec_w;
-            draw_button(cv, hover_.alpha(IdBtnFullRecord), rect(rx, 11.0f, frec_w, 32.0f), glyph::video, L"Full Rec", IdBtnFullRecord, 0, 0);
-        }
-        rx -= 8.0f + reg_w;
-        draw_button(cv, hover_.alpha(IdBtnRegion), rect(rx, 11.0f, reg_w, 32.0f), glyph::crop, L"Region", IdBtnRegion, 0, 0);
-        rx -= 8.0f + full_w;
-        draw_button(cv, hover_.alpha(IdBtnFull), rect(rx, 11.0f, full_w, 32.0f), glyph::monitor, L"Full Screen", IdBtnFull, 0, 1);
     }
 
     void draw_sidebar(Canvas& cv, D2D1_RECT_F area) {
@@ -1281,10 +1332,41 @@ private:
             return;
         }
 
+        const size_t sel_n = selection_count();
+        FixedWString<48> del_lbl{L"Move to Recycle Bin"};
+        if (sel_n > 1) {
+            del_lbl.append(L" (");
+            del_lbl.append(format_count(sel_n));
+            del_lbl.push_back(L')');
+        }
+        const float del_w = button_width(cv, del_lbl, true, 154.0f);
+        const float exp_w = button_width(cv, L"Folder", true, 84.0f);
+        const float open_w = button_width(cv, L"Open", true, 78.0f);
+        const float copy_w = button_width(cv, L"Copy", true, 78.0f);
+
+        Flow foot_actions{6.0f, 6.0f};
+        foot_actions.add(copy_w, 32.0f, [&](D2D1_RECT_F r) {
+            draw_button(cv, hover_.alpha(IdActCopy), r, glyph::copy, L"Copy", IdActCopy, 0, 1);
+        });
+        foot_actions.add(open_w, 32.0f, [&](D2D1_RECT_F r) {
+            draw_button(cv, hover_.alpha(IdActOpen), r, glyph::open, L"Open", IdActOpen, 0, 0);
+        });
+        foot_actions.add(exp_w, 32.0f, [&](D2D1_RECT_F r) {
+            draw_button(cv, hover_.alpha(IdActExplorer), r, glyph::folder, L"Folder", IdActExplorer, 0, 3);
+        });
+        foot_actions.add(del_w, 32.0f, [&](D2D1_RECT_F r) {
+            draw_button(cv, hover_.alpha(IdActDelete), r, glyph::del, del_lbl, IdActDelete, 0, 2);
+        });
+
+        const float foot_inner_w = std::max(40.0f, width(area) - 36.0f - 22.0f);
+        const float btns_nat_w = foot_actions.natural_width();
+        const bool inline_footer = (foot_inner_w - btns_nat_w - 14.0f) >= 140.0f;
+        const float foot_box_h = inline_footer ? 56.0f : (10.0f + 40.0f + 8.0f + foot_actions.height(foot_inner_w) + 10.0f);
+        const float footer_h = foot_box_h + 12.0f;
+
         const bool playable_video = is_playable_video(*e);
-        const float footer_h = 68.0f;
         const float video_bar_h = playable_video ? 44.0f : 0.0f;
-        const D2D1_RECT_F stage = D2D1::RectF(area.left + 18.0f, area.top + 18.0f, area.right - 18.0f, area.bottom - footer_h - video_bar_h - 12.0f);
+        const D2D1_RECT_F stage = D2D1::RectF(area.left + 18.0f, area.top + 18.0f, area.right - 18.0f, std::max(area.top + 60.0f, area.bottom - footer_h - video_bar_h - 12.0f));
         preview_rect_ = stage;
 
         cv.fill_round(stage, 12.0f, with_alpha(cv.theme().surface_lowest, 0.85f));
@@ -1358,30 +1440,18 @@ private:
         cv.fill_round(foot, 10.0f, with_alpha(cv.theme().surface, 0.90f));
         cv.stroke_round(foot, 10.0f, with_alpha(cv.theme().outline_variant, 0.6f));
 
-        const size_t sel_n = selection_count();
-        FixedWString<48> del_lbl{L"Move to Recycle Bin"};
-        if (sel_n > 1) {
-            del_lbl.append(L" (");
-            del_lbl.append(format_count(sel_n));
-            del_lbl.push_back(L')');
+        float info_w = foot_inner_w;
+        float info_bot = foot.top + 48.0f;
+        if (inline_footer) {
+            const float bx = foot.right - 10.0f - btns_nat_w;
+            const float by = foot.top + ((height(foot) - 32.0f) * 0.5f);
+            foot_actions.draw(bx, by, btns_nat_w);
+            info_w = std::max(40.0f, bx - foot.left - 18.0f);
+            info_bot = foot.bottom - 4.0f;
+        } else {
+            foot_actions.draw(foot.left + 11.0f, foot.top + 56.0f, foot_inner_w);
         }
-        const float del_w = button_width(cv, del_lbl, true, 154.0f);
-        const float exp_w = button_width(cv, L"Folder", true, 84.0f);
-        const float open_w = button_width(cv, L"Open", true, 78.0f);
-        const float copy_w = button_width(cv, L"Copy", true, 78.0f);
 
-        float bx = foot.right - 10.0f;
-        const float by = foot.top + ((height(foot) - 32.0f) * 0.5f);
-        bx -= del_w;
-        draw_button(cv, hover_.alpha(IdActDelete), rect(bx, by, del_w, 32.0f), glyph::del, del_lbl, IdActDelete, 0, 2);
-        bx -= 6.0f + exp_w;
-        draw_button(cv, hover_.alpha(IdActExplorer), rect(bx, by, exp_w, 32.0f), glyph::folder, L"Folder", IdActExplorer, 0, 3);
-        bx -= 6.0f + open_w;
-        draw_button(cv, hover_.alpha(IdActOpen), rect(bx, by, open_w, 32.0f), glyph::open, L"Open", IdActOpen, 0, 0);
-        bx -= 6.0f + copy_w;
-        draw_button(cv, hover_.alpha(IdActCopy), rect(bx, by, copy_w, 32.0f), glyph::copy, L"Copy", IdActCopy, 0, 1);
-
-        const float info_w = std::max(40.0f, bx - foot.left - 18.0f);
         if (sel_n > 1) {
             const SelectionSummary& sum = selection_summary();
             FixedWString<64> top_line;
@@ -1432,7 +1502,7 @@ private:
             cv.text(sub, rect(foot.left + 12.0f, foot.top + 28.0f, info_w, 18.0f), Font::Caption, cv.theme().on_surface_variant);
         }
         if (info_w > 40.0f) {
-            cv.hit(D2D1::RectF(foot.left + 8.0f, foot.top + 4.0f, foot.left + 12.0f + info_w, foot.bottom - 4.0f), IdFooterInfo);
+            cv.hit(D2D1::RectF(foot.left + 8.0f, foot.top + 4.0f, foot.left + 12.0f + info_w, info_bot), IdFooterInfo);
         }
     }
 
@@ -1978,6 +2048,13 @@ private:
                 icons_.apply(hwnd, inst_, 101);
                 (void)target_.sync_dpi();
                 invalidate();
+                return 0;
+            }
+            case WM_GETMINMAXINFO: {
+                auto* mmi = reinterpret_cast<MINMAXINFO*>(lp);
+                const UINT dpi = hwnd ? GetDpiForWindow(hwnd) : GetDpiForSystem();
+                const float s = (dpi > 0 ? static_cast<float>(dpi) : 96.0f) / 96.0f;
+                mmi->ptMinTrackSize = {.x = static_cast<LONG>(std::lround(640.0f * s)), .y = static_cast<LONG>(std::lround(480.0f * s))};
                 return 0;
             }
             case WM_PAINT: {

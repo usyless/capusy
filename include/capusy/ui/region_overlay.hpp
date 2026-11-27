@@ -409,6 +409,7 @@ public:
         active_annotation_.reset();
         active_ann_prev_vrect_.reset();
         round_stroke_.reset();
+        crosshair_dash_stroke_.reset();
         picker_sv_bmp_.reset();
         picker_hue_bmp_.reset();
         picker_bmp_dc_ = nullptr;
@@ -433,6 +434,7 @@ public:
 
     void reset_gpu() noexcept {
         round_stroke_.reset();
+        crosshair_dash_stroke_.reset();
         picker_sv_bmp_.reset();
         picker_hue_bmp_.reset();
         picker_bmp_dc_ = nullptr;
@@ -500,6 +502,8 @@ private:
         std::optional<D2D1_RECT_F> last_reticle_dirty;
         std::optional<D2D1_RECT_F> last_loupe_dirty;
         std::optional<D2D1_RECT_F> last_hint_dirty;
+        std::optional<D2D1_RECT_F> last_crosshair_v_dirty;
+        std::optional<D2D1_RECT_F> last_crosshair_h_dirty;
         std::optional<D2D1_RECT_F> last_tooltip_dirty;
     };
 
@@ -516,12 +520,22 @@ private:
     static constexpr std::array<float, 4> THICKNESSES = {2.0f, 4.0f, 8.0f, 14.0f};
 
     void ensure_stroke_style() noexcept {
-        if (round_stroke_ || !sh_.gfx.d2d_factory()) return;
-        const D2D1_STROKE_STYLE_PROPERTIES1 props = D2D1::StrokeStyleProperties1(
-            D2D1_CAP_STYLE_ROUND, D2D1_CAP_STYLE_ROUND, D2D1_CAP_STYLE_ROUND,
-            D2D1_LINE_JOIN_ROUND, 10.0f, D2D1_DASH_STYLE_SOLID, 0.0f,
-            D2D1_STROKE_TRANSFORM_TYPE_NORMAL);
-        (void)sh_.gfx.d2d_factory()->CreateStrokeStyle(&props, nullptr, 0, &round_stroke_);
+        if (!sh_.gfx.d2d_factory()) return;
+        if (!round_stroke_) {
+            const D2D1_STROKE_STYLE_PROPERTIES1 props = D2D1::StrokeStyleProperties1(
+                D2D1_CAP_STYLE_ROUND, D2D1_CAP_STYLE_ROUND, D2D1_CAP_STYLE_ROUND,
+                D2D1_LINE_JOIN_ROUND, 10.0f, D2D1_DASH_STYLE_SOLID, 0.0f,
+                D2D1_STROKE_TRANSFORM_TYPE_NORMAL);
+            (void)sh_.gfx.d2d_factory()->CreateStrokeStyle(&props, nullptr, 0, &round_stroke_);
+        }
+        if (!crosshair_dash_stroke_) {
+            static constexpr std::array<float, 2> dashes = {6.0f, 6.0f};
+            const D2D1_STROKE_STYLE_PROPERTIES1 props = D2D1::StrokeStyleProperties1(
+                D2D1_CAP_STYLE_FLAT, D2D1_CAP_STYLE_FLAT, D2D1_CAP_STYLE_FLAT,
+                D2D1_LINE_JOIN_MITER, 10.0f, D2D1_DASH_STYLE_CUSTOM, 0.0f,
+                D2D1_STROKE_TRANSFORM_TYPE_NORMAL);
+            (void)sh_.gfx.d2d_factory()->CreateStrokeStyle(&props, dashes.data(), static_cast<UINT32>(dashes.size()), &crosshair_dash_stroke_);
+        }
     }
 
     bool upload_monitor_slice(MonitorWindow& mw) noexcept {
@@ -571,21 +585,87 @@ private:
         std::optional<D2D1_RECT_F> reticle;
         std::optional<D2D1_RECT_F> card;
         std::optional<D2D1_RECT_F> hint;
+        std::optional<D2D1_RECT_F> crosshair_v;
+        std::optional<D2D1_RECT_F> crosshair_h;
     };
+
+    [[nodiscard]] static bool is_resize_drag(DragKind dk) noexcept {
+        switch (dk) {
+            case DragKind::ResizeNW:
+            case DragKind::ResizeN:
+            case DragKind::ResizeNE:
+            case DragKind::ResizeE:
+            case DragKind::ResizeSE:
+            case DragKind::ResizeS:
+            case DragKind::ResizeSW:
+            case DragKind::ResizeW:
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    [[nodiscard]] const MonitorWindow* cursor_monitor() const noexcept {
+        for (const auto& m : monitors_) {
+            if (rect_contains_pt(m->info.rect, cursor_vpt_)) return m.get();
+        }
+        return nullptr;
+    }
+
+    [[nodiscard]] bool should_show_region_cursor_tools(const MonitorWindow& cmw) const noexcept {
+        if (mode_ != OverlayMode::Screenshot && mode_ != OverlayMode::RecordRegion) return false;
+        if (color_picker_open_ || open_dropdown_ != AudioDropdown::None) return false;
+        if (drag_kind_ == DragKind::Creating || is_resize_drag(drag_kind_)) return true;
+        if (drag_kind_ != DragKind::None) return false;
+        if (hover_id_ != IdNone) return false;
+        if (!has_selection_) return true;
+        if (tool_ != DrawTool::Select) return false;
+        return hit_selection_handle(cursor_vpt_, cmw.target.scale()) != DragKind::Moving;
+    }
+
+    [[nodiscard]] bool should_show_loupe(const MonitorWindow& mw) const noexcept {
+        if (!rect_contains_pt(mw.info.rect, cursor_vpt_)) return false;
+        if (mode_ == OverlayMode::ColorPicker) return true;
+        if (mode_ == OverlayMode::Screenshot && annotation_dropper_active_ &&
+            drag_kind_ == DragKind::None && hover_id_ == IdNone) {
+            return true;
+        }
+        return sh_.settings.region_show_magnifier && should_show_region_cursor_tools(mw);
+    }
+
+    [[nodiscard]] bool should_show_crosshairs() const noexcept {
+        if (!sh_.settings.region_show_crosshairs) return false;
+        const MonitorWindow* cmw = cursor_monitor();
+        return cmw != nullptr && should_show_region_cursor_tools(*cmw);
+    }
 
     [[nodiscard]] LoupeRects compute_loupe_rects(const MonitorWindow& mw) const noexcept {
         LoupeRects out;
+        const D2D1_SIZE_F sz = mw.target.size();
+        const float inv_s = 1.0f / mw.target.scale();
+
+        if (should_show_crosshairs()) {
+            if (cursor_vpt_.x >= mw.info.rect.left && cursor_vpt_.x < mw.info.rect.right) {
+                const float lx = (static_cast<float>(cursor_vpt_.x - mw.info.rect.left) + 0.5f) * inv_s;
+                out.crosshair_v = D2D1::RectF(lx - 2.0f, 0.0f, lx + 2.0f, sz.height);
+            }
+            if (cursor_vpt_.y >= mw.info.rect.top && cursor_vpt_.y < mw.info.rect.bottom) {
+                const float ly = (static_cast<float>(cursor_vpt_.y - mw.info.rect.top) + 0.5f) * inv_s;
+                out.crosshair_h = D2D1::RectF(0.0f, ly - 2.0f, sz.width, ly + 2.0f);
+            }
+        }
+
+        if (!should_show_loupe(mw)) return out;
+
         const bool is_cp = (mode_ == OverlayMode::ColorPicker);
         const bool is_drop = (mode_ == OverlayMode::Screenshot && annotation_dropper_active_ &&
                               drag_kind_ == DragKind::None && hover_id_ == IdNone);
-        if ((!is_cp && !is_drop) || !rect_contains_pt(mw.info.rect, cursor_vpt_)) return out;
-
-        const D2D1_SIZE_F sz = mw.target.size();
-        const float inv_s = 1.0f / mw.target.scale();
         const float cx = (static_cast<float>(cursor_vpt_.x) - static_cast<float>(mw.info.rect.left)) * inv_s;
         const float cy = (static_cast<float>(cursor_vpt_.y) - static_cast<float>(mw.info.rect.top)) * inv_s;
-        const float px_dip = std::max(1.0f, inv_s);
-        out.reticle = D2D1::RectF(cx - px_dip - 3.0f, cy - px_dip - 3.0f, cx + (px_dip * 2.0f) + 3.0f, cy + (px_dip * 2.0f) + 3.0f);
+        if (is_cp || is_drop) {
+            const float px_dip = std::max(1.0f, inv_s);
+            out.reticle = D2D1::RectF(cx - px_dip - 3.0f, cy - px_dip - 3.0f, cx + (px_dip * 2.0f) + 3.0f, cy + (px_dip * 2.0f) + 3.0f);
+        }
 
         constexpr float card_w = 189.0f;
         constexpr float card_h = 231.0f;
@@ -624,8 +704,11 @@ private:
     void render_loupe_monitors() {
         for (const auto& m : monitors_) {
             const LoupeRects lr = compute_loupe_rects(*m);
-            const bool had_any = m->last_reticle_dirty.has_value() || m->last_loupe_dirty.has_value() || m->last_hint_dirty.has_value();
-            const bool has_any = lr.reticle.has_value() || lr.card.has_value() || lr.hint.has_value();
+            const bool had_any = m->last_reticle_dirty.has_value() || m->last_loupe_dirty.has_value() ||
+                                 m->last_hint_dirty.has_value() || m->last_crosshair_v_dirty.has_value() ||
+                                 m->last_crosshair_h_dirty.has_value();
+            const bool has_any = lr.reticle.has_value() || lr.card.has_value() || lr.hint.has_value() ||
+                                 lr.crosshair_v.has_value() || lr.crosshair_h.has_value();
             if (!had_any && !has_any && m->pending_dirty.empty() && !m->full_dirty) continue;
 
             if (!m->full_dirty) {
@@ -633,6 +716,10 @@ private:
                 if (m->last_loupe_dirty) m->pending_dirty.push_back(*m->last_loupe_dirty);
                 if (lr.reticle) m->pending_dirty.push_back(*lr.reticle);
                 if (lr.card) m->pending_dirty.push_back(*lr.card);
+                if (m->last_crosshair_v_dirty) m->pending_dirty.push_back(*m->last_crosshair_v_dirty);
+                if (m->last_crosshair_h_dirty) m->pending_dirty.push_back(*m->last_crosshair_h_dirty);
+                if (lr.crosshair_v) m->pending_dirty.push_back(*lr.crosshair_v);
+                if (lr.crosshair_h) m->pending_dirty.push_back(*lr.crosshair_h);
                 const bool hint_changed = (lr.hint.has_value() != m->last_hint_dirty.has_value()) ||
                                           (lr.hint && m->last_hint_dirty && !rect_equal(*lr.hint, *m->last_hint_dirty));
                 if (hint_changed) {
@@ -700,6 +787,8 @@ private:
             mw.last_reticle_dirty = lr.reticle;
             mw.last_loupe_dirty = lr.card;
             mw.last_hint_dirty = lr.hint;
+            mw.last_crosshair_v_dirty = lr.crosshair_v;
+            mw.last_crosshair_h_dirty = lr.crosshair_h;
         }
     }
 
@@ -750,7 +839,8 @@ private:
                 cv.fill(D2D1::RectF(0.0f, 0.0f, sz.width, sz.height), hex(0x09080c, 0.56f));
             } else {
                 cv.fill(D2D1::RectF(0.0f, 0.0f, sz.width, sz.height), hex(0xff5c5c, 0.04f));
-                cv.stroke(D2D1::RectF(0.0f, 0.0f, sz.width, sz.height), hex(0xff5c5c, 0.95f), 4.0f);
+                const float border_w = sh_.settings.thin_selection_border ? inv_s : 4.0f;
+                cv.stroke(D2D1::RectF(0.0f, 0.0f, sz.width, sz.height), hex(0xff5c5c, 0.95f), border_w);
             }
 
             if (hovered || (hovered_monitor_idx_ >= monitors_.size() && mw.info.primary)) {
@@ -853,10 +943,11 @@ private:
 
             // 4. Crisp border & resize handles
             const D2D1_COLOR_F accent = (mode_ == OverlayMode::RecordRegion) ? hex(0xff5c5c) : cv.theme().primary;
-            cv.stroke(sr, accent, has_selection_ ? 2.0f : 1.5f);
+            const float border_w = sh_.settings.thin_selection_border ? inv_s : (has_selection_ ? 2.0f : 1.5f);
+            cv.stroke(sr, accent, border_w);
 
             if (has_selection_ && tool_ == DrawTool::Select) {
-                draw_resize_handles(cv, sr, accent);
+                draw_resize_handles(cv, sr, accent, sh_.settings.thin_selection_border ? std::max(inv_s, 1.0f) : 1.8f);
             }
 
             // 5. Dimension badge above top-left of selection (on the monitor showing its top-left)
@@ -891,6 +982,11 @@ private:
         if (snap_guide_y_) {
             const float gy = (static_cast<float>(*snap_guide_y_) - mon_y) * inv_s;
             if (gy >= 0.0f && gy <= sz.height) cv.hline(0.0f, sz.width, gy, with_alpha(cv.theme().mint, 0.85f));
+        }
+
+        // 6b. Full-screen cursor alignment crosshair lines
+        if (should_show_crosshairs()) {
+            draw_crosshairs(mw, cv);
         }
 
         // 7. Top hint banner before selection is made (on primary monitor)
@@ -930,11 +1026,12 @@ private:
             draw_toolbar(mw, cv, mon_x, mon_y, inv_s);
         }
 
-        // 8b. Live eyedropper pixel loupe when picking an annotation color from the screen
-        if (mode_ == OverlayMode::Screenshot && annotation_dropper_active_ &&
-            drag_kind_ == DragKind::None && hover_id_ == IdNone &&
-            rect_contains_pt(mw.info.rect, cursor_vpt_)) {
-            draw_color_loupe(mw, cv);
+        // 8b. Live pixel magnifier loupe (eyedropper or region select / corner resize)
+        if (should_show_loupe(mw)) {
+            const bool show_reticle = (mode_ == OverlayMode::ColorPicker) ||
+                                      (mode_ == OverlayMode::Screenshot && annotation_dropper_active_ &&
+                                       drag_kind_ == DragKind::None && hover_id_ == IdNone);
+            draw_color_loupe(mw, cv, show_reticle);
         }
 
         // 9. Floating hover tooltip (topmost above toolbar)
@@ -1104,7 +1201,7 @@ private:
         return was_vis;
     }
 
-    static void draw_resize_handles(Canvas& cv, D2D1_RECT_F sr, D2D1_COLOR_F accent) noexcept {
+    static void draw_resize_handles(Canvas& cv, D2D1_RECT_F sr, D2D1_COLOR_F accent, float stroke_w = 1.8f) noexcept {
         const float mx = (sr.left + sr.right) * 0.5f;
         const float my = (sr.top + sr.bottom) * 0.5f;
         const std::array<D2D1_POINT_2F, 8> pts = {{
@@ -1113,7 +1210,7 @@ private:
         },};
         for (const D2D1_POINT_2F p : pts) {
             cv.fill_circle(p, 4.5f, cv.theme().surface_lowest);
-            cv.stroke_circle(p, 4.5f, accent, 1.8f);
+            cv.stroke_circle(p, 4.5f, accent, stroke_w);
         }
     }
 
@@ -1498,7 +1595,33 @@ private:
         cv.text(rgb_lbl, D2D1::RectF(sw_r.right + 72.0f, iy, px + pop_w - pad, iy + info_h), Font::Caption, cv.theme().on_surface_variant, Align::Right);
     }
 
-    void draw_color_loupe(MonitorWindow& mw, Canvas& cv) const noexcept {
+    void draw_crosshairs(MonitorWindow& mw, Canvas& cv) const noexcept {
+        const D2D1_SIZE_F sz = mw.target.size();
+        const float inv_s = 1.0f / mw.target.scale();
+        ID2D1DeviceContext6* dc = cv.dc();
+        if (!dc) return;
+
+        if (cursor_vpt_.x >= mw.info.rect.left && cursor_vpt_.x < mw.info.rect.right) {
+            const float lx = (static_cast<float>(cursor_vpt_.x - mw.info.rect.left) + 0.5f) * inv_s;
+            if (!cv.has_dirty_clip() || cv.intersects_clip(D2D1::RectF(lx - inv_s, 0.0f, lx + inv_s, sz.height), 1.0f)) {
+                const D2D1_POINT_2F p0{.x = lx, .y = 0.0f};
+                const D2D1_POINT_2F p1{.x = lx, .y = sz.height};
+                dc->DrawLine(p0, p1, cv.brush(hex(0x000000, 0.42f)), inv_s);
+                dc->DrawLine(p0, p1, cv.brush(hex(0xffffff, 0.85f)), inv_s, crosshair_dash_stroke_.get());
+            }
+        }
+        if (cursor_vpt_.y >= mw.info.rect.top && cursor_vpt_.y < mw.info.rect.bottom) {
+            const float ly = (static_cast<float>(cursor_vpt_.y - mw.info.rect.top) + 0.5f) * inv_s;
+            if (!cv.has_dirty_clip() || cv.intersects_clip(D2D1::RectF(0.0f, ly - inv_s, sz.width, ly + inv_s), 1.0f)) {
+                const D2D1_POINT_2F p0{.x = 0.0f, .y = ly};
+                const D2D1_POINT_2F p1{.x = sz.width, .y = ly};
+                dc->DrawLine(p0, p1, cv.brush(hex(0x000000, 0.42f)), inv_s);
+                dc->DrawLine(p0, p1, cv.brush(hex(0xffffff, 0.85f)), inv_s, crosshair_dash_stroke_.get());
+            }
+        }
+    }
+
+    void draw_color_loupe(MonitorWindow& mw, Canvas& cv, bool draw_reticle = true) const noexcept {
         const D2D1_SIZE_F sz = mw.target.size();
         const float inv_s = 1.0f / mw.target.scale();
         const float cx = (static_cast<float>(cursor_vpt_.x) - static_cast<float>(mw.info.rect.left)) * inv_s;
@@ -1507,9 +1630,11 @@ private:
         const Rgb8 center_rgb = sample_screen_rgb(cursor_vpt_);
 
         // Subtle pixel-precision crosshair reticle around the sampled pixel (leaves center pixel unobscured)
-        const D2D1_COLOR_F ret_outer = is_light_rgb(center_rgb) ? hex(0x000000, 0.85f) : hex(0xffffff, 0.90f);
-        const float px_dip = std::max(1.0f, inv_s);
-        cv.stroke(D2D1::RectF(cx - px_dip, cy - px_dip, cx + (px_dip * 2.0f), cy + (px_dip * 2.0f)), ret_outer, 1.2f);
+        if (draw_reticle) {
+            const D2D1_COLOR_F ret_outer = is_light_rgb(center_rgb) ? hex(0x000000, 0.85f) : hex(0xffffff, 0.90f);
+            const float px_dip = std::max(1.0f, inv_s);
+            cv.stroke(D2D1::RectF(cx - px_dip, cy - px_dip, cx + (px_dip * 2.0f), cy + (px_dip * 2.0f)), ret_outer, 1.2f);
+        }
 
         constexpr int half = 6; // 13 x 13 zoomed pixel grid
         constexpr int grid_n = (half * 2) + 1;
@@ -1965,7 +2090,11 @@ private:
                 drag_kind_ = dk;
                 drag_start_ = vpt;
                 drag_orig_sel_ = selection_;
-                if (tip_vis) render_monitor(mw);
+                if (sh_.settings.region_show_magnifier || sh_.settings.region_show_crosshairs) {
+                    render_loupe_monitors();
+                } else if (tip_vis) {
+                    render_monitor(mw);
+                }
                 return;
             }
         }
@@ -2066,7 +2195,7 @@ private:
                     queue_hit_dirty(*prev_tip_mw, old_id, old_idx, prev_tip_mw->pending_dirty);
                     render_monitor(*prev_tip_mw, false);
                 }
-                if (annotation_dropper_active_) {
+                if (annotation_dropper_active_ || sh_.settings.region_show_magnifier || sh_.settings.region_show_crosshairs) {
                     render_loupe_monitors();
                 } else if (hover_changed || mon_changed) {
                     render_monitor(mw, false);
@@ -2135,6 +2264,8 @@ private:
                     .bottom = std::max(drag_start_.y, cy),
                 };
                 render_all();
+            } else if (sh_.settings.region_show_magnifier || sh_.settings.region_show_crosshairs) {
+                render_loupe_monitors();
             }
             return;
         }
@@ -2460,6 +2591,7 @@ private:
     WindowInfo foreground_info_;
     std::vector<std::unique_ptr<MonitorWindow>> monitors_;
     wil::com_ptr<ID2D1StrokeStyle1> round_stroke_;
+    wil::com_ptr<ID2D1StrokeStyle1> crosshair_dash_stroke_;
 
     bool has_selection_ = false;
     bool instant_capture_ = true;

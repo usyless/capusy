@@ -41,6 +41,11 @@ static void test_startup_logic() {
 
 static void test_hotkey_collisions() {
     using namespace capusy;
+    // OpenFolder hotkey must be disabled by default
+    const HotkeyBinding def_folder = default_hotkey(HotkeyAction::OpenFolder);
+    CHECK(!def_folder.enabled);
+    CHECK(hotkey_action_label(HotkeyAction::OpenFolder)[0] != L'\0');
+
     std::array<HotkeyBinding, HOTKEY_COUNT> bindings = {{
         {.enabled = true, .mods = MOD_ALT | MOD_SHIFT, .vk = '1'},
         {.enabled = true, .mods = MOD_ALT | MOD_SHIFT, .vk = '2'},
@@ -48,6 +53,7 @@ static void test_hotkey_collisions() {
         {.enabled = true, .mods = MOD_ALT | MOD_SHIFT, .vk = 'H'},
         {.enabled = true, .mods = MOD_ALT | MOD_SHIFT, .vk = 'C'},
         {.enabled = true, .mods = MOD_ALT | MOD_SHIFT, .vk = '4'},
+        {.enabled = false, .mods = MOD_ALT | MOD_SHIFT, .vk = 'F'},
     }};
 
     for (size_t i = 0; i < HOTKEY_COUNT; ++i) {
@@ -254,6 +260,9 @@ static void test_capture_paths_and_formats() {
 
     const fs::path flat = make_capture_path_for_time(fs::path{L"C:\\Caps"}, L".jpg", dt, 2, false);
     CHECK(flat == fs::path{L"C:\\Caps"} / L"capusy_2026-04-07_09-05-03_042_2.jpg");
+
+    CHECK(resolve_active_capture_dir_for_time(fs::path{L"C:\\Caps"}, dt, true) == fs::path{L"C:\\Caps"} / L"2026-04");
+    CHECK(resolve_active_capture_dir_for_time(fs::path{L"C:\\Caps"}, dt, false) == fs::path{L"C:\\Caps"});
 
     CHECK(parse_image_format("png") == ImageFormat::Png);
     CHECK(parse_image_format("jpg") == ImageFormat::Jpeg);

@@ -86,6 +86,16 @@ struct CaptureDateTime {
     return ym;
 }
 
+/// Pure folder builder taking explicit local date/time: returns `dir / YYYY-MM` when `split_by_month` is enabled, otherwise `dir`.
+[[nodiscard]] inline std::filesystem::path resolve_active_capture_dir_for_time(
+    const std::filesystem::path& dir, const CaptureDateTime& dt, bool split_by_month) {
+    if (split_by_month) {
+        const FixedWString<8> ym = format_year_month(dt.year, dt.month);
+        return dir / std::wstring_view{ym};
+    }
+    return dir;
+}
+
 /// Pure path builder taking explicit local date/time & sequence number (for deterministic testing).
 [[nodiscard]] inline std::filesystem::path make_capture_path_for_time(const std::filesystem::path& dir, std::wstring_view ext,
                                                                       const CaptureDateTime& dt, uint64_t seq, bool split_by_month = true) {

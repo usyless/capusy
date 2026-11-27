@@ -220,6 +220,9 @@ private:
         IdToggleAutoCopy,
         IdToggleCaptureCursor,
         IdToggleInstantRegion,
+        IdToggleThinBorder,
+        IdToggleRegionMagnifier,
+        IdToggleRegionCrosshairs,
         IdToggleSplitMonth,
         IdFmtPng,
         IdFmtJpeg,
@@ -375,6 +378,9 @@ private:
         sw_auto_copy_.set(sh_.settings.auto_copy_clipboard ? 1.0f : 0.0f, animate);
         sw_cap_cursor_.set(sh_.settings.capture_cursor ? 1.0f : 0.0f, animate);
         sw_instant_region_.set(sh_.settings.region_instant_capture ? 1.0f : 0.0f, animate);
+        sw_thin_border_.set(sh_.settings.thin_selection_border ? 1.0f : 0.0f, animate);
+        sw_region_magnifier_.set(sh_.settings.region_show_magnifier ? 1.0f : 0.0f, animate);
+        sw_region_crosshairs_.set(sh_.settings.region_show_crosshairs ? 1.0f : 0.0f, animate);
         sw_split_month_.set(sh_.settings.split_by_month ? 1.0f : 0.0f, animate);
         sw_sharex_existing_only_.set(sharex_only_existing_ ? 1.0f : 0.0f, animate);
         if (!sharex_path_probed_) {
@@ -442,6 +448,9 @@ private:
         check(sw_auto_copy_, IdToggleAutoCopy);
         check(sw_cap_cursor_, IdToggleCaptureCursor);
         check(sw_instant_region_, IdToggleInstantRegion);
+        check(sw_thin_border_, IdToggleThinBorder);
+        check(sw_region_magnifier_, IdToggleRegionMagnifier);
+        check(sw_region_crosshairs_, IdToggleRegionCrosshairs);
         check(sw_split_month_, IdToggleSplitMonth);
         check(sw_sharex_existing_only_, IdToggleShareXExistingOnly);
         check(sw_toast_, IdToggleToast);
@@ -468,6 +477,9 @@ private:
         if (sw_auto_copy_.step(dt, 22.0f, 0.004f)) moving = true;
         if (sw_cap_cursor_.step(dt, 22.0f, 0.004f)) moving = true;
         if (sw_instant_region_.step(dt, 22.0f, 0.004f)) moving = true;
+        if (sw_thin_border_.step(dt, 22.0f, 0.004f)) moving = true;
+        if (sw_region_magnifier_.step(dt, 22.0f, 0.004f)) moving = true;
+        if (sw_region_crosshairs_.step(dt, 22.0f, 0.004f)) moving = true;
         if (sw_split_month_.step(dt, 22.0f, 0.004f)) moving = true;
         if (sw_sharex_existing_only_.step(dt, 22.0f, 0.004f)) moving = true;
         if (sw_toast_.step(dt, 22.0f, 0.004f)) moving = true;
@@ -560,8 +572,43 @@ private:
         if (resume_hotkeys && sh_.on_suspend_hotkeys) sh_.on_suspend_hotkeys(false);
     }
 
-    [[nodiscard]] float max_scroll() const noexcept {
-        const float view_h = std::max(0.0f, target_.size().height - TABS_H - 1.0f);
+    struct TabDef {
+        wchar_t g;
+        const wchar_t* label;
+        int id;
+    };
+
+    static constexpr std::array<TabDef, 3> tab_defs() noexcept {
+        return {{
+            {.g = glyph::keyboard, .label = L"General & Hotkeys", .id = IdTab0},
+            {.g = glyph::video, .label = L"Toast & Recording", .id = IdTab1},
+            {.g = glyph::info, .label = L"About", .id = IdTab2},
+        },};
+    }
+
+    struct TabLayout {
+        std::array<FlowPlacement, 3> placements{};
+        float height = 0.0f;
+    };
+
+    [[nodiscard]] TabLayout tab_layout(float total_w) const {
+        constexpr auto tabs = tab_defs();
+        std::array<FlowItem, 3> items; // NOLINT(cppcoreguidelines-pro-type-member-init)
+        for (size_t i = 0; i < items.size(); ++i) {
+            items[i] = {.width = sh_.fonts.measure(tabs[i].label, Font::BodySemi) + 46.0f, .height = TABS_H - 16.0f, .grow = false};
+        }
+        TabLayout out;
+        out.height = flow_layout_into(items, 8.0f, 8.0f, std::max(1.0f, total_w - (PAD * 2.0f)), out.placements);
+        return out;
+    }
+
+    [[nodiscard]] float tabs_height(float total_w) const {
+        return tab_layout(total_w).height + 16.0f;
+    }
+
+    [[nodiscard]] float max_scroll() const {
+        const float strip_h = tabs_height(target_.size().width);
+        const float view_h = std::max(0.0f, target_.size().height - strip_h - 1.0f);
         return std::max(0.0f, content_h_ - view_h);
     }
 
@@ -589,7 +636,7 @@ private:
                 queue_hit_dirty(dirty_dips_scratch_, hover_.prev_id, hover_.prev_index, full_dirty_);
             }
             if (tab_anim_.value != tab_anim_.target) {
-                dirty_dips_scratch_.push_back(D2D1::RectF(0.0f, 0.0f, target_.size().width, TABS_H + 2.0f));
+                dirty_dips_scratch_.push_back(D2D1::RectF(0.0f, 0.0f, target_.size().width, tabs_height(target_.size().width) + 2.0f));
             }
             queue_animating_switches(dirty_dips_scratch_, full_dirty_);
         } else {
@@ -637,11 +684,13 @@ private:
 
     void draw(Canvas& cv) {
         const D2D1_SIZE_F sz = target_.size();
+        const TabLayout tlayout = tab_layout(sz.width);
+        const float strip_h = tlayout.height + 16.0f;
         cv.fill(D2D1::RectF(0.0f, 0.0f, sz.width, sz.height), with_alpha(cv.theme().bg, cv.theme().window_bg_alpha));
 
-        draw_tabs(cv, sz);
+        draw_tabs(cv, sz, strip_h, tlayout);
 
-        const D2D1_RECT_F view = D2D1::RectF(0.0f, TABS_H + 1.0f, sz.width, sz.height);
+        const D2D1_RECT_F view = D2D1::RectF(0.0f, strip_h + 1.0f, sz.width, sz.height);
         view_rect_ = view;
         cv.push_clip(view);
 
@@ -707,6 +756,9 @@ private:
             case IdToggleAutoCopy:
             case IdToggleCaptureCursor:
             case IdToggleInstantRegion:
+            case IdToggleThinBorder:
+            case IdToggleRegionMagnifier:
+            case IdToggleRegionCrosshairs:
             case IdToggleSplitMonth:
             case IdFmtPng:
             case IdFmtJpeg:
@@ -811,6 +863,9 @@ private:
             case IdToggleAutoCopy: title = L"Automatically copy new captures to the clipboard"; return true;
             case IdToggleCaptureCursor: title = L"Include the mouse pointer in screenshots"; return true;
             case IdToggleInstantRegion: title = L"Save region on release without opening annotation tools"; return true;
+            case IdToggleThinBorder: title = L"Use a crisp 1px border for region selection and screen recording"; return true;
+            case IdToggleRegionMagnifier: title = L"Show the pixel magnifier loupe while selecting a region or hovering resize corners"; return true;
+            case IdToggleRegionCrosshairs: title = L"Draw horizontal and vertical alignment lines across the screen from the cursor"; return true;
             case IdSaveDirWell:
                 title = L"Capture save folder";
                 subtitle = save_dir_w_;
@@ -925,23 +980,15 @@ private:
         }
     }
 
-    void draw_tabs(Canvas& cv, D2D1_SIZE_F sz) {
-        if (cv.has_dirty_clip() && !cv.intersects_clip(D2D1::RectF(0.0f, 0.0f, sz.width, TABS_H + 2.0f), 2.0f)) return;
-        cv.fill(D2D1::RectF(0.0f, 0.0f, sz.width, TABS_H), with_alpha(cv.theme().surface_lowest, 0.78f));
+    void draw_tabs(Canvas& cv, D2D1_SIZE_F sz, float strip_h, const TabLayout& layout) {
+        if (cv.has_dirty_clip() && !cv.intersects_clip(D2D1::RectF(0.0f, 0.0f, sz.width, strip_h + 2.0f), 2.0f)) return;
+        cv.fill(D2D1::RectF(0.0f, 0.0f, sz.width, strip_h), with_alpha(cv.theme().surface_lowest, 0.78f));
 
-        struct TabDef { wchar_t g; const wchar_t* label; int id; };
-        static constexpr std::array<TabDef, 3> tabs = {{
-            {.g = glyph::keyboard, .label = L"General & Hotkeys", .id = IdTab0},
-            {.g = glyph::video, .label = L"Toast & Recording", .id = IdTab1},
-            {.g = glyph::info, .label = L"About", .id = IdTab2},
-        },};
-
+        constexpr auto tabs = tab_defs();
         std::array<D2D1_RECT_F, 3> rects{};
-        float x = PAD;
         for (size_t i = 0; i < tabs.size(); ++i) {
-            const float tw = cv.measure(tabs[i].label, Font::BodySemi) + 46.0f;
-            rects[i] = rect(x, 8.0f, tw, TABS_H - 16.0f);
-            x += tw + 8.0f;
+            const FlowPlacement& p = layout.placements[i];
+            rects[i] = rect(PAD + p.x, 8.0f + p.y, p.width, TABS_H - 16.0f);
         }
 
         const float t = std::clamp(tab_anim_.value, 0.0f, 2.0f);
@@ -966,7 +1013,21 @@ private:
             cv.text(tabs[static_cast<size_t>(i)].label, rect(r.left + 34.0f, r.top, width(r) - 42.0f, height(r)), Font::BodySemi, fg);
             cv.hit(r, tabs[static_cast<size_t>(i)].id);
         }
-        cv.hline(0.0f, sz.width, TABS_H, with_alpha(cv.theme().outline_variant, 0.65f));
+        cv.hline(0.0f, sz.width, strip_h, with_alpha(cv.theme().outline_variant, 0.65f));
+    }
+
+    [[nodiscard]] static float toggle_row_height(Canvas& cv, std::wstring_view label, float rw) {
+        return std::max(32.0f, text_height(cv, label, Font::Body, std::max(80.0f, rw - 60.0f), 20.0f) + 8.0f);
+    }
+
+    static void draw_toggle_row(Canvas& cv, float lx, float y, float rw, float row_h,
+                                std::wstring_view label, float ha, float sw_val, int id, bool dimmed = false) {
+        const float text_w = std::max(80.0f, rw - 60.0f);
+        const float th = text_height(cv, label, Font::Body, text_w, 20.0f);
+        const float ty = y + std::max(0.0f, (row_h - th) * 0.5f);
+        cv.text_wrap(label, rect(lx, ty, text_w, th + 2.0f), Font::Body,
+                     dimmed ? with_alpha(cv.theme().on_surface_variant, 0.6f) : cv.theme().on_surface);
+        draw_switch(cv, ha, sw_val, lx + rw, y + (row_h * 0.5f), id);
     }
 
     float draw_tab_general(Canvas& cv, float x, float y, float w) {
@@ -1092,40 +1153,73 @@ private:
             const float browse_w = button_width(cv, L"Browse", true, 98.0f);
             const float open_w = button_width(cv, L"Open", true, 84.0f);
 
+            const std::wstring_view l1 = L"Open on PC startup";
+            const std::wstring_view l2 = L"Copy screenshots to clipboard automatically";
+            const std::wstring_view l3 = L"Include mouse cursor in screenshots";
+            const std::wstring_view l4 = L"Instant region screenshot (capture on release, skip editor)";
+            const float r1_h = toggle_row_height(cv, l1, rw);
+            const float r2_h = toggle_row_height(cv, l2, rw);
+            const float r3_h = toggle_row_height(cv, l3, rw);
+            const float r4_h = toggle_row_height(cv, l4, rw);
+
+            Flow dir_row{8.0f, 8.0f};
+            dir_row.add(std::min(220.0f, rw), 34.0f, [&](D2D1_RECT_F well) {
+                draw_well(cv, well, 9.0f, true);
+                cv.text(save_dir_w, inset(well, 10.0f, 0.0f), Font::MonoSmall, cv.theme().on_surface);
+                cv.hit(well, IdSaveDirWell);
+            }, true);
+            dir_row.add(browse_w, 34.0f, [&](D2D1_RECT_F r) {
+                draw_button(cv, hover_.alpha(IdBrowseSaveDir), r, glyph::folder, L"Browse", IdBrowseSaveDir, 0, 0);
+            });
+            dir_row.add(open_w, 34.0f, [&](D2D1_RECT_F r) {
+                draw_button(cv, hover_.alpha(IdOpenSaveDir), r, glyph::open, L"Open", IdOpenSaveDir, 0, 3);
+            });
+
             const float r1_y = y + 16.0f + hd.h + 12.0f;
-            const float r2_y = r1_y + 38.0f;
-            const float r3_y = r2_y + 38.0f;
-            const float r4_y = r3_y + 38.0f;
-            const float line_y = r4_y + 40.0f;
+            const float r2_y = r1_y + r1_h + 6.0f;
+            const float r3_y = r2_y + r2_h + 6.0f;
+            const float r4_y = r3_y + r3_h + 6.0f;
+            const float line_y = r4_y + r4_h + 8.0f;
             const float dir_lbl_y = line_y + 12.0f;
             const float dir_row_y = dir_lbl_y + 22.0f;
-            const float card_h = (dir_row_y + 36.0f + 16.0f) - y;
+            const float card_h = (dir_row_y + dir_row.height(rw) + 16.0f) - y;
             const float next_y = card_begin(cv, x, y, w, card_h, CARD_GAP);
 
             (void)draw_header(cv, lx, y, rw, hd);
 
-            cv.text(L"Open on PC startup", rect(lx, r1_y, rw - 60.0f, 32.0f), Font::Body, cv.theme().on_surface);
-            draw_switch(cv, hover_.alpha(IdToggleStartup), sw_startup_.value, lx + rw, r1_y + 16.0f, IdToggleStartup);
-
-            cv.text(L"Copy screenshots to clipboard automatically", rect(lx, r2_y, rw - 60.0f, 32.0f), Font::Body, cv.theme().on_surface);
-            draw_switch(cv, hover_.alpha(IdToggleAutoCopy), sw_auto_copy_.value, lx + rw, r2_y + 16.0f, IdToggleAutoCopy);
-
-            cv.text(L"Include mouse cursor in screenshots", rect(lx, r3_y, rw - 60.0f, 32.0f), Font::Body, cv.theme().on_surface);
-            draw_switch(cv, hover_.alpha(IdToggleCaptureCursor), sw_cap_cursor_.value, lx + rw, r3_y + 16.0f, IdToggleCaptureCursor);
-
-            cv.text(L"Instant region screenshot (capture on release, skip editor)", rect(lx, r4_y, rw - 60.0f, 32.0f), Font::Body, cv.theme().on_surface);
-            draw_switch(cv, hover_.alpha(IdToggleInstantRegion), sw_instant_region_.value, lx + rw, r4_y + 16.0f, IdToggleInstantRegion);
+            draw_toggle_row(cv, lx, r1_y, rw, r1_h, l1, hover_.alpha(IdToggleStartup), sw_startup_.value, IdToggleStartup);
+            draw_toggle_row(cv, lx, r2_y, rw, r2_h, l2, hover_.alpha(IdToggleAutoCopy), sw_auto_copy_.value, IdToggleAutoCopy);
+            draw_toggle_row(cv, lx, r3_y, rw, r3_h, l3, hover_.alpha(IdToggleCaptureCursor), sw_cap_cursor_.value, IdToggleCaptureCursor);
+            draw_toggle_row(cv, lx, r4_y, rw, r4_h, l4, hover_.alpha(IdToggleInstantRegion), sw_instant_region_.value, IdToggleInstantRegion);
 
             cv.hline(lx, lx + rw, line_y, with_alpha(cv.theme().outline_variant, 0.5f));
             cv.text(L"Capture save folder", rect(lx, dir_lbl_y, rw, 20.0f), Font::SmallSemi, cv.theme().on_surface_variant);
+            dir_row.draw(lx, dir_row_y, rw);
 
-            const float well_w = std::max(120.0f, rw - browse_w - open_w - 16.0f);
-            const D2D1_RECT_F well = rect(lx, dir_row_y, well_w, 34.0f);
-            draw_well(cv, well, 9.0f, true);
-            cv.text(save_dir_w, inset(well, 10.0f, 0.0f), Font::MonoSmall, cv.theme().on_surface);
-            cv.hit(well, IdSaveDirWell);
-            draw_button(cv, hover_.alpha(IdBrowseSaveDir), rect(lx + well_w + 8.0f, dir_row_y, browse_w, 34.0f), glyph::folder, L"Browse", IdBrowseSaveDir, 0, 0);
-            draw_button(cv, hover_.alpha(IdOpenSaveDir), rect(lx + well_w + 8.0f + browse_w + 8.0f, dir_row_y, open_w, 34.0f), glyph::open, L"Open", IdOpenSaveDir, 0, 3);
+            y = next_y;
+        }
+
+        // 2b. Region Overlay & Guides card
+        {
+            const CardHeader hd = make_header(cv, rw, L"Region Overlay & Guides", cv.theme().on_surface,
+                                              L"Selection and recording border thickness, pixel magnifier loupe, and cursor alignment lines");
+            const std::wstring_view l1 = L"Thinner (1px) borders for region selection & screen recording";
+            const std::wstring_view l2 = L"Show magnifying glass during region select & corner resize";
+            const std::wstring_view l3 = L"Show full-screen cursor alignment lines (crosshairs)";
+            const float r1_h = toggle_row_height(cv, l1, rw);
+            const float r2_h = toggle_row_height(cv, l2, rw);
+            const float r3_h = toggle_row_height(cv, l3, rw);
+
+            const float r1_y = y + 16.0f + hd.h + 12.0f;
+            const float r2_y = r1_y + r1_h + 6.0f;
+            const float r3_y = r2_y + r2_h + 6.0f;
+            const float card_h = (r3_y + r3_h + 16.0f) - y;
+            const float next_y = card_begin(cv, x, y, w, card_h, CARD_GAP);
+
+            (void)draw_header(cv, lx, y, rw, hd);
+            draw_toggle_row(cv, lx, r1_y, rw, r1_h, l1, hover_.alpha(IdToggleThinBorder), sw_thin_border_.value, IdToggleThinBorder);
+            draw_toggle_row(cv, lx, r2_y, rw, r2_h, l2, hover_.alpha(IdToggleRegionMagnifier), sw_region_magnifier_.value, IdToggleRegionMagnifier);
+            draw_toggle_row(cv, lx, r3_y, rw, r3_h, l3, hover_.alpha(IdToggleRegionCrosshairs), sw_region_crosshairs_.value, IdToggleRegionCrosshairs);
 
             y = next_y;
         }
@@ -1198,9 +1292,32 @@ private:
             const wchar_t* imp_lbl = sharex_job_.busy ? L"Cancel" : L"Import";
             const float import_w = button_width(cv, imp_lbl, true, 102.0f);
 
+            const std::wstring_view path_display = sharex_path_w_.empty()
+                ? std::wstring_view{L"Select ShareX History.db or legacy History.json…"}
+                : std::wstring_view{sharex_path_w_};
+            Flow file_row{8.0f, 8.0f};
+            file_row.add(std::min(220.0f, rw), 34.0f, [&](D2D1_RECT_F well) {
+                draw_well(cv, well, 9.0f, true);
+                cv.text(path_display, inset(well, 10.0f, 0.0f), Font::MonoSmall,
+                        sharex_path_w_.empty() ? cv.theme().outline : cv.theme().on_surface);
+                cv.hit(well, IdShareXPathWell);
+            }, true);
+            file_row.add(browse_w, 34.0f, [&](D2D1_RECT_F browse_r) {
+                if (sharex_job_.busy) {
+                    draw_disabled_button(cv, browse_r, glyph::folder, L"Browse");
+                } else {
+                    draw_button(cv, hover_.alpha(IdBrowseShareX), browse_r, glyph::folder, L"Browse", IdBrowseShareX, 0, 0);
+                }
+            });
+            file_row.add(import_w, 34.0f, [&](D2D1_RECT_F import_r) {
+                draw_button(cv, hover_.alpha(IdImportShareX), import_r,
+                            sharex_job_.busy ? glyph::close : glyph::download, imp_lbl, IdImportShareX, 0,
+                            sharex_job_.busy ? 2 : 1);
+            });
+
             const float file_lbl_y = y + 16.0f + hd.h + 12.0f;
             const float file_row_y = file_lbl_y + 22.0f;
-            const float opt_y = file_row_y + 42.0f;
+            const float opt_y = file_row_y + file_row.height(rw) + 8.0f;
 
             float cy = opt_y + 34.0f;
             const bool show_bar = sharex_job_.busy && sx_view.total > 0;
@@ -1218,27 +1335,7 @@ private:
 
             (void)draw_header(cv, lx, y, rw, hd);
             cv.text(L"ShareX history file (History.db or History.json)", rect(lx, file_lbl_y, rw, 20.0f), Font::SmallSemi, cv.theme().on_surface_variant);
-
-            const float well_w = std::max(120.0f, rw - browse_w - import_w - 16.0f);
-            const D2D1_RECT_F well = rect(lx, file_row_y, well_w, 34.0f);
-            draw_well(cv, well, 9.0f, true);
-            const std::wstring_view path_display = sharex_path_w_.empty()
-                ? std::wstring_view{L"Select ShareX History.db or legacy History.json…"}
-                : std::wstring_view{sharex_path_w_};
-            cv.text(path_display, inset(well, 10.0f, 0.0f), Font::MonoSmall,
-                    sharex_path_w_.empty() ? cv.theme().outline : cv.theme().on_surface);
-            cv.hit(well, IdShareXPathWell);
-
-            const D2D1_RECT_F browse_r = rect(lx + well_w + 8.0f, file_row_y, browse_w, 34.0f);
-            if (sharex_job_.busy) {
-                draw_disabled_button(cv, browse_r, glyph::folder, L"Browse");
-            } else {
-                draw_button(cv, hover_.alpha(IdBrowseShareX), browse_r, glyph::folder, L"Browse", IdBrowseShareX, 0, 0);
-            }
-            const D2D1_RECT_F import_r = rect(lx + well_w + 8.0f + browse_w + 8.0f, file_row_y, import_w, 34.0f);
-            draw_button(cv, hover_.alpha(IdImportShareX), import_r,
-                        sharex_job_.busy ? glyph::close : glyph::download, imp_lbl, IdImportShareX, 0,
-                        sharex_job_.busy ? 2 : 1);
+            file_row.draw(lx, file_row_y, rw);
 
             cv.text(L"Only import files that still exist on disk", rect(lx, opt_y, rw - 60.0f, 32.0f), Font::Body,
                     sharex_job_.busy ? with_alpha(cv.theme().on_surface_variant, 0.6f) : cv.theme().on_surface);
@@ -2343,6 +2440,24 @@ private:
                 sync_state(true);
                 start_anim();
                 return;
+            case IdToggleThinBorder:
+                sh_.settings.thin_selection_border = !sh_.settings.thin_selection_border;
+                sh_.save();
+                sync_state(true);
+                start_anim();
+                return;
+            case IdToggleRegionMagnifier:
+                sh_.settings.region_show_magnifier = !sh_.settings.region_show_magnifier;
+                sh_.save();
+                sync_state(true);
+                start_anim();
+                return;
+            case IdToggleRegionCrosshairs:
+                sh_.settings.region_show_crosshairs = !sh_.settings.region_show_crosshairs;
+                sh_.save();
+                sync_state(true);
+                start_anim();
+                return;
             case IdToggleSplitMonth:
                 sh_.settings.split_by_month = !sh_.settings.split_by_month;
                 sh_.save();
@@ -2647,6 +2762,13 @@ private:
                 invalidate();
                 return 0;
             }
+            case WM_GETMINMAXINFO: {
+                auto* mmi = reinterpret_cast<MINMAXINFO*>(lp);
+                const UINT dpi = hwnd ? GetDpiForWindow(hwnd) : GetDpiForSystem();
+                const float s = (dpi > 0 ? static_cast<float>(dpi) : 96.0f) / 96.0f;
+                mmi->ptMinTrackSize = {.x = static_cast<LONG>(std::lround(420.0f * s)), .y = static_cast<LONG>(std::lround(520.0f * s))};
+                return 0;
+            }
             case WM_PAINT: {
                 PAINTSTRUCT ps;
                 BeginPaint(hwnd, &ps);
@@ -2783,6 +2905,9 @@ private:
     AnimFloat sw_auto_copy_;
     AnimFloat sw_cap_cursor_;
     AnimFloat sw_instant_region_;
+    AnimFloat sw_thin_border_;
+    AnimFloat sw_region_magnifier_;
+    AnimFloat sw_region_crosshairs_;
     AnimFloat sw_split_month_;
     AnimFloat sw_sharex_existing_only_;
     AnimFloat sw_toast_;
