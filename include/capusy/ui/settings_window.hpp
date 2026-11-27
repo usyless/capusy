@@ -99,6 +99,8 @@ public:
         else ShowWindow(hwnd_, SW_SHOWNORMAL);
         SetForegroundWindow(hwnd_);
         SetFocus(hwnd_);
+        window_active_ = true;
+        tooltip_.clear(hwnd_, TIMER_TOOLTIP, false);
         anim_active_ = false;
         render();
         ValidateRect(hwnd_, nullptr);
@@ -108,6 +110,9 @@ public:
     void hide() {
         if (!hwnd_) return;
         stop_recording_hotkey();
+        tooltip_.clear(hwnd_, TIMER_TOOLTIP, false);
+        raw_hover_id_ = IdNone;
+        raw_hover_index_ = 0;
         dragging_scroll_ = false;
         in_sizemove_ = false;
         dragging_slider_ = IdNone;
@@ -156,6 +161,7 @@ private:
     static constexpr float PAD = 24.0f;
     static constexpr float CARD_GAP = 14.0f;
     static constexpr UINT WM_APP_RECORDED_KEY = WM_APP + 30;
+    static constexpr UINT_PTR TIMER_TOOLTIP = 1;
 
     enum HitId : int {
         IdNone = 0,
@@ -179,6 +185,7 @@ private:
         IdSliderImageQuality,
         IdBrowseSaveDir,
         IdOpenSaveDir,
+        IdSaveDirWell,
         IdToggleToast,
         IdSliderToastSize,
         IdSliderToastTimeout,
@@ -286,6 +293,7 @@ private:
         last_anim_ = now;
 
         bool moving = hover_.step(dt);
+        if (tooltip_.step(dt)) moving = true;
         if (tab_anim_.step(dt, 20.0f, 0.004f)) moving = true;
         for (auto& sw : sw_hotkeys_) { if (sw.step(dt, 22.0f, 0.004f)) moving = true; }
         if (sw_win_prtscn_.step(dt, 22.0f, 0.004f)) moving = true;
@@ -460,7 +468,147 @@ private:
                 });
             }
             draw_dropdown_popup(cv, is_desk ? desktop_drop_r_ : mic_drop_r_, sz, opts, IdRecAudioDropItem, hover_.id, hover_.index);
+        } else {
+            draw_tooltip(cv, sz, tooltip_.anchor, tooltip_.title, tooltip_.subtitle, tooltip_.alpha.value);
         }
+    }
+
+    [[nodiscard]] bool has_tooltip(int id, int idx) const noexcept {
+        if (open_audio_drop_ != AudioDropdown::None) return false;
+        switch (id) {
+            case IdTab0:
+            case IdTab1:
+            case IdTab2:
+            case IdToggleWinPrtSc:
+            case IdOpenWinKeyboardSettings:
+            case IdToggleStartup:
+            case IdToggleAutoCopy:
+            case IdToggleCaptureCursor:
+            case IdToggleInstantRegion:
+            case IdToggleSplitMonth:
+            case IdFmtPng:
+            case IdFmtJpeg:
+            case IdFmtBmp:
+            case IdFmtTiff:
+            case IdSliderImageQuality:
+            case IdBrowseSaveDir:
+            case IdOpenSaveDir:
+            case IdSaveDirWell:
+            case IdToggleToast:
+            case IdSliderToastSize:
+            case IdSliderToastTimeout:
+            case IdTestToast:
+            case IdFps30:
+            case IdFps60:
+            case IdBitrate6:
+            case IdBitrate12:
+            case IdBitrate20:
+            case IdToggleRecordCursor:
+            case IdToggleRecDesktop:
+            case IdDropRecDesktop:
+            case IdToggleRecMic:
+            case IdDropRecMic:
+            case IdToggleAutoUpdate:
+            case IdCheckUpdates:
+            case IdInstallUpdate:
+            case IdInstallUpdateDisabled:
+            case IdOpenReleaseUrl:
+                return true;
+            case IdToggleHotkey:
+            case IdRecordHotkey:
+            case IdResetHotkey:
+                return idx >= 0 && std::cmp_less(idx, HOTKEY_COUNT);
+            default:
+                return false;
+        }
+    }
+
+    bool build_tooltip(int id, int idx, std::wstring& title, std::wstring& subtitle) const {
+        title.clear();
+        subtitle.clear();
+        if (open_audio_drop_ != AudioDropdown::None) return false;
+        switch (id) {
+            case IdTab0: title = L"Global hotkeys, startup, save folder, and image format"; return true;
+            case IdTab1: title = L"Corner preview toast and region screen recording"; return true;
+            case IdTab2: title = L"App info, history database stats, and software updates"; return true;
+            case IdToggleHotkey:
+                if (idx >= 0 && std::cmp_less(idx, HOTKEY_COUNT)) {
+                    const auto a = static_cast<HotkeyAction>(idx);
+                    title = sh_.settings.hotkey(a).enabled ? L"Disable this hotkey" : L"Enable this hotkey";
+                    return true;
+                }
+                return false;
+            case IdRecordHotkey:
+                if (idx >= 0 && std::cmp_less(idx, HOTKEY_COUNT)) {
+                    const auto a = static_cast<HotkeyAction>(idx);
+                    title = (recording_action_ && *recording_action_ == a)
+                        ? L"Cancel shortcut recording (Esc)"
+                        : L"Click then press a key combination";
+                    return true;
+                }
+                return false;
+            case IdResetHotkey:
+                if (idx >= 0 && std::cmp_less(idx, HOTKEY_COUNT)) {
+                    const HotkeyBinding def = default_hotkey(static_cast<HotkeyAction>(idx));
+                    title = L"Reset to default shortcut";
+                    const auto txt = format_hotkey(def.mods, def.vk);
+                    subtitle.assign(txt.view());
+                    return true;
+                }
+                return false;
+            case IdToggleWinPrtSc: title = L"Toggle Windows Snipping Tool PrintScreen override"; return true;
+            case IdOpenWinKeyboardSettings: title = L"Open Windows Settings → Accessibility → Keyboard"; return true;
+            case IdToggleStartup: title = L"Launch capusy automatically in the system tray at sign-in"; return true;
+            case IdToggleAutoCopy: title = L"Automatically copy new captures to the clipboard"; return true;
+            case IdToggleCaptureCursor: title = L"Include the mouse pointer in screenshots"; return true;
+            case IdToggleInstantRegion: title = L"Save region on release without opening annotation tools"; return true;
+            case IdSaveDirWell:
+                title = L"Capture save folder";
+                subtitle = save_dir_w_;
+                return !subtitle.empty();
+            case IdBrowseSaveDir: title = L"Choose a folder for saved screenshots and recordings"; return true;
+            case IdOpenSaveDir: title = L"Open save folder in Explorer"; return true;
+            case IdToggleSplitMonth: title = L"Group saved files into YYYY-MM subfolders"; return true;
+            case IdFmtPng: title = L"Lossless PNG (recommended)"; return true;
+            case IdFmtJpeg: title = L"Lossy JPEG (smaller files, adjustable quality)"; return true;
+            case IdFmtBmp: title = L"Uncompressed BMP (fastest write, largest files)"; return true;
+            case IdFmtTiff: title = L"Lossless TIFF (archival quality)"; return true;
+            case IdSliderImageQuality: title = L"Adjust JPEG compression quality (10%–100%)"; return true;
+            case IdToggleToast: title = L"Show a non-activating corner preview after each capture"; return true;
+            case IdSliderToastSize: title = L"Adjust corner preview width (160–420 px)"; return true;
+            case IdSliderToastTimeout: title = L"Adjust how long the corner preview stays visible (1–15 s)"; return true;
+            case IdTestToast: title = L"Preview the corner thumbnail notification right now"; return true;
+            case IdFps30: title = L"Record at 30 frames per second (smaller files)"; return true;
+            case IdFps60: title = L"Record at 60 frames per second (smoother motion)"; return true;
+            case IdBitrate6: title = L"Standard video bitrate (6 Mbps)"; return true;
+            case IdBitrate12: title = L"High video bitrate (12 Mbps)"; return true;
+            case IdBitrate20: title = L"Ultra video bitrate (20 Mbps)"; return true;
+            case IdToggleRecordCursor: title = L"Include the mouse pointer in screen recordings"; return true;
+            case IdToggleRecDesktop: title = L"Capture system audio via WASAPI loopback"; return true;
+            case IdDropRecDesktop:
+                title = L"Select desktop audio output device";
+                subtitle = resolve_audio_device_label(sh_.settings.record_desktop_device_id, desktop_devices_, L"System Default");
+                return true;
+            case IdToggleRecMic: title = L"Capture microphone audio alongside video"; return true;
+            case IdDropRecMic:
+                title = L"Select microphone input device";
+                subtitle = resolve_audio_device_label(sh_.settings.record_mic_device_id, mic_devices_, L"System Default");
+                return true;
+            case IdToggleAutoUpdate: title = L"Check GitHub Releases automatically once every 24 hours"; return true;
+            case IdCheckUpdates: title = L"Check GitHub Releases for a newer version now"; return true;
+            case IdInstallUpdate:
+                title = update_job_.busy ? L"Cancel update download" : L"Download, verify, and install the latest release";
+                return true;
+            case IdInstallUpdateDisabled: title = L"Stop recording before installing an update"; return true;
+            case IdOpenReleaseUrl: title = L"Open the GitHub Releases page in your browser"; return true;
+            default: return false;
+        }
+    }
+
+    void dismiss_tooltip() noexcept {
+        const bool was_vis = tooltip_.visible();
+        tooltip_.clear(hwnd_, TIMER_TOOLTIP, false);
+        if (was_vis) invalidate();
     }
 
     void draw_tabs(Canvas& cv, D2D1_SIZE_F sz) {
@@ -657,6 +805,7 @@ private:
             const D2D1_RECT_F well = rect(lx, dir_row_y, well_w, 34.0f);
             draw_well(cv, well, 9.0f, true);
             cv.text(save_dir_w, inset(well, 10.0f, 0.0f), Font::MonoSmall, cv.theme().on_surface);
+            cv.hit(well, IdSaveDirWell);
             draw_button(cv, hover_.alpha(IdBrowseSaveDir), rect(lx + well_w + 8.0f, dir_row_y, browse_w, 34.0f), glyph::folder, L"Browse", IdBrowseSaveDir, 0, 0);
             draw_button(cv, hover_.alpha(IdOpenSaveDir), rect(lx + well_w + 8.0f + browse_w + 8.0f, dir_row_y, open_w, 34.0f), glyph::open, L"Open", IdOpenSaveDir, 0, 3);
 
@@ -1480,13 +1629,14 @@ private:
                 return 0;
             }
             case WM_MOUSEWHEEL: {
+                dismiss_tooltip();
                 open_audio_drop_ = AudioDropdown::None;
                 const float delta = static_cast<float>(GET_WHEEL_DELTA_WPARAM(wp)) / 120.0f;
                 target_scroll_ = std::clamp(target_scroll_ - (delta * 90.0f), 0.0f, max_scroll());
                 start_anim();
                 return 0;
             }
-            case WM_LBUTTONDOWN: on_lbutton_down(lp); return 0;
+            case WM_LBUTTONDOWN: dismiss_tooltip(); on_lbutton_down(lp); return 0;
             case WM_LBUTTONUP:
                 dragging_scroll_ = false;
                 dragging_slider_ = IdNone;
@@ -1507,17 +1657,47 @@ private:
                     return 0;
                 }
                 const Hit* h = hit_test(hits_, p);
-                if (hover_.set(h ? h->id : IdNone, h ? h->index : 0, true)) start_anim();
-                SetCursor(h ? cursor_hand_ : cursor_arrow_);
+                const int nid = h ? h->id : IdNone;
+                const int nidx = h ? h->index : 0;
+                if (nid != raw_hover_id_ || nidx != raw_hover_index_) {
+                    raw_hover_id_ = nid;
+                    raw_hover_index_ = nidx;
+                    const int vis_id = (nid == IdSaveDirWell || nid == IdInstallUpdateDisabled) ? IdNone : nid;
+                    const int vis_idx = (vis_id == IdNone) ? 0 : nidx;
+                    const bool vis_changed = hover_.set(vis_id, vis_idx, true);
+                    tooltip_.on_hover_changed(hwnd_, TIMER_TOOLTIP, h, has_tooltip(nid, nidx), true);
+                    if (vis_changed || tooltip_.alpha.active()) start_anim();
+                }
+                SetCursor((h && h->id != IdSaveDirWell && h->id != IdInstallUpdateDisabled) ? cursor_hand_ : cursor_arrow_);
                 TRACKMOUSEEVENT tme{.cbSize = sizeof(tme), .dwFlags = TME_LEAVE, .hwndTrack = hwnd};
                 TrackMouseEvent(&tme);
                 return 0;
             }
-            case WM_MOUSELEAVE:
-                if (hover_.set(IdNone, 0, true)) start_anim();
+            case WM_MOUSELEAVE: {
+                raw_hover_id_ = IdNone;
+                raw_hover_index_ = 0;
+                tooltip_.clear(hwnd_, TIMER_TOOLTIP, true);
+                if (hover_.set(IdNone, 0, true) || tooltip_.alpha.active()) start_anim();
+                return 0;
+            }
+            case WM_TIMER:
+                if (wp == TIMER_TOOLTIP) {
+                    if (!visible() || !window_active_ || open_audio_drop_ != AudioDropdown::None) {
+                        tooltip_.clear(hwnd_, TIMER_TOOLTIP, false);
+                        return 0;
+                    }
+                    std::wstring tip_title;
+                    std::wstring tip_sub;
+                    const bool ok = build_tooltip(raw_hover_id_, raw_hover_index_, tip_title, tip_sub);
+                    if (tooltip_.on_timer(hwnd_, TIMER_TOOLTIP, ok, std::move(tip_title), std::move(tip_sub), true)) {
+                        start_anim();
+                    }
+                }
                 return 0;
             case WM_ACTIVATE:
-                if (LOWORD(wp) == WA_INACTIVE) {
+                window_active_ = (LOWORD(wp) != WA_INACTIVE);
+                if (!window_active_) {
+                    dismiss_tooltip();
                     if (recording_action_ || record_hook_) {
                         stop_recording_hotkey();
                         invalidate();
@@ -1526,6 +1706,9 @@ private:
                     refresh_external_state();
                 }
                 break;
+            case WM_DESTROY:
+                KillTimer(hwnd, TIMER_TOOLTIP);
+                return 0;
             case WM_APP_RECORDED_KEY:
                 if (recording_action_) {
                     on_key_down(static_cast<UINT>(wp), static_cast<uint32_t>(lp));
@@ -1533,6 +1716,7 @@ private:
                 return 0;
             case WM_KEYDOWN:
             case WM_SYSKEYDOWN:
+                dismiss_tooltip();
                 if (msg == WM_SYSKEYDOWN && wp == VK_F4 && !recording_action_) break;
                 on_key_down(static_cast<UINT>(wp));
                 return 0;
@@ -1598,6 +1782,10 @@ private:
 
     std::vector<Hit> hits_;
     HoverTracker hover_;
+    int raw_hover_id_ = IdNone;
+    int raw_hover_index_ = 0;
+    bool window_active_ = true;
+    HoverTooltip tooltip_;
     float scroll_ = 0.0f;
     float target_scroll_ = 0.0f;
     float content_h_ = 0.0f;

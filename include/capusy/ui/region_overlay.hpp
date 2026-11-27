@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <functional>
@@ -200,6 +201,8 @@ public:
         active_annotation_.reset();
         hover_id_ = IdNone;
         hover_idx_ = 0;
+        tooltip_.clear(nullptr, 0, false);
+        tooltip_hwnd_ = nullptr;
 
         POINT cur{};
         GetCursorPos(&cur);
@@ -271,6 +274,10 @@ public:
             }
         }
         for (auto& m : monitors_) {
+            if (m->hwnd) {
+                KillTimer(m->hwnd, TIMER_TOOLTIP);
+                KillTimer(m->hwnd, TIMER_TOOLTIP_ANIM);
+            }
             m->frozen_bmp.reset();
             m->target.release();
             if (m->hwnd) {
@@ -278,6 +285,8 @@ public:
                 m->hwnd = nullptr;
             }
         }
+        tooltip_.clear(nullptr, 0, false);
+        tooltip_hwnd_ = nullptr;
         monitors_.clear();
         capture_.reset();
         snaps_ = {};
@@ -295,6 +304,9 @@ public:
     }
 
 private:
+    static constexpr UINT_PTR TIMER_TOOLTIP = 1;
+    static constexpr UINT_PTR TIMER_TOOLTIP_ANIM = 2;
+
     enum HitId : int {
         IdNone = 0,
         IdTool,
@@ -543,6 +555,152 @@ private:
         if (show_toolbar) {
             draw_toolbar(mw, cv, mon_x, mon_y, inv_s);
         }
+
+        // 9. Floating hover tooltip (topmost above toolbar)
+        if (mw.hwnd == tooltip_hwnd_ && open_dropdown_ == AudioDropdown::None && drag_kind_ == DragKind::None) {
+            draw_tooltip(cv, sz, tooltip_.anchor, tooltip_.title, tooltip_.subtitle, tooltip_.alpha.value);
+        }
+    }
+
+    [[nodiscard]] bool has_tooltip(int id, int idx) const noexcept {
+        if (open_dropdown_ != AudioDropdown::None) return false;
+        switch (id) {
+            case IdUndo:
+            case IdRedo:
+            case IdClear:
+            case IdCapture:
+            case IdCancel:
+            case IdToggleInstant:
+            case IdRecDesktopToggle:
+            case IdRecDesktopDrop:
+            case IdRecMicToggle:
+            case IdRecMicDrop:
+                return true;
+            case IdTool:
+                return idx >= 0 && idx < 7;
+            case IdColor:
+                return idx >= 0 && std::cmp_less(idx, PALETTE.size());
+            case IdThick:
+                return idx >= 0 && std::cmp_less(idx, THICKNESSES.size());
+            default:
+                return false;
+        }
+    }
+
+    bool build_tooltip(int id, int idx, std::wstring& title, std::wstring& subtitle) const {
+        title.clear();
+        subtitle.clear();
+        if (open_dropdown_ != AudioDropdown::None) return false;
+        switch (id) {
+            case IdToggleInstant:
+                if (instant_capture_) {
+                    title = L"Switch to Edit Mode (E)";
+                    subtitle = L"Adjust region & annotate before saving";
+                } else {
+                    title = L"Switch to Instant Mode (E)";
+                    subtitle = L"Capture immediately on click or drag release";
+                }
+                return true;
+            case IdTool: {
+                switch (static_cast<DrawTool>(idx)) {
+                    case DrawTool::Select:
+                        title = L"Select & Resize";
+                        subtitle = L"Move or resize the capture region";
+                        return true;
+                    case DrawTool::Pen:
+                        title = L"Pen";
+                        subtitle = L"Freehand draw  •  Scroll to change size";
+                        return true;
+                    case DrawTool::Highlighter:
+                        title = L"Highlighter";
+                        subtitle = L"Translucent marker  •  Scroll to change size";
+                        return true;
+                    case DrawTool::Rect:
+                        title = L"Rectangle";
+                        subtitle = L"Drag to draw outline  •  Scroll to change size";
+                        return true;
+                    case DrawTool::Ellipse:
+                        title = L"Oval / Ellipse";
+                        subtitle = L"Drag to draw outline  •  Scroll to change size";
+                        return true;
+                    case DrawTool::Line:
+                        title = L"Line";
+                        subtitle = L"Drag to draw straight line  •  Scroll to change size";
+                        return true;
+                    case DrawTool::Arrow:
+                        title = L"Arrow";
+                        subtitle = L"Drag to draw arrow  •  Scroll to change size";
+                        return true;
+                    default:
+                        return false;
+                }
+            }
+            case IdUndo: title = L"Undo (Ctrl+Z)"; return true;
+            case IdRedo: title = L"Redo (Ctrl+Y)"; return true;
+            case IdClear: title = L"Clear all annotations"; return true;
+            case IdCapture:
+                if (mode_ == OverlayMode::RecordRegion) {
+                    title = L"Start recording (Enter)";
+                } else {
+                    title = L"Save screenshot (Enter)";
+                    subtitle = L"Or double-click inside the selection";
+                }
+                return true;
+            case IdCancel: title = L"Cancel (Esc)"; return true;
+            case IdColor: {
+                static constexpr std::array<const wchar_t*, 8> names = {
+                    L"Red", L"Orange", L"Yellow", L"Green", L"Teal", L"Blue", L"White", L"Dark ink",
+                };
+                if (idx >= 0 && std::cmp_less(idx, names.size())) {
+                    title = names[static_cast<size_t>(idx)];
+                    return true;
+                }
+                return false;
+            }
+            case IdThick: {
+                static constexpr std::array<const wchar_t*, 4> names = {
+                    L"Thin (2 px)", L"Medium (4 px)", L"Thick (8 px)", L"Extra thick (14 px)",
+                };
+                if (idx >= 0 && std::cmp_less(idx, names.size())) {
+                    title = names[static_cast<size_t>(idx)];
+                    subtitle = L"Scroll wheel to adjust";
+                    return true;
+                }
+                return false;
+            }
+            case IdRecDesktopToggle:
+                title = sh_.settings.record_desktop_audio ? L"Mute desktop audio" : L"Record desktop audio";
+                return true;
+            case IdRecDesktopDrop:
+                title = L"Select desktop audio device";
+                subtitle = resolve_audio_device_label(sh_.settings.record_desktop_device_id, desktop_devices_, L"Default Output");
+                return true;
+            case IdRecMicToggle:
+                title = sh_.settings.record_mic_audio ? L"Mute microphone" : L"Record microphone audio";
+                return true;
+            case IdRecMicDrop:
+                title = L"Select microphone device";
+                subtitle = resolve_audio_device_label(sh_.settings.record_mic_device_id, mic_devices_, L"Default Mic");
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    void start_tooltip_anim(HWND hwnd) noexcept {
+        if (!hwnd) return;
+        last_tooltip_anim_ = std::chrono::steady_clock::now();
+        SetTimer(hwnd, TIMER_TOOLTIP_ANIM, 16, nullptr);
+    }
+
+    bool dismiss_tooltip() noexcept {
+        const bool was_vis = tooltip_.visible();
+        if (tooltip_hwnd_) {
+            KillTimer(tooltip_hwnd_, TIMER_TOOLTIP);
+            KillTimer(tooltip_hwnd_, TIMER_TOOLTIP_ANIM);
+        }
+        tooltip_.clear(nullptr, 0, false);
+        return was_vis;
     }
 
     void draw_resize_handles(Canvas& cv, D2D1_RECT_F sr, D2D1_COLOR_F accent) const noexcept {
@@ -963,6 +1121,7 @@ private:
     }
 
     void on_lbutton_down(MonitorWindow& mw, LPARAM lp) {
+        const bool tip_vis = dismiss_tooltip();
         const D2D1_POINT_2F dip = to_local_dip(mw, lp);
         if (const Hit* h = hit_test(mw.hits, dip)) {
             on_toolbar_click(h->id, h->index);
@@ -996,6 +1155,7 @@ private:
                 drag_kind_ = dk;
                 drag_start_ = vpt;
                 drag_orig_sel_ = selection_;
+                if (tip_vis) render_monitor(mw);
                 return;
             }
         }
@@ -1021,7 +1181,19 @@ private:
             const Hit* h = hit_test(mw.hits, dip);
             const int nid = h ? h->id : IdNone;
             const int nidx = h ? h->index : 0;
+            const bool mon_changed = (tooltip_hwnd_ != mw.hwnd);
             bool need_render = (nid != hover_id_ || nidx != hover_idx_);
+            if (need_render || (mon_changed && nid != IdNone)) {
+                if (mon_changed && tooltip_hwnd_) {
+                    KillTimer(tooltip_hwnd_, TIMER_TOOLTIP);
+                    KillTimer(tooltip_hwnd_, TIMER_TOOLTIP_ANIM);
+                    tooltip_.clear(nullptr, 0, false);
+                    need_render = true;
+                }
+                tooltip_hwnd_ = mw.hwnd;
+                tooltip_.on_hover_changed(mw.hwnd, TIMER_TOOLTIP, h, has_tooltip(nid, nidx), true);
+                if (tooltip_.alpha.active()) start_tooltip_anim(mw.hwnd);
+            }
             hover_id_ = nid;
             hover_idx_ = nidx;
             if (!has_selection_) {
@@ -1035,6 +1207,8 @@ private:
                 }
             }
             update_cursor(mw, vpt, h);
+            TRACKMOUSEEVENT tme{.cbSize = sizeof(tme), .dwFlags = TME_LEAVE, .hwndTrack = mw.hwnd};
+            TrackMouseEvent(&tme);
             if (need_render) render_all();
             return;
         }
@@ -1231,10 +1405,45 @@ private:
             case WM_MOUSEMOVE:
                 on_mouse_move(mw, lp);
                 return 0;
+            case WM_MOUSELEAVE:
+                if (tooltip_hwnd_ == hwnd) {
+                    hover_id_ = IdNone;
+                    hover_idx_ = 0;
+                    tooltip_.clear(hwnd, TIMER_TOOLTIP, true);
+                    if (tooltip_.alpha.active()) start_tooltip_anim(hwnd);
+                    render_monitor(mw);
+                }
+                return 0;
+            case WM_TIMER:
+                if (wp == TIMER_TOOLTIP) {
+                    if (tooltip_hwnd_ != hwnd || open_dropdown_ != AudioDropdown::None || drag_kind_ != DragKind::None) {
+                        KillTimer(hwnd, TIMER_TOOLTIP);
+                        return 0;
+                    }
+                    std::wstring tip_title;
+                    std::wstring tip_sub;
+                    const bool ok = build_tooltip(hover_id_, hover_idx_, tip_title, tip_sub);
+                    if (tooltip_.on_timer(hwnd, TIMER_TOOLTIP, ok, std::move(tip_title), std::move(tip_sub), true)) {
+                        start_tooltip_anim(hwnd);
+                        render_monitor(mw);
+                    }
+                    return 0;
+                }
+                if (wp == TIMER_TOOLTIP_ANIM) {
+                    const auto now = std::chrono::steady_clock::now();
+                    const float dt = std::clamp(std::chrono::duration<float>(now - last_tooltip_anim_).count(), 0.001f, 0.05f);
+                    last_tooltip_anim_ = now;
+                    const bool moving = tooltip_.step(dt);
+                    render_monitor(mw);
+                    if (!moving) KillTimer(hwnd, TIMER_TOOLTIP_ANIM);
+                    return 0;
+                }
+                return 0;
             case WM_LBUTTONUP:
                 on_lbutton_up(mw, lp);
                 return 0;
             case WM_RBUTTONDOWN:
+                dismiss_tooltip();
                 if (open_dropdown_ != AudioDropdown::None) {
                     open_dropdown_ = AudioDropdown::None;
                     render_all();
@@ -1249,17 +1458,23 @@ private:
                 }
                 return 0;
             case WM_MOUSEWHEEL: {
+                const bool tip_vis = dismiss_tooltip();
                 if (has_selection_ && tool_ != DrawTool::Select) {
                     const int delta = GET_WHEEL_DELTA_WPARAM(wp);
                     if (delta > 0 && thick_idx_ + 1 < THICKNESSES.size()) ++thick_idx_;
                     else if (delta < 0 && thick_idx_ > 0) --thick_idx_;
                     render_all();
+                } else if (tip_vis) {
+                    render_monitor(mw);
                 }
                 return 0;
             }
-            case WM_KEYDOWN:
+            case WM_KEYDOWN: {
+                const bool tip_vis = dismiss_tooltip();
                 on_key_down(static_cast<UINT>(wp));
+                if (tip_vis && active()) render_monitor(mw);
                 return 0;
+            }
             case WM_SETCURSOR:
                 if (LOWORD(lp) == HTCLIENT) {
                     if (current_cursor_) SetCursor(current_cursor_);
@@ -1305,6 +1520,9 @@ private:
 
     int hover_id_ = IdNone;
     int hover_idx_ = 0;
+    HWND tooltip_hwnd_ = nullptr;
+    HoverTooltip tooltip_;
+    std::chrono::steady_clock::time_point last_tooltip_anim_{};
 
     HCURSOR cursor_cross_ = nullptr;
     HCURSOR cursor_arrow_ = nullptr;

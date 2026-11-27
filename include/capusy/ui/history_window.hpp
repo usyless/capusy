@@ -88,6 +88,8 @@ public:
         else ShowWindow(hwnd_, SW_SHOWNORMAL);
         SetForegroundWindow(hwnd_);
         SetFocus(hwnd_);
+        window_active_ = true;
+        tooltip_.clear(hwnd_, TIMER_TOOLTIP, false);
         sync_preview_media();
         anim_active_ = false;
         full_dirty_ = true;
@@ -101,6 +103,9 @@ public:
         KillTimer(hwnd_, TIMER_VIDEO);
         KillTimer(hwnd_, TIMER_DROP);
         KillTimer(hwnd_, TIMER_CARET);
+        tooltip_.clear(hwnd_, TIMER_TOOLTIP, false);
+        raw_hover_id_ = IdNone;
+        raw_hover_index_ = 0;
         set_search_focus(false);
         dragging_search_ = false;
         video_.close();
@@ -252,6 +257,7 @@ private:
     static constexpr UINT_PTR TIMER_VIDEO = 2;
     static constexpr UINT_PTR TIMER_DROP = 3;
     static constexpr UINT_PTR TIMER_CARET = 4;
+    static constexpr UINT_PTR TIMER_TOOLTIP = 5;
 
     struct RowCache {
         std::wstring wpath;
@@ -289,6 +295,7 @@ private:
         IdVideoPlay,
         IdVideoMute,
         IdVideoScrub,
+        IdFooterInfo,
     };
 
     enum CtxCmd : UINT {
@@ -379,6 +386,7 @@ private:
         last_anim_ = now;
 
         bool moving = hover_.step(dt);
+        if (tooltip_.step(dt)) moving = true;
         const float d = target_scroll_ - scroll_;
         if (std::abs(d) < 0.5f) {
             scroll_ = target_scroll_;
@@ -441,6 +449,135 @@ private:
         draw_sidebar(cv, D2D1::RectF(0.0f, body_top, sidebar_w, sz.height));
         cv.vline(sidebar_w, body_top, sz.height, with_alpha(cv.theme().outline_variant, 0.65f));
         draw_preview_pane(cv, D2D1::RectF(sidebar_w + 1.0f, body_top, sz.width, sz.height));
+        draw_tooltip(cv, sz, tooltip_.anchor, tooltip_.title, tooltip_.subtitle, tooltip_.alpha.value);
+    }
+
+    [[nodiscard]] std::wstring hotkey_subtitle(HotkeyAction a) const {
+        const auto idx = static_cast<size_t>(a);
+        if (!is_hotkey_active(sh_.hotkey_status[idx].state)) return {};
+        const auto& hb = sh_.settings.hotkey(a);
+        const auto txt = format_hotkey(hb.mods, hb.vk);
+        return std::wstring{txt.view()};
+    }
+
+    [[nodiscard]] bool has_tooltip(int id, int idx) const noexcept {
+        switch (id) {
+            case IdBtnFull:
+            case IdBtnRegion:
+            case IdBtnRecord:
+            case IdBtnSettings:
+            case IdSearchBox:
+            case IdSearchClear:
+            case IdFilterAll:
+            case IdFilterImages:
+            case IdFilterVideos:
+            case IdActCopy:
+            case IdActOpen:
+            case IdActExplorer:
+            case IdActDelete:
+            case IdVideoPlay:
+            case IdVideoMute:
+            case IdVideoScrub:
+                return true;
+            case IdRow:
+                return idx >= 0 && std::cmp_less(idx, row_cache_.size());
+            case IdFooterInfo:
+                return selected_idx_ >= 0 && std::cmp_less(selected_idx_, row_cache_.size());
+            default:
+                return false;
+        }
+    }
+
+    bool build_tooltip(int id, int idx, std::wstring& title, std::wstring& subtitle) const {
+        title.clear();
+        subtitle.clear();
+        switch (id) {
+            case IdBtnFull:
+                title = L"Capture full screen";
+                subtitle = hotkey_subtitle(HotkeyAction::FullScreenshot);
+                return true;
+            case IdBtnRegion:
+                title = L"Capture region";
+                subtitle = hotkey_subtitle(HotkeyAction::RegionScreenshot);
+                return true;
+            case IdBtnRecord:
+                title = sh_.recording_active ? L"Stop region recording" : L"Start region recording";
+                subtitle = hotkey_subtitle(HotkeyAction::RegionRecord);
+                return true;
+            case IdBtnSettings:
+                title = sh_.has_update_available() ? L"Settings (Update available)" : L"Open settings";
+                return true;
+            case IdSearchBox:
+                title = L"Search captures (Ctrl+F)";
+                subtitle = L"Window title, app, filename, or date";
+                return true;
+            case IdSearchClear:
+                title = L"Clear search (Esc)";
+                return true;
+            case IdFilterAll:
+                title = L"Show all captures";
+                return true;
+            case IdFilterImages:
+                title = L"Show screenshots only";
+                return true;
+            case IdFilterVideos:
+                title = L"Show recordings only";
+                return true;
+            case IdRow:
+                if (idx >= 0 && std::cmp_less(idx, row_cache_.size())) {
+                    const RowCache& rc = row_cache_[static_cast<size_t>(idx)];
+                    title = !rc.window_title.empty()
+                        ? ulp::str::concat_strings(rc.window_title, L"  —  ", rc.filename)
+                        : rc.filename;
+                    subtitle = rc.wpath;
+                    return !title.empty() || !subtitle.empty();
+                }
+                return false;
+            case IdFooterInfo:
+                if (selected_idx_ >= 0 && std::cmp_less(selected_idx_, row_cache_.size())) {
+                    const RowCache& rc = row_cache_[static_cast<size_t>(selected_idx_)];
+                    title = !rc.window_title.empty()
+                        ? ulp::str::concat_strings(rc.window_title, L"  —  ", rc.filename)
+                        : rc.filename;
+                    subtitle = rc.wpath;
+                    return !title.empty() || !subtitle.empty();
+                }
+                return false;
+            case IdActCopy: {
+                const CaptureEntry* e = selected_entry();
+                title = (e && e->kind == CaptureKind::Video) ? L"Copy video file (Ctrl+C)" : L"Copy image (Ctrl+C)";
+                return true;
+            }
+            case IdActOpen:
+                title = L"Open in default app (Enter)";
+                return true;
+            case IdActExplorer:
+                title = L"Show in Explorer";
+                return true;
+            case IdActDelete:
+                title = L"Delete file & remove from history (Del)";
+                return true;
+            case IdVideoPlay: {
+                const bool playing = video_.is_scrubbing() ? video_.want_play() : video_.is_playing();
+                title = playing ? L"Pause (Space)" : L"Play (Space)";
+                return true;
+            }
+            case IdVideoMute:
+                title = video_.is_muted() ? L"Unmute" : L"Mute";
+                return true;
+            case IdVideoScrub:
+                title = L"Seek video";
+                subtitle = L"Click or drag to scrub";
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    void dismiss_tooltip() noexcept {
+        const bool was_vis = tooltip_.visible();
+        tooltip_.clear(hwnd_, TIMER_TOOLTIP, false);
+        if (was_vis) invalidate();
     }
 
     void draw_header(Canvas& cv, D2D1_SIZE_F sz) {
@@ -711,6 +848,9 @@ private:
             append_to(sub, L"  •  ", sel_rc.ts);
         }
         cv.text(sub, rect(foot.left + 12.0f, foot.top + 28.0f, info_w, 18.0f), Font::Caption, cv.theme().on_surface_variant);
+        if (info_w > 40.0f) {
+            cv.hit(D2D1::RectF(foot.left + 8.0f, foot.top + 4.0f, foot.left + 12.0f + info_w, foot.bottom - 4.0f), IdFooterInfo);
+        }
     }
 
     // ------------------------------------------------------------------------------------------
@@ -970,9 +1110,17 @@ private:
         const Hit* h = hit_test(hits_, p);
         const int nid = h ? h->id : IdNone;
         const int nidx = h ? h->index : 0;
-        if (hover_.set(nid, nidx, true)) start_anim();
+        if (nid != raw_hover_id_ || nidx != raw_hover_index_) {
+            raw_hover_id_ = nid;
+            raw_hover_index_ = nidx;
+            const int vis_id = (nid == IdFooterInfo) ? IdNone : nid;
+            const int vis_idx = (nid == IdFooterInfo) ? 0 : nidx;
+            const bool vis_changed = hover_.set(vis_id, vis_idx, true);
+            tooltip_.on_hover_changed(hwnd_, TIMER_TOOLTIP, h, has_tooltip(nid, nidx), true);
+            if (vis_changed || tooltip_.alpha.active()) start_anim();
+        }
         if (h && h->id == IdSearchBox) SetCursor(cursor_ibeam_);
-        else SetCursor((h && h->id != IdPreviewArea) ? cursor_hand_ : cursor_arrow_);
+        else SetCursor((h && h->id != IdPreviewArea && h->id != IdFooterInfo) ? cursor_hand_ : cursor_arrow_);
         TRACKMOUSEEVENT tme{.cbSize = sizeof(tme), .dwFlags = TME_LEAVE, .hwndTrack = hwnd_};
         TrackMouseEvent(&tme);
     }
@@ -1149,23 +1297,49 @@ private:
                     } else {
                         KillTimer(hwnd, TIMER_CARET);
                     }
+                } else if (wp == TIMER_TOOLTIP) {
+                    if (!visible() || !window_active_) {
+                        tooltip_.clear(hwnd_, TIMER_TOOLTIP, false);
+                        return 0;
+                    }
+                    std::wstring tip_title;
+                    std::wstring tip_sub;
+                    const bool ok = build_tooltip(raw_hover_id_, raw_hover_index_, tip_title, tip_sub);
+                    if (tooltip_.on_timer(hwnd_, TIMER_TOOLTIP, ok, std::move(tip_title), std::move(tip_sub), true)) {
+                        start_anim();
+                    }
                 }
                 return 0;
             case WM_MOUSEWHEEL: {
+                dismiss_tooltip();
                 const float delta = static_cast<float>(GET_WHEEL_DELTA_WPARAM(wp)) / 120.0f;
                 target_scroll_ = std::clamp(target_scroll_ - (delta * 96.0f), 0.0f, max_scroll());
                 start_anim();
                 return 0;
             }
-            case WM_LBUTTONDOWN: on_lbutton_down(lp); return 0;
-            case WM_LBUTTONDBLCLK: on_lbutton_dblclk(lp); return 0;
+            case WM_LBUTTONDOWN: dismiss_tooltip(); on_lbutton_down(lp); return 0;
+            case WM_LBUTTONDBLCLK: dismiss_tooltip(); on_lbutton_dblclk(lp); return 0;
             case WM_LBUTTONUP: on_lbutton_up(); return 0;
-            case WM_RBUTTONUP: on_rbutton_up(lp); return 0;
+            case WM_RBUTTONUP: dismiss_tooltip(); on_rbutton_up(lp); return 0;
             case WM_MOUSEMOVE: on_mouse_move(lp); return 0;
-            case WM_MOUSELEAVE:
-                if (hover_.set(IdNone, 0, true)) start_anim();
+            case WM_MOUSELEAVE: {
+                raw_hover_id_ = IdNone;
+                raw_hover_index_ = 0;
+                tooltip_.clear(hwnd_, TIMER_TOOLTIP, true);
+                if (hover_.set(IdNone, 0, true) || tooltip_.alpha.active()) start_anim();
                 return 0;
-            case WM_KEYDOWN: on_key_down(static_cast<UINT>(wp)); return 0;
+            }
+            case WM_ACTIVATE:
+                window_active_ = (LOWORD(wp) != WA_INACTIVE);
+                if (!window_active_) dismiss_tooltip();
+                break;
+            case WM_DESTROY:
+                KillTimer(hwnd, TIMER_VIDEO);
+                KillTimer(hwnd, TIMER_DROP);
+                KillTimer(hwnd, TIMER_CARET);
+                KillTimer(hwnd, TIMER_TOOLTIP);
+                return 0;
+            case WM_KEYDOWN: dismiss_tooltip(); on_key_down(static_cast<UINT>(wp)); return 0;
             case WM_CHAR: on_char(static_cast<wchar_t>(wp)); return 0;
             case WM_SETCURSOR:
                 if (LOWORD(lp) == HTCLIENT) return TRUE;
@@ -1196,6 +1370,10 @@ private:
 
     std::vector<Hit> hits_;
     HoverTracker hover_;
+    int raw_hover_id_ = IdNone;
+    int raw_hover_index_ = 0;
+    bool window_active_ = true;
+    HoverTooltip tooltip_;
     float scroll_ = 0.0f;
     float target_scroll_ = 0.0f;
     D2D1_RECT_F list_rect_{};
