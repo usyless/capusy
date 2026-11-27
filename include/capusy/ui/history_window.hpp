@@ -48,23 +48,7 @@ public:
         wc.lpszClassName = HISTORY_CLASS;
         RegisterClassExW(&wc);
 
-        const DWORD style = WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN;
-        const UINT sys_dpi = GetDpiForSystem();
-        const float s = (sys_dpi > 0 ? static_cast<float>(sys_dpi) : 96.0f) / 96.0f;
-        RECT rc{.left = 0, .top = 0, .right = static_cast<LONG>(1040 * s), .bottom = static_cast<LONG>(680 * s)};
-        AdjustWindowRectExForDpi(&rc, style, FALSE, 0, sys_dpi);
-
-        hwnd_ = CreateWindowExW(
-            WS_EX_NOREDIRECTIONBITMAP, HISTORY_CLASS, L"capusy — History",
-            style, CW_USEDEFAULT, CW_USEDEFAULT, rc.right - rc.left, rc.bottom - rc.top,
-            nullptr, nullptr, inst, this);
-        if (!hwnd_) return false;
-
-        icons_.apply(hwnd_, inst, 101);
-        cloak_window(hwnd_, true);
-        video_.set_notify(hwnd_, WM_APP_VIDEO);
         video_.set_muted(sh_.settings.video_muted);
-
         cursor_arrow_ = LoadCursorW(nullptr, IDC_ARROW);
         cursor_hand_ = LoadCursorW(nullptr, IDC_HAND);
         cursor_ibeam_ = LoadCursorW(nullptr, IDC_IBEAM);
@@ -73,56 +57,67 @@ public:
     }
 
     [[nodiscard]] HWND hwnd() const noexcept { return hwnd_; }
-    [[nodiscard]] bool visible() const noexcept { return hwnd_ && IsWindowVisible(hwnd_) != FALSE; }
+    [[nodiscard]] bool visible() const noexcept { return hwnd_ != nullptr && IsWindowVisible(hwnd_) != FALSE; }
 
     void show() {
-        if (!hwnd_) return;
-        KillTimer(hwnd_, TIMER_RELEASE_TARGET);
+        const bool was_visible = visible();
+        if (!hwnd_ && !ensure_hwnd()) return;
         if (!sh_.gfx.ensure_device(hwnd_)) return;
         if (!target_.ready() && !target_.attach(sh_.gfx, hwnd_)) {
+            if (!was_visible && hwnd_) {
+                DestroyWindow(hwnd_);
+            }
             if (sh_.on_visibility_changed) sh_.on_visibility_changed();
             return;
         }
+        video_.set_notify(hwnd_, WM_APP_VIDEO);
         sh_.thumbs.start(hwnd_, WM_APP_THUMBS, 2);
         sh_.previews.start(hwnd_, WM_APP_THUMBS, 1);
 
         reload_entries(true);
         apply_dark_window(hwnd_, DWMSBT_MAINWINDOW, true);
-        cloak_window(hwnd_, false);
         minimized_ = false;
-        if (IsIconic(hwnd_)) {
-            ShowWindow(hwnd_, SW_RESTORE);
-        } else {
-            ShowWindow(hwnd_, SW_SHOWNORMAL);
-        }
-        SetForegroundWindow(hwnd_);
-        SetFocus(hwnd_);
         window_active_ = true;
         tooltip_.clear(hwnd_, TIMER_TOOLTIP, false);
         last_tooltip_dirty_.reset();
-        sync_preview_media();
-        sync_caret_timer();
         anim_active_ = false;
         full_dirty_ = true;
         pending_dirty_.clear();
-        render();
+        if (!was_visible) {
+            render(true);
+            ShowWindow(hwnd_, saved_maximized_ ? SW_SHOWMAXIMIZED : SW_SHOWNORMAL);
+        } else if (IsIconic(hwnd_)) {
+            ShowWindow(hwnd_, SW_RESTORE);
+        }
+        SetForegroundWindow(hwnd_);
+        SetFocus(hwnd_);
+        sync_preview_media();
+        sync_caret_timer();
+        if (was_visible || saved_maximized_) {
+            full_dirty_ = true;
+            render();
+        }
         ValidateRect(hwnd_, nullptr);
         if (sh_.on_visibility_changed) sh_.on_visibility_changed();
     }
 
     void hide() {
-        if (!hwnd_ || dragging_out_) return;
-        // Hide via SW_HIDE without cloaking so Windows plays its native DWM close animation,
-        // and defer releasing the DComp swapchain until after the animation finishes.
-        const bool was_visible = visible();
-        if (was_visible) {
-            ShowWindow(hwnd_, SW_HIDE);
+        if (!hwnd_ || dragging_out_ || hiding_) return;
+        hiding_ = true;
+        const auto reset_hiding = wil::scope_exit([&] { hiding_ = false; });
+
+        WINDOWPLACEMENT wp{.length = sizeof(wp)};
+        if (GetWindowPlacement(hwnd_, &wp)) {
+            saved_placement_ = wp;
+            saved_maximized_ = (IsZoomed(hwnd_) != FALSE);
         }
-        KillTimer(hwnd_, TIMER_VIDEO);
-        if (async_drops_.empty()) KillTimer(hwnd_, TIMER_DROP);
-        KillTimer(hwnd_, TIMER_CARET);
-        KillTimer(hwnd_, TIMER_SEARCH);
-        tooltip_.clear(hwnd_, TIMER_TOOLTIP, false);
+
+        const HWND h = hwnd_;
+        KillTimer(h, TIMER_VIDEO);
+        if (async_drops_.empty()) KillTimer(h, TIMER_DROP);
+        KillTimer(h, TIMER_CARET);
+        KillTimer(h, TIMER_SEARCH);
+        tooltip_.clear(h, TIMER_TOOLTIP, false);
         last_tooltip_dirty_.reset();
         raw_hover_id_ = IdNone;
         raw_hover_index_ = 0;
@@ -130,6 +125,7 @@ public:
         search_field_.clear_cached_layout();
         dragging_search_ = false;
         deferred_select_idx_ = -1;
+        video_.set_notify(nullptr, 0);
         video_.shutdown();
         sh_.previews.clear();
         sh_.thumbs.clear();
@@ -148,12 +144,6 @@ public:
         focused_row_.reset();
         total_count_ = 0;
         unfiltered_count_ = 0;
-        if (was_visible) {
-            SetTimer(hwnd_, TIMER_RELEASE_TARGET, 400, nullptr);
-        } else {
-            KillTimer(hwnd_, TIMER_RELEASE_TARGET);
-            target_.release();
-        }
         dragging_scroll_ = false;
         in_sizemove_ = false;
         minimized_ = false;
@@ -162,6 +152,16 @@ public:
         anim_active_ = false;
         full_dirty_ = true;
         hover_.set(IdNone, 0, false);
+
+        // Destroy the HWND when no async drag is in flight so Windows plays its native close
+        // animation on every close and its native open animation on every subsequent reopen.
+        if (async_drops_.empty()) {
+            DestroyWindow(h);
+            target_.release();
+        } else {
+            ShowWindow(h, SW_HIDE);
+            target_.release();
+        }
         if (sh_.on_visibility_changed) sh_.on_visibility_changed();
     }
 
@@ -261,7 +261,29 @@ private:
     static constexpr UINT_PTR TIMER_CARET = 4;
     static constexpr UINT_PTR TIMER_TOOLTIP = 5;
     static constexpr UINT_PTR TIMER_SEARCH = 6;
-    static constexpr UINT_PTR TIMER_RELEASE_TARGET = 7;
+
+    bool ensure_hwnd() {
+        if (hwnd_) return true;
+        const DWORD style = WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN;
+        const UINT sys_dpi = GetDpiForSystem();
+        const float s = (sys_dpi > 0 ? static_cast<float>(sys_dpi) : 96.0f) / 96.0f;
+        RECT rc{.left = 0, .top = 0, .right = static_cast<LONG>(1040 * s), .bottom = static_cast<LONG>(680 * s)};
+        AdjustWindowRectExForDpi(&rc, style, FALSE, 0, sys_dpi);
+
+        hwnd_ = CreateWindowExW(
+            WS_EX_NOREDIRECTIONBITMAP, HISTORY_CLASS, L"capusy — History",
+            style, CW_USEDEFAULT, CW_USEDEFAULT, rc.right - rc.left, rc.bottom - rc.top,
+            nullptr, nullptr, inst_, this);
+        if (!hwnd_) return false;
+
+        if (saved_placement_) {
+            WINDOWPLACEMENT wp = *saved_placement_;
+            wp.showCmd = SW_HIDE;
+            SetWindowPlacement(hwnd_, &wp);
+        }
+        icons_.apply(hwnd_, inst_, 101);
+        return true;
+    }
 
     struct RowCache {
         std::wstring wpath;
@@ -920,8 +942,8 @@ private:
         return moving;
     }
 
-    void render() {
-        if (!window_can_render_live(visible(), minimized_) || rendering_) return;
+    void render(bool allow_hidden = false) {
+        if ((!allow_hidden && !window_can_render_live(visible(), minimized_)) || rendering_) return;
         if (!target_.ready()) {
             if (!sh_.gfx.ensure_device(hwnd_) || !target_.rebuild()) return;
             full_dirty_ = true;
@@ -2024,7 +2046,16 @@ private:
 
     static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (msg == WM_NCCREATE) {
-            SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(reinterpret_cast<CREATESTRUCTW*>(lp)->lpCreateParams));
+            auto* self = static_cast<HistoryWindow*>(reinterpret_cast<CREATESTRUCTW*>(lp)->lpCreateParams);
+            self->hwnd_ = hwnd;
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(self));
+        }
+        if (msg == WM_NCDESTROY) {
+            if (auto* self = reinterpret_cast<HistoryWindow*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA))) {
+                self->hwnd_ = nullptr;
+                SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+            }
+            return DefWindowProcW(hwnd, msg, wp, lp);
         }
         auto* self = reinterpret_cast<HistoryWindow*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
         if (!self) return DefWindowProcW(hwnd, msg, wp, lp);
@@ -2126,6 +2157,10 @@ private:
                     });
                     if (async_drops_.empty()) {
                         KillTimer(hwnd, TIMER_DROP);
+                        if (!visible() && hwnd_ == hwnd) {
+                            DestroyWindow(hwnd);
+                            target_.release();
+                        }
                         if (sh_.on_visibility_changed) sh_.on_visibility_changed();
                     }
                 } else if (wp == TIMER_CARET) {
@@ -2152,11 +2187,6 @@ private:
                     const bool ok = build_tooltip(raw_hover_id_, raw_hover_index_, tip_title, tip_sub);
                     if (tooltip_.on_timer(hwnd_, TIMER_TOOLTIP, ok, std::move(tip_title), std::move(tip_sub), true)) {
                         start_anim();
-                    }
-                } else if (wp == TIMER_RELEASE_TARGET) {
-                    KillTimer(hwnd, TIMER_RELEASE_TARGET);
-                    if (!visible()) {
-                        target_.release();
                     }
                 }
                 return 0;
@@ -2193,7 +2223,6 @@ private:
                 KillTimer(hwnd, TIMER_CARET);
                 KillTimer(hwnd, TIMER_TOOLTIP);
                 KillTimer(hwnd, TIMER_SEARCH);
-                KillTimer(hwnd, TIMER_RELEASE_TARGET);
                 return 0;
             case WM_KEYDOWN: dismiss_tooltip(); on_key_down(static_cast<UINT>(wp)); return 0;
             case WM_CHAR: on_char(static_cast<wchar_t>(wp)); return 0;
@@ -2209,6 +2238,9 @@ private:
     Shared& sh_;
     HINSTANCE inst_ = nullptr;
     HWND hwnd_ = nullptr;
+    std::optional<WINDOWPLACEMENT> saved_placement_;
+    bool saved_maximized_ = false;
+    bool hiding_ = false;
     WindowIcons icons_;
     WindowTarget target_;
     VideoPlayer video_;
