@@ -29,16 +29,21 @@ struct Settings {
     int image_quality = 90;             // 10 .. 100 (applies to JPEG)
     bool auto_copy_clipboard = true;
     bool capture_cursor = false;
+    bool region_instant_capture = true; // Capture immediately on click/release instead of opening annotation toolbar
 
     // Corner preview thumbnail toast (on primary monitor)
     bool show_corner_toast = true;
     float toast_timeout_s = 4.0f;  // 1.0 .. 15.0 seconds
     float toast_width_dip = 260.0f; // 160 .. 420 DIPs
 
-    // Region screen recording (Windows native Media Foundation H.264 MP4)
+    // Region screen recording (Windows native Media Foundation H.264 + AAC MP4)
     uint32_t record_fps = 30;            // 30 or 60
     uint32_t record_bitrate_mbps = 12;   // 6, 12, or 20
     bool record_cursor = true;
+    bool record_desktop_audio = true;
+    bool record_mic_audio = false;
+    std::string record_desktop_device_id; // Empty = Windows default output device
+    std::string record_mic_device_id;     // Empty = Windows default microphone device
 
     // History window audio state for reused VideoPlayer
     double video_volume = 1.0;

@@ -171,7 +171,7 @@ private:
         sh_.on_visibility_changed = [this] { schedule_idle_trim(); };
         sh_.on_redraw_all = [this] {
             if (history_win_ && history_win_->visible()) history_win_->invalidate();
-            if (settings_win_ && settings_win_->visible()) settings_win_->invalidate();
+            if (settings_win_ && settings_win_->visible()) settings_win_->sync_and_invalidate();
         };
         sh_.on_update_balloon = [this](std::wstring_view ver_label) {
             balloon_opens_about_ = true;
@@ -234,7 +234,16 @@ private:
     void start_region_recording(RECT region, WindowInfo win_info) {
         if (recorder_.recording()) return;
         const fs::path out = make_capture_path(resolve_save_dir(sh_.settings), L".mp4", sh_.settings.split_by_month);
-        if (!recorder_.start(region, out, sh_.settings.record_fps, sh_.settings.record_bitrate_mbps, sh_.settings.record_cursor)) {
+        RecordingConfig cfg{
+            .fps = sh_.settings.record_fps,
+            .bitrate_mbps = sh_.settings.record_bitrate_mbps,
+            .include_cursor = sh_.settings.record_cursor,
+            .record_desktop_audio = sh_.settings.record_desktop_audio,
+            .record_mic_audio = sh_.settings.record_mic_audio,
+            .desktop_device_id = sh_.settings.record_desktop_device_id,
+            .mic_device_id = sh_.settings.record_mic_device_id,
+        };
+        if (!recorder_.start(region, out, std::move(cfg))) {
             balloon_opens_about_ = false;
             show_balloon(L"Failed to start region recording.", NIIF_ERROR);
             return;

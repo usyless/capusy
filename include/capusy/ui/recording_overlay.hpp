@@ -77,7 +77,10 @@ public:
         if (FAILED(GetDpiForMonitor(mon, MDT_EFFECTIVE_DPI, &dx, &dy)) || dx == 0) dx = 96;
         const float s = static_cast<float>(dx) / 96.0f;
 
-        const int pw = static_cast<int>(std::lround(192.0f * s));
+        const bool desk_on = recorder_ && recorder_->desktop_audio_active();
+        const bool mic_on = recorder_ && recorder_->mic_audio_active();
+        const float extra_w = (desk_on ? 18.0f : 0.0f) + (mic_on ? 18.0f : 0.0f) + ((desk_on || mic_on) ? 6.0f : 0.0f);
+        const int pw = static_cast<int>(std::lround((192.0f + extra_w) * s));
         const int ph = static_cast<int>(std::lround(40.0f * s));
         int px = ((region.left + region.right) - pw) / 2;
         int py = region.bottom + static_cast<int>(std::lround(10.0f * s));
@@ -142,7 +145,17 @@ private:
             lbl.append(format_duration_ms(ms));
             cv.text(lbl, rect(30.0f, 0.0f, 82.0f, sz.height), Font::MonoSmall, cv.theme().on_surface);
 
-            draw_button(cv, hover_stop_ ? 1.0f : 0.0f, rect(sz.width - 74.0f, 6.0f, 66.0f, sz.height - 12.0f),
+            float ix = 112.0f;
+            const float stop_x = sz.width - 74.0f;
+            if (recorder_ && recorder_->desktop_audio_active() && ix + 16.0f <= stop_x - 4.0f) {
+                cv.icon(glyph::volume, rect(ix, 0.0f, 16.0f, sz.height), cv.theme().primary, Font::IconSmall);
+                ix += 18.0f;
+            }
+            if (recorder_ && recorder_->mic_audio_active() && ix + 16.0f <= stop_x - 4.0f) {
+                cv.icon(glyph::mic, rect(ix, 0.0f, 16.0f, sz.height), cv.theme().mint, Font::IconSmall);
+            }
+
+            draw_button(cv, hover_stop_ ? 1.0f : 0.0f, rect(stop_x, 6.0f, 66.0f, sz.height - 12.0f),
                         glyph::stop, L"Stop", 1, 0, 2);
         });
     }

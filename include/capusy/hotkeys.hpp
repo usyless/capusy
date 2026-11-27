@@ -71,7 +71,7 @@ inline constexpr uint32_t VK_PRINTSCREEN_CODE = 0x2Cu;
 [[nodiscard]] constexpr const wchar_t* hotkey_action_caption(HotkeyAction a) noexcept {
     switch (a) {
         case HotkeyAction::FullScreenshot: return L"Captures all monitors immediately (fills gaps with black)";
-        case HotkeyAction::RegionScreenshot: return L"Freezes all monitors, snaps to windows & elements, with drawing tools";
+        case HotkeyAction::RegionScreenshot: return L"Freezes all monitors, snaps to windows & elements (instant or edit mode)";
         case HotkeyAction::RegionRecord: return L"Select a region to record MP4 video; press again to stop";
         case HotkeyAction::OpenHistory: return L"Shows the screenshot history and preview window";
         case HotkeyAction::Count: break;

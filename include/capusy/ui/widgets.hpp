@@ -203,4 +203,80 @@ inline void draw_error_row(Canvas& cv, std::wstring_view message, float x, float
     cv.text_wrap(message, rect(x + 22.0f, y, std::max(40.0f, row_w - 22.0f), h), Font::Caption, cv.theme().error);
 }
 
+struct DropdownOption {
+    std::wstring label;
+    bool selected = false;
+    int index = 0;
+};
+
+inline void draw_dropdown_field(Canvas& cv, float ha, D2D1_RECT_F r, std::wstring_view label,
+                                bool open, bool enabled, int id, int idx = 0) {
+    const float rad = std::min(cv.theme().button_radius, height(r) * 0.5f);
+    const D2D1_COLOR_F bg = enabled
+        ? lerp_color(cv.theme().surface_low, cv.theme().surface_high, open ? 1.0f : ha)
+        : with_alpha(cv.theme().surface_low, 0.55f);
+    const D2D1_COLOR_F border = open
+        ? cv.theme().primary
+        : (enabled ? cv.theme().outline_variant : with_alpha(cv.theme().outline_variant, 0.45f));
+    const D2D1_COLOR_F fg = enabled ? cv.theme().on_surface : with_alpha(cv.theme().on_surface_variant, 0.6f);
+    const D2D1_COLOR_F chev = open ? cv.theme().primary : with_alpha(cv.theme().on_surface_variant, enabled ? 0.9f : 0.45f);
+
+    cv.fill_round(r, rad, bg);
+    cv.stroke_round(r, rad, border, open ? 1.4f : 1.0f);
+    cv.text(label, D2D1::RectF(r.left + 10.0f, r.top, std::max(r.left + 10.0f, r.right - 26.0f), r.bottom), Font::Small, fg);
+    cv.icon(open ? glyph::chevron_up : glyph::chevron_down, rect(r.right - 24.0f, r.top, 18.0f, height(r)), chev, Font::IconSmall);
+    if (id != 0) cv.hit(r, id, idx);
+}
+
+inline void draw_dropdown_popup(Canvas& cv, D2D1_RECT_F anchor, D2D1_SIZE_F viewport,
+                                std::span<const DropdownOption> opts, int item_id, int hover_id, int hover_idx) {
+    if (opts.empty()) return;
+    constexpr float item_h = 30.0f;
+    constexpr float pad_y = 6.0f;
+    const float max_h = std::max(item_h + (pad_y * 2.0f), viewport.height - 24.0f);
+    const float content_h = (pad_y * 2.0f) + (static_cast<float>(opts.size()) * item_h);
+    const float pop_h = std::min(max_h, content_h);
+    float pop_w = std::max(width(anchor), 240.0f);
+    for (const auto& o : opts) {
+        pop_w = std::max(pop_w, cv.measure(o.label, Font::Small) + 46.0f);
+    }
+    pop_w = std::min(pop_w, std::max(160.0f, viewport.width - 24.0f));
+
+    const float px = std::clamp(anchor.left, 12.0f, std::max(12.0f, viewport.width - pop_w - 12.0f));
+    const float below_space = viewport.height - anchor.bottom - 16.0f;
+    const float above_space = anchor.top - 16.0f;
+    float py = anchor.bottom + 4.0f;
+    if (below_space < pop_h && above_space > below_space) {
+        py = anchor.top - pop_h - 4.0f;
+    }
+    py = std::clamp(py, 12.0f, std::max(12.0f, viewport.height - pop_h - 12.0f));
+
+    const D2D1_RECT_F panel = rect(px, py, pop_w, pop_h);
+    cv.shadow(panel, 10.0f, 10.0f, 0.48f);
+    cv.fill_round(panel, 10.0f, with_alpha(cv.theme().surface, 0.98f));
+    cv.stroke_round(panel, 10.0f, cv.theme().outline_variant, 1.0f);
+
+    cv.push_clip(inset(panel, 2.0f, 2.0f));
+    float iy = py + pad_y;
+    for (const auto& o : opts) {
+        if (iy >= panel.bottom - 4.0f) break;
+        const D2D1_RECT_F row = rect(px + 6.0f, iy, pop_w - 12.0f, item_h);
+        const bool hov = (hover_id == item_id && hover_idx == o.index);
+        if (o.selected) {
+            cv.fill_round(row, 7.0f, with_alpha(cv.theme().primary_container, hov ? 0.85f : 0.65f));
+        } else if (hov) {
+            cv.fill_round(row, 7.0f, with_alpha(cv.theme().on_surface, 0.08f));
+        }
+        if (o.selected) {
+            cv.icon(glyph::check, rect(row.left + 6.0f, row.top, 18.0f, item_h), cv.theme().primary, Font::IconSmall);
+        }
+        const D2D1_COLOR_F tfg = o.selected ? cv.theme().on_primary_container : cv.theme().on_surface;
+        cv.text(o.label, D2D1::RectF(row.left + 28.0f, row.top, row.right - 8.0f, row.bottom),
+                o.selected ? Font::SmallSemi : Font::Small, tfg);
+        cv.hit(row, item_id, o.index);
+        iy += item_h;
+    }
+    cv.pop_clip();
+}
+
 } // namespace capusy::ui

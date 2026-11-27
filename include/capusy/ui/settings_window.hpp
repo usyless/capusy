@@ -4,6 +4,7 @@
 #include "shared.hpp"
 #include "widgets.hpp"
 
+#include <capusy/audio_capture.hpp>
 #include <capusy/updater.hpp>
 
 #include <algorithm>
@@ -110,6 +111,7 @@ public:
         dragging_scroll_ = false;
         in_sizemove_ = false;
         dragging_slider_ = IdNone;
+        open_audio_drop_ = AudioDropdown::None;
         anim_active_ = false;
         hover_.set(IdNone, 0, false);
         app_icon_.reset();
@@ -126,6 +128,11 @@ public:
 
     void invalidate() noexcept {
         if (visible()) InvalidateRect(hwnd_, nullptr, FALSE);
+    }
+
+    void sync_and_invalidate() {
+        sync_state(false);
+        invalidate();
     }
 
     void refresh_external_state(bool reload_if_changed = true) {
@@ -163,6 +170,7 @@ private:
         IdToggleStartup,
         IdToggleAutoCopy,
         IdToggleCaptureCursor,
+        IdToggleInstantRegion,
         IdToggleSplitMonth,
         IdFmtPng,
         IdFmtJpeg,
@@ -181,12 +189,23 @@ private:
         IdBitrate12,
         IdBitrate20,
         IdToggleRecordCursor,
+        IdToggleRecDesktop,
+        IdDropRecDesktop,
+        IdToggleRecMic,
+        IdDropRecMic,
+        IdRecAudioDropItem,
         IdToggleAutoUpdate,
         IdCheckUpdates,
         IdInstallUpdate,
         IdInstallUpdateDisabled,
         IdOpenReleaseUrl,
         IdScrollbar,
+    };
+
+    enum class AudioDropdown : uint8_t {
+        None = 0,
+        Desktop,
+        Mic,
     };
 
     struct UpdateJob {
@@ -241,10 +260,17 @@ private:
         sw_startup_.set(startup_enabled_ ? 1.0f : 0.0f, animate);
         sw_auto_copy_.set(sh_.settings.auto_copy_clipboard ? 1.0f : 0.0f, animate);
         sw_cap_cursor_.set(sh_.settings.capture_cursor ? 1.0f : 0.0f, animate);
+        sw_instant_region_.set(sh_.settings.region_instant_capture ? 1.0f : 0.0f, animate);
         sw_split_month_.set(sh_.settings.split_by_month ? 1.0f : 0.0f, animate);
         sw_toast_.set(sh_.settings.show_corner_toast ? 1.0f : 0.0f, animate);
         sw_rec_cursor_.set(sh_.settings.record_cursor ? 1.0f : 0.0f, animate);
+        sw_rec_desktop_.set(sh_.settings.record_desktop_audio ? 1.0f : 0.0f, animate);
+        sw_rec_mic_.set(sh_.settings.record_mic_audio ? 1.0f : 0.0f, animate);
         sw_auto_update_.set(sh_.settings.auto_check_updates ? 1.0f : 0.0f, animate);
+        if (!animate) {
+            desktop_devices_ = enumerate_audio_devices(AudioFlow::Render);
+            mic_devices_ = enumerate_audio_devices(AudioFlow::Capture);
+        }
     }
 
     void start_anim() noexcept {
@@ -266,9 +292,12 @@ private:
         if (sw_startup_.step(dt, 22.0f, 0.004f)) moving = true;
         if (sw_auto_copy_.step(dt, 22.0f, 0.004f)) moving = true;
         if (sw_cap_cursor_.step(dt, 22.0f, 0.004f)) moving = true;
+        if (sw_instant_region_.step(dt, 22.0f, 0.004f)) moving = true;
         if (sw_split_month_.step(dt, 22.0f, 0.004f)) moving = true;
         if (sw_toast_.step(dt, 22.0f, 0.004f)) moving = true;
         if (sw_rec_cursor_.step(dt, 22.0f, 0.004f)) moving = true;
+        if (sw_rec_desktop_.step(dt, 22.0f, 0.004f)) moving = true;
+        if (sw_rec_mic_.step(dt, 22.0f, 0.004f)) moving = true;
         if (sw_auto_update_.step(dt, 22.0f, 0.004f)) moving = true;
         const float d = target_scroll_ - scroll_;
         if (std::abs(d) < 0.5f) {
@@ -410,6 +439,27 @@ private:
             scroll_thumb_ = D2D1::RectF(view.right - lerp(6.0f, 8.0f, ha), ty, view.right - 2.0f, ty + thumb_h);
             cv.fill_round(scroll_thumb_, 3.0f, with_alpha(cv.theme().on_surface_variant, lerp(0.28f, 0.55f, ha)));
             cv.hit(D2D1::RectF(view.right - 12.0f, view.top, view.right, view.bottom), IdScrollbar);
+        }
+
+        if (tab_ == 1 && open_audio_drop_ != AudioDropdown::None) {
+            const bool is_desk = (open_audio_drop_ == AudioDropdown::Desktop);
+            const auto& devs = is_desk ? desktop_devices_ : mic_devices_;
+            const std::string& cur_id = is_desk ? sh_.settings.record_desktop_device_id : sh_.settings.record_mic_device_id;
+            std::vector<DropdownOption> opts;
+            opts.reserve(devs.size() + 1);
+            opts.push_back({
+                .label = resolve_audio_device_label("", devs, L"System Default"),
+                .selected = cur_id.empty(),
+                .index = -1,
+            });
+            for (size_t i = 0; i < devs.size(); ++i) {
+                opts.push_back({
+                    .label = devs[i].name,
+                    .selected = (!cur_id.empty() && cur_id == devs[i].id),
+                    .index = static_cast<int>(i),
+                });
+            }
+            draw_dropdown_popup(cv, is_desk ? desktop_drop_r_ : mic_drop_r_, sz, opts, IdRecAudioDropItem, hover_.id, hover_.index);
         }
     }
 
@@ -579,7 +629,8 @@ private:
             const float r1_y = y + 16.0f + hd.h + 12.0f;
             const float r2_y = r1_y + 38.0f;
             const float r3_y = r2_y + 38.0f;
-            const float line_y = r3_y + 40.0f;
+            const float r4_y = r3_y + 38.0f;
+            const float line_y = r4_y + 40.0f;
             const float dir_lbl_y = line_y + 12.0f;
             const float dir_row_y = dir_lbl_y + 22.0f;
             const float card_h = (dir_row_y + 36.0f + 16.0f) - y;
@@ -595,6 +646,9 @@ private:
 
             cv.text(L"Include mouse cursor in screenshots", rect(lx, r3_y, rw - 60.0f, 32.0f), Font::Body, cv.theme().on_surface);
             draw_switch(cv, hover_.alpha(IdToggleCaptureCursor), sw_cap_cursor_.value, lx + rw, r3_y + 16.0f, IdToggleCaptureCursor);
+
+            cv.text(L"Instant region screenshot (capture on release, skip editor)", rect(lx, r4_y, rw - 60.0f, 32.0f), Font::Body, cv.theme().on_surface);
+            draw_switch(cv, hover_.alpha(IdToggleInstantRegion), sw_instant_region_.value, lx + rw, r4_y + 16.0f, IdToggleInstantRegion);
 
             cv.hline(lx, lx + rw, line_y, with_alpha(cv.theme().outline_variant, 0.5f));
             cv.text(L"Capture save folder", rect(lx, dir_lbl_y, rw, 20.0f), Font::SmallSemi, cv.theme().on_surface_variant);
@@ -713,7 +767,7 @@ private:
         // 2. Region Screen Recording card
         {
             const CardHeader hd = make_header(cv, rw, L"Region Screen Recording", cv.theme().on_surface,
-                                              L"Native Windows Media Foundation H.264 MP4 encoder");
+                                              L"Native Windows Media Foundation H.264 + AAC MP4 encoder");
 
             Flow fps_row{8.0f, 8.0f};
             flow_text(cv, fps_row, L"Frame rate:", Font::Body, cv.theme().on_surface, 130.0f, 32.0f);
@@ -739,7 +793,12 @@ private:
             const float r1_y = y + 16.0f + hd.h + 14.0f;
             const float r2_y = r1_y + fps_row.height(rw) + 12.0f;
             const float r3_y = r2_y + br_row.height(rw) + 14.0f;
-            const float card_h = (r3_y + 34.0f + 16.0f) - y;
+            const float sep_y = r3_y + 40.0f;
+            const float desk_y = sep_y + 14.0f;
+            const float desk_drop_y = desk_y + 36.0f;
+            const float mic_y = desk_drop_y + 44.0f;
+            const float mic_drop_y = mic_y + 36.0f;
+            const float card_h = (mic_drop_y + 34.0f + 16.0f) - y;
             const float next_y = card_begin(cv, x, y, w, card_h, CARD_GAP);
 
             (void)draw_header(cv, lx, y, rw, hd);
@@ -748,6 +807,26 @@ private:
 
             cv.text(L"Include mouse cursor in recordings", rect(lx, r3_y, rw - 60.0f, 32.0f), Font::Body, cv.theme().on_surface);
             draw_switch(cv, hover_.alpha(IdToggleRecordCursor), sw_rec_cursor_.value, lx + rw, r3_y + 16.0f, IdToggleRecordCursor);
+
+            cv.hline(lx, lx + rw, sep_y, with_alpha(cv.theme().outline_variant, 0.5f));
+
+            cv.text(L"Record desktop audio", rect(lx, desk_y, rw - 60.0f, 32.0f), Font::Body, cv.theme().on_surface);
+            draw_switch(cv, hover_.alpha(IdToggleRecDesktop), sw_rec_desktop_.value, lx + rw, desk_y + 16.0f, IdToggleRecDesktop);
+            desktop_drop_r_ = rect(lx, desk_drop_y, rw, 34.0f);
+            const std::wstring desk_lbl = resolve_audio_device_label(sh_.settings.record_desktop_device_id, desktop_devices_, L"System Default");
+            draw_dropdown_field(cv, hover_.alpha(IdDropRecDesktop), desktop_drop_r_, desk_lbl,
+                                open_audio_drop_ == AudioDropdown::Desktop,
+                                sh_.settings.record_desktop_audio && !desktop_devices_.empty(),
+                                desktop_devices_.empty() ? IdNone : IdDropRecDesktop);
+
+            cv.text(L"Record microphone audio", rect(lx, mic_y, rw - 60.0f, 32.0f), Font::Body, cv.theme().on_surface);
+            draw_switch(cv, hover_.alpha(IdToggleRecMic), sw_rec_mic_.value, lx + rw, mic_y + 16.0f, IdToggleRecMic);
+            mic_drop_r_ = rect(lx, mic_drop_y, rw, 34.0f);
+            const std::wstring mic_lbl = resolve_audio_device_label(sh_.settings.record_mic_device_id, mic_devices_, L"System Default");
+            draw_dropdown_field(cv, hover_.alpha(IdDropRecMic), mic_drop_r_, mic_lbl,
+                                open_audio_drop_ == AudioDropdown::Mic,
+                                sh_.settings.record_mic_audio && !mic_devices_.empty(),
+                                mic_devices_.empty() ? IdNone : IdDropRecMic);
 
             y = next_y;
         }
@@ -1084,18 +1163,27 @@ private:
         const D2D1_POINT_2F p = to_dip(lp);
         const Hit* h = hit_test(hits_, p);
         if (!h) {
+            open_audio_drop_ = AudioDropdown::None;
             stop_recording_hotkey();
             invalidate();
             return;
+        }
+        if (open_audio_drop_ != AudioDropdown::None &&
+            h->id != IdRecAudioDropItem && h->id != IdDropRecDesktop && h->id != IdDropRecMic) {
+            open_audio_drop_ = AudioDropdown::None;
         }
         if (recording_action_ && h->id != IdRecordHotkey) stop_recording_hotkey();
 
         switch (h->id) {
             case IdTab0: case IdTab1: case IdTab2:
+                open_audio_drop_ = AudioDropdown::None;
                 tab_ = h->id - IdTab0;
                 tab_anim_.set(static_cast<float>(tab_), true);
                 scroll_ = target_scroll_ = 0.0f;
-                if (tab_ == 2) {
+                if (tab_ == 1) {
+                    desktop_devices_ = enumerate_audio_devices(AudioFlow::Render);
+                    mic_devices_ = enumerate_audio_devices(AudioFlow::Capture);
+                } else if (tab_ == 2) {
                     if (auto st = sh_.history.stats()) stats_ = *st;
                 }
                 start_anim();
@@ -1165,6 +1253,12 @@ private:
                 sync_state(true);
                 start_anim();
                 return;
+            case IdToggleInstantRegion:
+                sh_.settings.region_instant_capture = !sh_.settings.region_instant_capture;
+                sh_.save();
+                sync_state(true);
+                start_anim();
+                return;
             case IdToggleSplitMonth:
                 sh_.settings.split_by_month = !sh_.settings.split_by_month;
                 sh_.save();
@@ -1212,6 +1306,51 @@ private:
                 sh_.save();
                 sync_state(true);
                 start_anim();
+                return;
+            case IdToggleRecDesktop:
+                sh_.settings.record_desktop_audio = !sh_.settings.record_desktop_audio;
+                sh_.save();
+                sync_state(true);
+                start_anim();
+                return;
+            case IdDropRecDesktop:
+                desktop_devices_ = enumerate_audio_devices(AudioFlow::Render);
+                open_audio_drop_ = (open_audio_drop_ == AudioDropdown::Desktop) ? AudioDropdown::None : AudioDropdown::Desktop;
+                invalidate();
+                return;
+            case IdToggleRecMic:
+                sh_.settings.record_mic_audio = !sh_.settings.record_mic_audio;
+                sh_.save();
+                sync_state(true);
+                start_anim();
+                return;
+            case IdDropRecMic:
+                mic_devices_ = enumerate_audio_devices(AudioFlow::Capture);
+                open_audio_drop_ = (open_audio_drop_ == AudioDropdown::Mic) ? AudioDropdown::None : AudioDropdown::Mic;
+                invalidate();
+                return;
+            case IdRecAudioDropItem:
+                if (open_audio_drop_ == AudioDropdown::Desktop) {
+                    if (h->index < 0) sh_.settings.record_desktop_device_id.clear();
+                    else if (std::cmp_less(h->index, desktop_devices_.size())) {
+                        sh_.settings.record_desktop_device_id = desktop_devices_[static_cast<size_t>(h->index)].id;
+                    }
+                    sh_.settings.record_desktop_audio = true;
+                    sh_.save();
+                    sync_state(true);
+                    start_anim();
+                } else if (open_audio_drop_ == AudioDropdown::Mic) {
+                    if (h->index < 0) sh_.settings.record_mic_device_id.clear();
+                    else if (std::cmp_less(h->index, mic_devices_.size())) {
+                        sh_.settings.record_mic_device_id = mic_devices_[static_cast<size_t>(h->index)].id;
+                    }
+                    sh_.settings.record_mic_audio = true;
+                    sh_.save();
+                    sync_state(true);
+                    start_anim();
+                }
+                open_audio_drop_ = AudioDropdown::None;
+                invalidate();
                 return;
             case IdToggleAutoUpdate:
                 sh_.settings.auto_check_updates = !sh_.settings.auto_check_updates;
@@ -1279,7 +1418,14 @@ private:
             invalidate();
             return;
         }
-        if (vk == VK_ESCAPE) hide();
+        if (vk == VK_ESCAPE) {
+            if (open_audio_drop_ != AudioDropdown::None) {
+                open_audio_drop_ = AudioDropdown::None;
+                invalidate();
+                return;
+            }
+            hide();
+        }
     }
 
     static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
@@ -1334,6 +1480,7 @@ private:
                 return 0;
             }
             case WM_MOUSEWHEEL: {
+                open_audio_drop_ = AudioDropdown::None;
                 const float delta = static_cast<float>(GET_WHEEL_DELTA_WPARAM(wp)) / 120.0f;
                 target_scroll_ = std::clamp(target_scroll_ - (delta * 90.0f), 0.0f, max_scroll());
                 start_anim();
@@ -1418,10 +1565,19 @@ private:
     AnimFloat sw_startup_;
     AnimFloat sw_auto_copy_;
     AnimFloat sw_cap_cursor_;
+    AnimFloat sw_instant_region_;
     AnimFloat sw_split_month_;
     AnimFloat sw_toast_;
     AnimFloat sw_rec_cursor_;
+    AnimFloat sw_rec_desktop_;
+    AnimFloat sw_rec_mic_;
     AnimFloat sw_auto_update_;
+
+    AudioDropdown open_audio_drop_ = AudioDropdown::None;
+    std::vector<AudioDeviceInfo> desktop_devices_;
+    std::vector<AudioDeviceInfo> mic_devices_;
+    D2D1_RECT_F desktop_drop_r_{};
+    D2D1_RECT_F mic_drop_r_{};
 
     bool startup_enabled_ = false;
     bool win_prtscn_disabled_ = false;

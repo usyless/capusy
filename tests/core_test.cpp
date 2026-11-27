@@ -1,5 +1,6 @@
 #include "check.hpp"
 
+#include <capusy/audio_capture.hpp>
 #include <capusy/capture_logic.hpp>
 #include <capusy/history_store.hpp>
 #include <capusy/hotkeys.hpp>
@@ -310,6 +311,71 @@ static void test_ui_primitives() {
     CHECK(p2.skip);
 }
 
+static void test_audio_capture_helpers() {
+    using namespace capusy;
+
+    // Sample decoding (PCM16, Float32, PCM24, PCM8)
+    const int16_t s16 = 16384;
+    CHECK(std::abs(decode_audio_sample(reinterpret_cast<const uint8_t*>(&s16), AudioSampleFormat::Pcm16) - 0.5f) < 0.001f);
+    const float sf32 = -0.75f;
+    CHECK(std::abs(decode_audio_sample(reinterpret_cast<const uint8_t*>(&sf32), AudioSampleFormat::Float32) + 0.75f) < 0.0001f);
+    const uint8_t s8 = 128;
+    CHECK(std::abs(decode_audio_sample(&s8, AudioSampleFormat::Pcm8)) < 0.001f);
+
+    // Mono & 5.1 downmix to stereo
+    const std::array<float, 1> mono = {0.4f};
+    const StereoFrame dm1 = downmix_to_stereo(mono);
+    CHECK(std::abs(dm1.l - 0.4f) < 0.0001f && std::abs(dm1.r - 0.4f) < 0.0001f);
+
+    const std::array<float, 6> ch51 = {1.0f, 0.0f, 0.5f, 0.0f, 0.0f, 0.0f};
+    const StereoFrame dm51 = downmix_to_stereo(ch51);
+    CHECK(dm51.l > dm51.r && dm51.r > 0.1f);
+
+    // Resampler pass-through at 48 kHz
+    StereoResampler r48;
+    r48.reset(48000, 48000);
+    StereoFloatFifo fifo48{256};
+    const std::array<StereoFrame, 4> in4 = {{{0.1f, -0.1f}, {0.2f, -0.2f}, {0.3f, -0.3f}, {0.4f, -0.4f}}};
+    r48.push_stereo(in4, fifo48);
+    CHECK(fifo48.frames_available() == 4);
+    std::array<float, 8> out4{};
+    CHECK(fifo48.pop_frames(out4.data(), 4) == 4);
+    CHECK(std::abs(out4[0] - 0.1f) < 0.0001f && std::abs(out4[7] + 0.4f) < 0.0001f);
+    CHECK(fifo48.frames_available() == 0);
+
+    // Resampler 44.1 kHz -> 48 kHz preserves duration within 1 frame
+    StereoResampler r44;
+    r44.reset(44100, 48000);
+    StereoFloatFifo fifo44{2048};
+    std::vector<StereoFrame> chunk44(441, {.l = 0.5f, .r = -0.5f}); // 10 ms at 44.1 kHz
+    for (int i = 0; i < 10; ++i) r44.push_stereo(chunk44, fifo44);   // 100 ms total -> ~4800 frames at 48 kHz
+    CHECK(fifo44.frames_available() >= 4795 && fifo44.frames_available() <= 4805);
+
+    // FIFO trim_excess keeps latency bounded
+    fifo44.trim_excess(2000, 1000);
+    CHECK(fifo44.frames_available() == 1000);
+
+    // Mixing + soft-limiting prevents int16 overflow wrap
+    const std::array<float, 4> a = {0.8f, -0.8f, 0.25f, 0.0f};
+    const std::array<float, 4> b = {0.8f, -0.8f, 0.25f, -0.5f};
+    std::array<int16_t, 4> mixed{};
+    mix_stereo_to_pcm16(a, b, mixed);
+    CHECK(mixed[0] > 28000 && mixed[0] <= 32767);
+    CHECK(mixed[1] < -28000 && mixed[1] >= -32767);
+    CHECK(std::abs(mixed[2] - 16384) <= 2);
+    CHECK(std::abs(mixed[3] + 16384) <= 2);
+
+    // Device label resolution
+    const std::vector<AudioDeviceInfo> devs = {
+        {.id = "id-spk", .name = L"Speakers (Realtek)", .is_default = true},
+        {.id = "id-hp", .name = L"Headphones (USB)", .is_default = false},
+    };
+    CHECK(resolve_audio_device_label("", devs, L"Default Output") == L"Default Output (Speakers (Realtek))");
+    CHECK(resolve_audio_device_label("id-hp", devs, L"Default Output") == L"Headphones (USB)");
+    CHECK(resolve_audio_device_label("missing-id", devs, L"Default Output") == L"Default Output (Speakers (Realtek))");
+    CHECK(resolve_audio_device_label("", {}, L"Default Output") == L"No device found");
+}
+
 int main() {
     test_startup_logic();
     test_hotkey_collisions();
@@ -318,5 +384,6 @@ int main() {
     test_history_search();
     test_update_logic();
     test_ui_primitives();
+    test_audio_capture_helpers();
     return capusy::test::failures == 0 ? 0 : 1;
 }

@@ -4,6 +4,7 @@
 #include "shared.hpp"
 #include "widgets.hpp"
 
+#include <capusy/audio_capture.hpp>
 #include <capusy/capture.hpp>
 
 #include <algorithm>
@@ -178,6 +179,15 @@ public:
         current_cursor_ = cursor_cross_;
 
         // Reset session state
+        instant_capture_ = (mode_ == OverlayMode::Screenshot) && sh_.settings.region_instant_capture;
+        open_dropdown_ = AudioDropdown::None;
+        if (mode_ == OverlayMode::RecordRegion) {
+            desktop_devices_ = enumerate_audio_devices(AudioFlow::Render);
+            mic_devices_ = enumerate_audio_devices(AudioFlow::Capture);
+        } else {
+            desktop_devices_.clear();
+            mic_devices_.clear();
+        }
         has_selection_ = false;
         selection_ = {};
         hover_snap_.reset();
@@ -278,6 +288,9 @@ public:
         round_stroke_.reset();
         has_selection_ = false;
         drag_kind_ = DragKind::None;
+        open_dropdown_ = AudioDropdown::None;
+        desktop_devices_.clear();
+        mic_devices_.clear();
         if (was_active && on_closed) on_closed();
     }
 
@@ -292,6 +305,18 @@ private:
         IdClear,
         IdCapture,
         IdCancel,
+        IdToggleInstant,
+        IdRecDesktopToggle,
+        IdRecDesktopDrop,
+        IdRecMicToggle,
+        IdRecMicDrop,
+        IdRecDropdownItem,
+    };
+
+    enum class AudioDropdown : uint8_t {
+        None = 0,
+        Desktop,
+        Mic,
     };
 
     enum class DragKind : uint8_t {
@@ -456,7 +481,9 @@ private:
                 badge.assign(to_fixed_wstr<16>(rw_px));
                 badge.append(L" × ");
                 badge.append(to_fixed_wstr<16>(rh_px));
-                if (!has_selection_) badge.append(L"  (click to snap)");
+                if (!has_selection_) {
+                    badge.append((mode_ == OverlayMode::Screenshot && instant_capture_) ? L"  (click to capture)" : L"  (click to snap)");
+                }
                 const float bw = cv.measure(badge, Font::MonoSmall) + 16.0f;
                 const float bh = 24.0f;
                 const float bx = std::clamp(sr.left, 8.0f, std::max(8.0f, sz.width - bw - 8.0f));
@@ -480,17 +507,36 @@ private:
             if (gy >= 0.0f && gy <= sz.height) cv.hline(0.0f, sz.width, gy, with_alpha(cv.theme().mint, 0.85f));
         }
 
-        // 7. Top hint banner before selection is made (on monitor under cursor or primary)
+        // 7. Top hint banner before selection is made (on primary monitor)
         if (!has_selection_ && mw.info.primary) {
-            const std::wstring_view hint = (mode_ == OverlayMode::RecordRegion)
-                ? L"Click a window/element or drag to select recording region  •  Hold Alt to disable snap  •  Esc to cancel"
-                : L"Click a window/element or drag to select region  •  Hold Alt to disable snap  •  Esc to cancel";
-            const float hw = std::min(sz.width - 32.0f, cv.measure(hint, Font::SmallSemi) + 28.0f);
-            const D2D1_RECT_F hr = rect((sz.width - hw) * 0.5f, 16.0f, hw, 32.0f);
-            cv.shadow(hr, 16.0f, 8.0f, 0.35f);
-            cv.fill_round(hr, 16.0f, with_alpha(cv.theme().surface, 0.94f));
-            cv.stroke_round(hr, 16.0f, with_alpha(cv.theme().outline_variant, 0.85f));
-            cv.text(hint, hr, Font::SmallSemi, cv.theme().on_surface, Align::Center);
+            if (mode_ == OverlayMode::RecordRegion) {
+                const std::wstring_view hint = L"Click a window/element or drag to select recording region  •  Hold Alt to disable snap  •  Esc to cancel";
+                const float hw = std::min(sz.width - 32.0f, cv.measure(hint, Font::SmallSemi) + 28.0f);
+                const D2D1_RECT_F hr = rect((sz.width - hw) * 0.5f, 16.0f, hw, 34.0f);
+                cv.shadow(hr, 17.0f, 8.0f, 0.35f);
+                cv.fill_round(hr, 17.0f, with_alpha(cv.theme().surface, 0.94f));
+                cv.stroke_round(hr, 17.0f, with_alpha(cv.theme().outline_variant, 0.85f));
+                cv.text(hint, hr, Font::SmallSemi, cv.theme().on_surface, Align::Center);
+            } else {
+                const std::wstring_view hint = instant_capture_
+                    ? L"Click a window or drag to capture  •  Hold Alt to disable snap  •  Esc to cancel"
+                    : L"Click a window or drag to select & edit  •  Hold Alt to disable snap  •  Esc to cancel";
+                const wchar_t* mode_lbl = instant_capture_ ? L"Edit Mode (E)" : L"Instant Mode (E)";
+                const wchar_t mode_icon = instant_capture_ ? glyph::pen : glyph::camera;
+                const float btn_w = button_width(cv, mode_lbl, true, 114.0f);
+                const float text_w = cv.measure(hint, Font::SmallSemi);
+                const float hw = std::min(sz.width - 32.0f, 16.0f + text_w + 12.0f + btn_w + 8.0f);
+                const float hx = (sz.width - hw) * 0.5f;
+                const D2D1_RECT_F hr = rect(hx, 16.0f, hw, 38.0f);
+                cv.shadow(hr, 19.0f, 8.0f, 0.35f);
+                cv.fill_round(hr, 19.0f, with_alpha(cv.theme().surface, 0.94f));
+                cv.stroke_round(hr, 19.0f, with_alpha(cv.theme().outline_variant, 0.85f));
+                const float avail_text = std::max(60.0f, hw - btn_w - 34.0f);
+                cv.text(hint, rect(hx + 16.0f, hr.top, avail_text, height(hr)), Font::SmallSemi, cv.theme().on_surface);
+                draw_button(cv, hover_id_ == IdToggleInstant ? 1.0f : 0.0f,
+                            rect(hr.right - btn_w - 6.0f, hr.top + 5.0f, btn_w, 28.0f),
+                            mode_icon, mode_lbl, IdToggleInstant, 0, instant_capture_ ? 0 : 1);
+            }
         }
 
         // 8. Floating annotation & capture toolbar
@@ -521,21 +567,93 @@ private:
             (static_cast<float>(selection_.bottom) - mon_y) * inv_s);
 
         if (mode_ == OverlayMode::RecordRegion) {
-            const float rec_w = button_width(cv, L"Start Recording", true, 144.0f);
-            const float cancel_w = button_width(cv, L"Cancel", true, 90.0f);
-            const float tw = 10.0f + rec_w + 8.0f + cancel_w + 10.0f;
-            const float th = 48.0f;
+            const float rec_w = button_width(cv, L"Start Recording", true, 148.0f);
+            const float cancel_w = button_width(cv, L"Cancel", true, 88.0f);
+            const float pad = 12.0f;
+            const float toggle_w = 108.0f;
+            const float tw = std::min(sz.width - 24.0f, 430.0f);
+            const float th = 138.0f;
             const float tx = std::clamp(((sr.left + sr.right) * 0.5f) - (tw * 0.5f), 12.0f, std::max(12.0f, sz.width - tw - 12.0f));
             float ty = sr.bottom + 12.0f;
             if (ty + th > sz.height - 12.0f) ty = sr.top - th - 12.0f;
             ty = std::clamp(ty, 12.0f, std::max(12.0f, sz.height - th - 12.0f));
 
             const D2D1_RECT_F bar = rect(tx, ty, tw, th);
-            cv.shadow(bar, 12.0f, 10.0f, 0.42f);
+            cv.shadow(bar, 12.0f, 10.0f, 0.45f);
             cv.fill_round(bar, 12.0f, with_alpha(cv.theme().surface, 0.96f));
             cv.stroke_round(bar, 12.0f, cv.theme().outline_variant);
-            draw_button(cv, hover_id_ == IdCapture ? 1.0f : 0.0f, rect(tx + 10.0f, ty + 8.0f, rec_w, 32.0f), glyph::video, L"Start Recording", IdCapture, 0, 2);
-            draw_button(cv, hover_id_ == IdCancel ? 1.0f : 0.0f, rect(tx + 10.0f + rec_w + 8.0f, ty + 8.0f, cancel_w, 32.0f), glyph::close, L"Cancel", IdCancel, 0, 3);
+
+            const float inner_w = tw - (pad * 2.0f);
+            const float drop_w = std::max(110.0f, inner_w - toggle_w - 8.0f);
+            const float drop_x = tx + pad + toggle_w + 8.0f;
+
+            // Row 1: Desktop audio toggle + output device dropdown
+            const float y1 = ty + 10.0f;
+            const bool desk_on = sh_.settings.record_desktop_audio;
+            draw_button(cv, hover_id_ == IdRecDesktopToggle ? 1.0f : 0.0f,
+                        rect(tx + pad, y1, toggle_w, 32.0f),
+                        desk_on ? glyph::volume : glyph::mute, L"Desktop",
+                        IdRecDesktopToggle, 0, desk_on ? 1 : 0);
+            const D2D1_RECT_F desk_drop = rect(drop_x, y1, drop_w, 32.0f);
+            const std::wstring desk_lbl = resolve_audio_device_label(sh_.settings.record_desktop_device_id, desktop_devices_, L"Default Output");
+            draw_dropdown_field(cv, hover_id_ == IdRecDesktopDrop ? 1.0f : 0.0f, desk_drop, desk_lbl,
+                                open_dropdown_ == AudioDropdown::Desktop, desk_on && !desktop_devices_.empty(),
+                                desktop_devices_.empty() ? IdNone : IdRecDesktopDrop);
+
+            // Row 2: Microphone toggle + input device dropdown
+            const float y2 = y1 + 38.0f;
+            const bool mic_on = sh_.settings.record_mic_audio;
+            draw_button(cv, hover_id_ == IdRecMicToggle ? 1.0f : 0.0f,
+                        rect(tx + pad, y2, toggle_w, 32.0f),
+                        mic_on ? glyph::mic : glyph::mute, L"Mic",
+                        IdRecMicToggle, 0, mic_on ? 1 : 0);
+            const D2D1_RECT_F mic_drop = rect(drop_x, y2, drop_w, 32.0f);
+            const std::wstring mic_lbl = resolve_audio_device_label(sh_.settings.record_mic_device_id, mic_devices_, L"Default Mic");
+            draw_dropdown_field(cv, hover_id_ == IdRecMicDrop ? 1.0f : 0.0f, mic_drop, mic_lbl,
+                                open_dropdown_ == AudioDropdown::Mic, mic_on && !mic_devices_.empty(),
+                                mic_devices_.empty() ? IdNone : IdRecMicDrop);
+
+            // Divider + Row 3: Start Recording + summary + Cancel
+            const float div_y = y2 + 40.0f;
+            cv.hline(tx + pad, tx + tw - pad, div_y, with_alpha(cv.theme().outline_variant, 0.55f));
+            const float y3 = div_y + 8.0f;
+            draw_button(cv, hover_id_ == IdCapture ? 1.0f : 0.0f, rect(tx + pad, y3, rec_w, 32.0f),
+                        glyph::video, L"Start Recording", IdCapture, 0, 2);
+
+            const float mid_l = tx + pad + rec_w + 8.0f;
+            const float mid_r = tx + tw - pad - cancel_w - 8.0f;
+            if (mid_r - mid_l >= 64.0f) {
+                FixedWString<32> spec;
+                spec.assign(to_fixed_wstr<8>(sh_.settings.record_fps));
+                spec.append(L" FPS • ");
+                spec.append(to_fixed_wstr<8>(sh_.settings.record_bitrate_mbps));
+                spec.append(L"M");
+                cv.text(spec, D2D1::RectF(mid_l, y3, mid_r, y3 + 32.0f), Font::Caption, cv.theme().on_surface_variant, Align::Center);
+            }
+            draw_button(cv, hover_id_ == IdCancel ? 1.0f : 0.0f, rect(tx + tw - pad - cancel_w, y3, cancel_w, 32.0f),
+                        glyph::close, L"Cancel", IdCancel, 0, 3);
+
+            // Open audio device dropdown popup (rendered last so it wins hit-testing)
+            if (open_dropdown_ != AudioDropdown::None) {
+                const bool is_desk = (open_dropdown_ == AudioDropdown::Desktop);
+                const auto& devs = is_desk ? desktop_devices_ : mic_devices_;
+                const std::string& cur_id = is_desk ? sh_.settings.record_desktop_device_id : sh_.settings.record_mic_device_id;
+                std::vector<DropdownOption> opts;
+                opts.reserve(devs.size() + 1);
+                opts.push_back({
+                    .label = resolve_audio_device_label("", devs, is_desk ? L"System Default" : L"System Default"),
+                    .selected = cur_id.empty(),
+                    .index = -1,
+                });
+                for (size_t i = 0; i < devs.size(); ++i) {
+                    opts.push_back({
+                        .label = devs[i].name,
+                        .selected = (!cur_id.empty() && cur_id == devs[i].id),
+                        .index = static_cast<int>(i),
+                    });
+                }
+                draw_dropdown_popup(cv, is_desk ? desk_drop : mic_drop, sz, opts, IdRecDropdownItem, hover_id_, hover_idx_);
+            }
             return;
         }
 
@@ -801,6 +919,43 @@ private:
             case IdCancel:
                 cancel();
                 return;
+            case IdToggleInstant:
+                instant_capture_ = !instant_capture_;
+                break;
+            case IdRecDesktopToggle:
+                open_dropdown_ = AudioDropdown::None;
+                sh_.settings.record_desktop_audio = !sh_.settings.record_desktop_audio;
+                sh_.save();
+                if (sh_.on_redraw_all) sh_.on_redraw_all();
+                break;
+            case IdRecDesktopDrop:
+                open_dropdown_ = (open_dropdown_ == AudioDropdown::Desktop) ? AudioDropdown::None : AudioDropdown::Desktop;
+                break;
+            case IdRecMicToggle:
+                open_dropdown_ = AudioDropdown::None;
+                sh_.settings.record_mic_audio = !sh_.settings.record_mic_audio;
+                sh_.save();
+                if (sh_.on_redraw_all) sh_.on_redraw_all();
+                break;
+            case IdRecMicDrop:
+                open_dropdown_ = (open_dropdown_ == AudioDropdown::Mic) ? AudioDropdown::None : AudioDropdown::Mic;
+                break;
+            case IdRecDropdownItem:
+                if (open_dropdown_ == AudioDropdown::Desktop) {
+                    if (idx < 0) sh_.settings.record_desktop_device_id.clear();
+                    else if (std::cmp_less(idx, desktop_devices_.size())) sh_.settings.record_desktop_device_id = desktop_devices_[static_cast<size_t>(idx)].id;
+                    sh_.settings.record_desktop_audio = true;
+                    sh_.save();
+                    if (sh_.on_redraw_all) sh_.on_redraw_all();
+                } else if (open_dropdown_ == AudioDropdown::Mic) {
+                    if (idx < 0) sh_.settings.record_mic_device_id.clear();
+                    else if (std::cmp_less(idx, mic_devices_.size())) sh_.settings.record_mic_device_id = mic_devices_[static_cast<size_t>(idx)].id;
+                    sh_.settings.record_mic_audio = true;
+                    sh_.save();
+                    if (sh_.on_redraw_all) sh_.on_redraw_all();
+                }
+                open_dropdown_ = AudioDropdown::None;
+                break;
             default:
                 break;
         }
@@ -811,6 +966,12 @@ private:
         const D2D1_POINT_2F dip = to_local_dip(mw, lp);
         if (const Hit* h = hit_test(mw.hits, dip)) {
             on_toolbar_click(h->id, h->index);
+            return;
+        }
+
+        if (open_dropdown_ != AudioDropdown::None) {
+            open_dropdown_ = AudioDropdown::None;
+            render_all();
             return;
         }
 
@@ -993,6 +1154,10 @@ private:
                 has_selection_ = false;
             }
             drag_kind_ = DragKind::None;
+            if (has_selection_ && mode_ == OverlayMode::Screenshot && instant_capture_) {
+                confirm_capture();
+                return;
+            }
             render_all();
             return;
         }
@@ -1004,10 +1169,20 @@ private:
     void on_key_down(UINT vk) {
         const bool ctrl = GetKeyState(VK_CONTROL) < 0;
         if (vk == VK_ESCAPE) {
+            if (open_dropdown_ != AudioDropdown::None) {
+                open_dropdown_ = AudioDropdown::None;
+                render_all();
+                return;
+            }
             cancel();
             return;
         }
-        if (vk == VK_RETURN && has_selection_) {
+        if (vk == 'E' && !ctrl && !has_selection_ && mode_ == OverlayMode::Screenshot) {
+            instant_capture_ = !instant_capture_;
+            render_all();
+            return;
+        }
+        if (vk == VK_RETURN && has_selection_ && open_dropdown_ == AudioDropdown::None) {
             confirm_capture();
             return;
         }
@@ -1048,7 +1223,8 @@ private:
                 on_lbutton_down(mw, lp);
                 return 0;
             case WM_LBUTTONDBLCLK:
-                if (has_selection_ && tool_ == DrawTool::Select && rect_contains_pt(selection_, to_virtual_px(mw, lp))) {
+                if (open_dropdown_ == AudioDropdown::None && !hit_test(mw.hits, to_local_dip(mw, lp)) &&
+                    has_selection_ && tool_ == DrawTool::Select && rect_contains_pt(selection_, to_virtual_px(mw, lp))) {
                     confirm_capture();
                 }
                 return 0;
@@ -1059,7 +1235,10 @@ private:
                 on_lbutton_up(mw, lp);
                 return 0;
             case WM_RBUTTONDOWN:
-                if (has_selection_) {
+                if (open_dropdown_ != AudioDropdown::None) {
+                    open_dropdown_ = AudioDropdown::None;
+                    render_all();
+                } else if (has_selection_) {
                     has_selection_ = false;
                     annotations_.clear();
                     redo_stack_.clear();
@@ -1103,6 +1282,10 @@ private:
     wil::com_ptr<ID2D1StrokeStyle1> round_stroke_;
 
     bool has_selection_ = false;
+    bool instant_capture_ = true;
+    AudioDropdown open_dropdown_ = AudioDropdown::None;
+    std::vector<AudioDeviceInfo> desktop_devices_;
+    std::vector<AudioDeviceInfo> mic_devices_;
     RECT selection_{};
     std::optional<RECT> hover_snap_;
     std::optional<RECT> click_snap_candidate_;
