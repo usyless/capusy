@@ -25,7 +25,8 @@ enum class HotkeyAction : size_t {
     RegionScreenshot = 1,
     RegionRecord = 2,
     OpenHistory = 3,
-    Count = 4,
+    ColorPicker = 4,
+    Count = 5,
 };
 
 inline constexpr size_t HOTKEY_COUNT = static_cast<size_t>(HotkeyAction::Count);
@@ -63,6 +64,7 @@ inline constexpr uint32_t VK_PRINTSCREEN_CODE = 0x2Cu;
         case HotkeyAction::RegionScreenshot: return L"Region Screenshot";
         case HotkeyAction::RegionRecord: return L"Region Recording (Start / Stop)";
         case HotkeyAction::OpenHistory: return L"Open Screenshot History";
+        case HotkeyAction::ColorPicker: return L"Screen Color Picker";
         case HotkeyAction::Count: break;
     }
     return L"Shortcut";
@@ -74,6 +76,7 @@ inline constexpr uint32_t VK_PRINTSCREEN_CODE = 0x2Cu;
         case HotkeyAction::RegionScreenshot: return L"Freezes all monitors, snaps to windows & elements (instant or edit mode)";
         case HotkeyAction::RegionRecord: return L"Select a region to record MP4 video; press again to stop";
         case HotkeyAction::OpenHistory: return L"Shows the screenshot history and preview window";
+        case HotkeyAction::ColorPicker: return L"Freezes all monitors, shows RGB under cursor, and copies #HEX on click";
         case HotkeyAction::Count: break;
     }
     return L"";
@@ -87,6 +90,7 @@ inline constexpr uint32_t VK_PRINTSCREEN_CODE = 0x2Cu;
         case HotkeyAction::RegionScreenshot: return {.enabled = true, .mods = kAltShift, .vk = '2'};
         case HotkeyAction::RegionRecord: return {.enabled = true, .mods = kAltShift, .vk = '3'};
         case HotkeyAction::OpenHistory: return {.enabled = true, .mods = kAltShift, .vk = 'H'};
+        case HotkeyAction::ColorPicker: return {.enabled = true, .mods = kAltShift, .vk = 'C'};
         case HotkeyAction::Count: break;
     }
 #else

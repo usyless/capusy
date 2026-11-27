@@ -3,6 +3,8 @@
 #include "canvas.hpp"
 #include "shared.hpp"
 
+#include <capusy/color_logic.hpp>
+
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -54,6 +56,7 @@ public:
         if (!hwnd_ || !sh_.settings.show_corner_toast) return;
         if (!sh_.gfx.ensure_device(hwnd_)) return;
 
+        color_mode_ = false;
         path_ = path;
         is_video_ = is_video;
         video_badge_.assign(video_badge.empty() ? L"MP4" : video_badge);
@@ -134,6 +137,59 @@ public:
         if (sh_.on_visibility_changed) sh_.on_visibility_changed();
     }
 
+    void show_color(Rgb8 rgb, std::wstring_view hex_str, std::wstring_view rgb_str, bool copied) {
+        if (!hwnd_ || !sh_.settings.show_corner_toast) return;
+        if (!sh_.gfx.ensure_device(hwnd_)) return;
+
+        color_mode_ = true;
+        picked_rgb_ = rgb;
+        color_hex_.assign(hex_str);
+        color_rgb_.assign(rgb_str);
+        path_.clear();
+        is_video_ = false;
+        copied_ = copied;
+        thumb_bmp_.reset();
+
+        const HMONITOR primary = MonitorFromPoint(POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY);
+        MONITORINFO mi{.cbSize = sizeof(mi)};
+        GetMonitorInfoW(primary, &mi);
+        UINT dx = 96;
+        UINT dy = 96;
+        if (FAILED(GetDpiForMonitor(primary, MDT_EFFECTIVE_DPI, &dx, &dy)) || dx == 0) dx = 96;
+        const float s = static_cast<float>(dx) / 96.0f;
+
+        const float w_dip = std::clamp(sh_.settings.toast_width_dip, 210.0f, 320.0f);
+        constexpr float h_dip = 70.0f;
+        const int px_w = static_cast<int>(std::lround(w_dip * s));
+        const int px_h = static_cast<int>(std::lround(h_dip * s));
+        const int margin = static_cast<int>(std::lround(16.0f * s));
+        const int x = mi.rcWork.right - px_w - margin;
+        const int y = mi.rcWork.bottom - px_h - margin;
+
+        SetWindowPos(hwnd_, HWND_TOPMOST, x, y, px_w, px_h, SWP_NOACTIVATE);
+        if (!target_.ready()) {
+            if (!target_.attach(sh_.gfx, hwnd_)) return;
+        } else {
+            (void)target_.resize(static_cast<UINT>(px_w), static_cast<UINT>(px_h));
+        }
+
+        shown_ = true;
+        fading_out_ = false;
+        hovered_ = false;
+        elapsed_s_ = 0.0f;
+        timeout_s_ = std::clamp(sh_.settings.toast_timeout_s, 1.0f, 15.0f);
+        if (opacity_.value < 0.05f) opacity_.snap(0.0f);
+        opacity_.set(1.0f, true);
+        last_tick_ = std::chrono::steady_clock::now();
+
+        render();
+        cloak_window(hwnd_, false);
+        ShowWindow(hwnd_, SW_SHOWNOACTIVATE);
+        SetWindowPos(hwnd_, HWND_TOPMOST, x, y, px_w, px_h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        SetTimer(hwnd_, TIMER_ANIM, 16, nullptr);
+        if (sh_.on_visibility_changed) sh_.on_visibility_changed();
+    }
+
     void hide_immediate() noexcept {
         if (!hwnd_) return;
         const bool was = shown_;
@@ -189,31 +245,44 @@ private:
             cv.fill_round(card, 12.0f, with_alpha(cv.theme().surface, 0.96f));
             cv.stroke_round(card, 12.0f, hovered_ ? cv.theme().primary : cv.theme().outline_variant, hovered_ ? 1.5f : 1.0f);
 
-            const D2D1_RECT_F img_r = D2D1::RectF(6.0f, 6.0f, sz.width - 6.0f, sz.height - 30.0f);
-            cv.fill_round(img_r, 8.0f, cv.theme().surface_lowest);
-            if (thumb_bmp_) {
-                cv.fill_bitmap_round(thumb_bmp_.get(), img_r, 8.0f, ThumbFit::Contain);
-            } else {
-                cv.icon(is_video_ ? glyph::video : glyph::photo, img_r, cv.theme().primary, Font::IconLarge);
-            }
+            if (color_mode_) {
+                const D2D1_RECT_F sw = rect(10.0f, 10.0f, 44.0f, 44.0f);
+                cv.fill_round(sw, 9.0f, hex(rgb_to_u32(picked_rgb_)));
+                cv.stroke_round(sw, 9.0f, with_alpha(cv.theme().on_surface, 0.35f), 1.0f);
 
-            if (is_video_) {
-                const D2D1_RECT_F badge = rect(img_r.right - 46.0f, img_r.top + 6.0f, 40.0f, 18.0f);
-                cv.fill_round(badge, 5.0f, with_alpha(cv.theme().surface_lowest, 0.85f));
-                cv.text(video_badge_, badge, Font::Label, cv.theme().amber, Align::Center);
-            }
-
-            // Footer metadata
-            FixedWString<64> meta;
-            if (meta_w_ > 0 && meta_h_ > 0) {
-                meta.assign(to_fixed_wstr<16>(meta_w_));
-                meta.append(L"×");
-                meta.append(to_fixed_wstr<16>(meta_h_));
+                const float tx = sw.right + 10.0f;
+                const float tw = std::max(40.0f, sz.width - tx - 10.0f);
+                FixedWString<48> line1{color_hex_.view()};
+                if (copied_) line1.append(L"  •  Copied");
+                cv.text(line1, rect(tx, 11.0f, tw, 22.0f), Font::BodySemi, cv.theme().on_surface);
+                cv.text(color_rgb_, rect(tx, 33.0f, tw, 20.0f), Font::MonoSmall, cv.theme().on_surface_variant);
             } else {
-                meta.assign(L"Captured");
+                const D2D1_RECT_F img_r = D2D1::RectF(6.0f, 6.0f, sz.width - 6.0f, sz.height - 30.0f);
+                cv.fill_round(img_r, 8.0f, cv.theme().surface_lowest);
+                if (thumb_bmp_) {
+                    cv.fill_bitmap_round(thumb_bmp_.get(), img_r, 8.0f, ThumbFit::Contain);
+                } else {
+                    cv.icon(is_video_ ? glyph::video : glyph::photo, img_r, cv.theme().primary, Font::IconLarge);
+                }
+
+                if (is_video_) {
+                    const D2D1_RECT_F badge = rect(img_r.right - 46.0f, img_r.top + 6.0f, 40.0f, 18.0f);
+                    cv.fill_round(badge, 5.0f, with_alpha(cv.theme().surface_lowest, 0.85f));
+                    cv.text(video_badge_, badge, Font::Label, cv.theme().amber, Align::Center);
+                }
+
+                // Footer metadata
+                FixedWString<64> meta;
+                if (meta_w_ > 0 && meta_h_ > 0) {
+                    meta.assign(to_fixed_wstr<16>(meta_w_));
+                    meta.append(L"×");
+                    meta.append(to_fixed_wstr<16>(meta_h_));
+                } else {
+                    meta.assign(L"Captured");
+                }
+                if (copied_) meta.append(L"  •  Copied");
+                cv.text(meta, D2D1::RectF(10.0f, sz.height - 28.0f, sz.width - 10.0f, sz.height - 6.0f), Font::Caption, cv.theme().on_surface_variant);
             }
-            if (copied_) meta.append(L"  •  Copied");
-            cv.text(meta, D2D1::RectF(10.0f, sz.height - 28.0f, sz.width - 10.0f, sz.height - 6.0f), Font::Caption, cv.theme().on_surface_variant);
 
             // Auto-hide countdown bar
             const float frac = std::clamp(1.0f - (elapsed_s_ / std::max(0.1f, timeout_s_)), 0.0f, 1.0f);
@@ -296,6 +365,10 @@ private:
     uint32_t meta_h_ = 0;
     bool is_video_ = false;
     FixedWString<16> video_badge_{L"MP4"};
+    bool color_mode_ = false;
+    Rgb8 picked_rgb_{};
+    FixedWString<16> color_hex_;
+    FixedWString<32> color_rgb_;
     bool copied_ = false;
     bool shown_ = false;
     bool fading_out_ = false;

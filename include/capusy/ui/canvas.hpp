@@ -58,6 +58,8 @@ inline constexpr wchar_t undo = 0xE7A7;
 inline constexpr wchar_t redo = 0xE7A6;
 inline constexpr wchar_t history = 0xE81C;
 inline constexpr wchar_t monitor = 0xE7F4;
+inline constexpr wchar_t palette = 0xE790;
+inline constexpr wchar_t eyedropper = 0xEF3C;
 } // namespace glyph
 
 enum class Font : uint8_t {

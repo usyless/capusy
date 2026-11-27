@@ -6,6 +6,7 @@
 
 #include <capusy/audio_capture.hpp>
 #include <capusy/capture.hpp>
+#include <capusy/color_logic.hpp>
 
 #include <algorithm>
 #include <array>
@@ -22,7 +23,10 @@ namespace capusy::ui {
 enum class OverlayMode : uint8_t {
     Screenshot = 0,
     RecordRegion = 1,
+    ColorPicker = 2,
 };
+
+inline constexpr float HIGHLIGHTER_OPACITY = 0.24f;
 
 enum class DrawTool : uint8_t {
     Select = 0,
@@ -44,8 +48,9 @@ struct Annotation {
 
 /// Renders a single annotation onto `dc` shifted by `(-offset_x, -offset_y)` and divided by `scale`
 /// (pass `scale = 1.0f` for 1:1 physical export, or `monitor_dpi / 96.0f` for DPI-aware overlay display).
-inline void render_annotation(ID2D1DeviceContext6* dc, ID2D1SolidColorBrush* brush, ID2D1StrokeStyle* round_stroke,
-                              const Annotation& a, float offset_x, float offset_y, float scale) noexcept {
+inline void render_annotation(ID2D1DeviceContext6* dc, ID2D1Factory* factory, ID2D1SolidColorBrush* brush,
+                              ID2D1StrokeStyle* round_stroke, const Annotation& a,
+                              float offset_x, float offset_y, float scale) noexcept {
     if (!dc || !brush || a.points.empty()) return;
     const float inv_s = scale > 0.0f ? (1.0f / scale) : 1.0f;
     const auto to_local = [&](D2D1_POINT_2F p) noexcept -> D2D1_POINT_2F {
@@ -55,7 +60,7 @@ inline void render_annotation(ID2D1DeviceContext6* dc, ID2D1SolidColorBrush* bru
     const float w = std::max(1.0f, a.thickness * inv_s);
     D2D1_COLOR_F col = a.color;
     if (a.tool == DrawTool::Highlighter) {
-        col.a = 0.36f;
+        col.a = HIGHLIGHTER_OPACITY;
     }
     brush->SetColor(col);
 
@@ -66,10 +71,40 @@ inline void render_annotation(ID2D1DeviceContext6* dc, ID2D1SolidColorBrush* bru
             if (a.points.size() == 1) {
                 const D2D1_POINT_2F p = to_local(a.points[0]);
                 dc->FillEllipse(D2D1::Ellipse(p, stroke_w * 0.5f, stroke_w * 0.5f), brush);
-            } else {
-                for (size_t i = 1; i < a.points.size(); ++i) {
-                    dc->DrawLine(to_local(a.points[i - 1]), to_local(a.points[i]), brush, stroke_w, round_stroke);
+                break;
+            }
+            // Build a single unified PathGeometry (with quadratic midpoint smoothing) so Direct2D
+            // widens and composites the whole stroke once — eliminating overlapping-circle beads
+            // on translucent highlighter strokes and jagged polyline corners.
+            wil::com_ptr<ID2D1Factory> fallback_factory;
+            ID2D1Factory* fac = factory;
+            if (!fac) {
+                dc->GetFactory(&fallback_factory);
+                fac = fallback_factory.get();
+            }
+            wil::com_ptr<ID2D1PathGeometry> path;
+            wil::com_ptr<ID2D1GeometrySink> sink;
+            if (fac && SUCCEEDED(fac->CreatePathGeometry(&path)) && path && SUCCEEDED(path->Open(&sink)) && sink) {
+                sink->BeginFigure(to_local(a.points[0]), D2D1_FIGURE_BEGIN_HOLLOW);
+                if (a.points.size() == 2) {
+                    sink->AddLine(to_local(a.points[1]));
+                } else {
+                    for (size_t i = 1; i + 1 < a.points.size(); ++i) {
+                        const D2D1_POINT_2F cur = to_local(a.points[i]);
+                        const D2D1_POINT_2F next = to_local(a.points[i + 1]);
+                        const D2D1_POINT_2F mid{.x = (cur.x + next.x) * 0.5f, .y = (cur.y + next.y) * 0.5f};
+                        sink->AddQuadraticBezier(D2D1::QuadraticBezierSegment(cur, mid));
+                    }
+                    sink->AddLine(to_local(a.points.back()));
                 }
+                sink->EndFigure(D2D1_FIGURE_END_OPEN);
+                if (SUCCEEDED(sink->Close())) {
+                    dc->DrawGeometry(path.get(), brush, stroke_w, round_stroke);
+                    break;
+                }
+            }
+            for (size_t i = 1; i < a.points.size(); ++i) {
+                dc->DrawLine(to_local(a.points[i - 1]), to_local(a.points[i]), brush, stroke_w, round_stroke);
             }
             break;
         }
@@ -134,9 +169,11 @@ public:
 
     std::function<void(Raster&&, WindowInfo&&)> on_screenshot_captured;
     std::function<void(RECT, WindowInfo&&)> on_record_region_selected;
+    std::function<void(Rgb8)> on_color_picked;
     std::function<void()> on_closed;
 
     [[nodiscard]] bool active() const noexcept { return !monitors_.empty(); }
+    [[nodiscard]] OverlayMode mode() const noexcept { return mode_; }
 
     bool start(HINSTANCE inst, OverlayMode mode, bool include_cursor) {
         cancel();
@@ -148,10 +185,11 @@ public:
         if (!sh_.gfx.ensure_device(nullptr)) {
             return false;
         }
-        foreground_info_ = foreground_window_info();
-        auto cap = capture_virtual_screen(include_cursor, sh_.gfx.d3d());
+        foreground_info_ = (mode_ == OverlayMode::ColorPicker) ? WindowInfo{} : foreground_window_info();
+        const bool snap_cursor = (mode_ == OverlayMode::ColorPicker) ? false : include_cursor;
+        auto cap = capture_virtual_screen(snap_cursor, sh_.gfx.d3d());
         if (!cap || cap->monitors.empty()) return false;
-        snaps_ = enumerate_snap_targets(cap->monitors);
+        snaps_ = (mode_ == OverlayMode::ColorPicker) ? SnapTargets{} : enumerate_snap_targets(cap->monitors);
         capture_ = std::move(*cap);
         ensure_stroke_style();
 
@@ -200,12 +238,16 @@ public:
         active_annotation_.reset();
         hover_id_ = IdNone;
         hover_idx_ = 0;
+        color_picker_open_ = false;
+        annotation_dropper_active_ = false;
+        sync_picker_hsv_from_current();
         tooltip_.clear(nullptr, 0, false);
         tooltip_hwnd_ = nullptr;
 
         POINT cur{};
         GetCursorPos(&cur);
-        hover_snap_ = hit_snap_rect(snaps_, cur);
+        cursor_vpt_ = cur;
+        hover_snap_ = (mode_ == OverlayMode::ColorPicker) ? std::nullopt : hit_snap_rect(snaps_, cur);
 
         // 2. Create one native-DPI overlay HWND per physical monitor!
         HWND primary_or_cursor_hwnd = nullptr;
@@ -294,6 +336,12 @@ public:
         redo_stack_.clear();
         active_annotation_.reset();
         round_stroke_.reset();
+        picker_sv_bmp_.reset();
+        picker_hue_bmp_.reset();
+        picker_bmp_dc_ = nullptr;
+        picker_sv_bmp_h_ = -1.0f;
+        color_picker_open_ = false;
+        annotation_dropper_active_ = false;
         has_selection_ = false;
         drag_kind_ = DragKind::None;
         open_dropdown_ = AudioDropdown::None;
@@ -310,6 +358,11 @@ private:
         IdNone = 0,
         IdTool,
         IdColor,
+        IdColorPicker,
+        IdColorDropper,
+        IdPickerPanel,
+        IdPickerSV,
+        IdPickerHue,
         IdThick,
         IdUndo,
         IdRedo,
@@ -337,6 +390,8 @@ private:
         Moving,
         ResizeNW, ResizeN, ResizeNE, ResizeE, ResizeSE, ResizeS, ResizeSW, ResizeW,
         Drawing,
+        PickingSV,
+        PickingHue,
     };
 
     struct MonitorWindow {
@@ -439,6 +494,24 @@ private:
             cv.dc()->DrawBitmap(mw.frozen_bmp.get(), D2D1::RectF(0.0f, 0.0f, sz.width, sz.height), 1.0f, D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR);
         }
 
+        if (mode_ == OverlayMode::ColorPicker) {
+            const bool cursor_here = rect_contains_pt(mw.info.rect, cursor_vpt_);
+            if (cursor_here) {
+                const std::wstring_view hint = L"Click to copy #HEX  •  Arrow keys to nudge  •  Esc to cancel";
+                const float hw = std::min(sz.width - 32.0f, cv.measure(hint, Font::SmallSemi) + 28.0f);
+                const float cy_dip = (static_cast<float>(cursor_vpt_.y) - mon_y) * inv_s;
+                const float hy = (cy_dip < 96.0f) ? (sz.height - 50.0f) : 16.0f;
+                const D2D1_RECT_F hr = rect((sz.width - hw) * 0.5f, hy, hw, 34.0f);
+                cv.shadow(hr, 17.0f, 8.0f, 0.35f);
+                cv.fill_round(hr, 17.0f, with_alpha(cv.theme().surface, 0.94f));
+                cv.stroke_round(hr, 17.0f, with_alpha(cv.theme().outline_variant, 0.85f));
+                cv.text(hint, hr, Font::SmallSemi, cv.theme().on_surface, Align::Center);
+
+                draw_color_loupe(mw, cv);
+            }
+            return;
+        }
+
         // Determine active spotlight rect (either selected region or hover snap target)
         const std::optional<RECT> spot = has_selection_ ? std::optional<RECT>{selection_} : hover_snap_;
 
@@ -468,11 +541,12 @@ private:
             if (has_selection_ && mode_ == OverlayMode::Screenshot && cl.right > cl.left && cl.bottom > cl.top) {
                 cv.push_clip(cl);
                 ID2D1SolidColorBrush* br = mw.target.solid_brush();
+                ID2D1Factory* fac = sh_.gfx.d2d_factory();
                 for (const Annotation& a : annotations_) {
-                    render_annotation(cv.dc(), br, round_stroke_.get(), a, mon_x, mon_y, s);
+                    render_annotation(cv.dc(), fac, br, round_stroke_.get(), a, mon_x, mon_y, s);
                 }
                 if (active_annotation_) {
-                    render_annotation(cv.dc(), br, round_stroke_.get(), *active_annotation_, mon_x, mon_y, s);
+                    render_annotation(cv.dc(), fac, br, round_stroke_.get(), *active_annotation_, mon_x, mon_y, s);
                 }
                 cv.pop_clip();
             }
@@ -556,14 +630,21 @@ private:
             draw_toolbar(mw, cv, mon_x, mon_y, inv_s);
         }
 
+        // 8b. Live eyedropper pixel loupe when picking an annotation color from the screen
+        if (mode_ == OverlayMode::Screenshot && annotation_dropper_active_ &&
+            drag_kind_ == DragKind::None && hover_id_ == IdNone &&
+            rect_contains_pt(mw.info.rect, cursor_vpt_)) {
+            draw_color_loupe(mw, cv);
+        }
+
         // 9. Floating hover tooltip (topmost above toolbar)
-        if (mw.hwnd == tooltip_hwnd_ && open_dropdown_ == AudioDropdown::None && drag_kind_ == DragKind::None) {
+        if (mw.hwnd == tooltip_hwnd_ && open_dropdown_ == AudioDropdown::None && !color_picker_open_ && drag_kind_ == DragKind::None) {
             draw_tooltip(cv, sz, tooltip_.anchor, tooltip_.title, tooltip_.subtitle, tooltip_.alpha.value);
         }
     }
 
     [[nodiscard]] bool has_tooltip(int id, int idx) const noexcept {
-        if (open_dropdown_ != AudioDropdown::None) return false;
+        if (open_dropdown_ != AudioDropdown::None || color_picker_open_) return false;
         switch (id) {
             case IdUndo:
             case IdRedo:
@@ -571,6 +652,8 @@ private:
             case IdCapture:
             case IdCancel:
             case IdToggleInstant:
+            case IdColorPicker:
+            case IdColorDropper:
             case IdRecDesktopToggle:
             case IdRecDesktopDrop:
             case IdRecMicToggle:
@@ -591,7 +674,7 @@ private:
     bool build_tooltip(int id, int idx, std::wstring& title, std::wstring& subtitle) const {
         title.clear();
         subtitle.clear();
-        if (open_dropdown_ != AudioDropdown::None) return false;
+        if (open_dropdown_ != AudioDropdown::None || color_picker_open_) return false;
         switch (id) {
             case IdToggleInstant:
                 if (instant_capture_) {
@@ -637,8 +720,16 @@ private:
                 }
             }
             case IdUndo: title = L"Undo (Ctrl+Z)"; return true;
-            case IdRedo: title = L"Redo (Ctrl+Y)"; return true;
+            case IdRedo: title = L"Redo (Ctrl+Y / Ctrl+Shift+Z)"; return true;
             case IdClear: title = L"Clear all annotations"; return true;
+            case IdColorPicker:
+                title = L"Custom color picker";
+                subtitle = std::wstring{format_hex_rgb(u32_to_rgb(current_color_rgb_)).view()};
+                return true;
+            case IdColorDropper:
+                title = annotation_dropper_active_ ? L"Cancel color dropper (Esc)" : L"Pick color from screen";
+                subtitle = L"Click any pixel on screen to use its color";
+                return true;
             case IdCapture:
                 if (mode_ == OverlayMode::RecordRegion) {
                     title = L"Start recording (Enter)";
@@ -864,8 +955,9 @@ private:
         float row1_w = 10.0f;
         for (const auto& tb : tools) row1_w += (tb.label[0] ? 48.0f : 34.0f) + 4.0f;
         row1_w += 10.0f + (32.0f * 3.0f) + (4.0f * 2.0f) + 10.0f + cap_w + 6.0f + 34.0f + 10.0f;
+        const float row2_w = 14.0f + (static_cast<float>(PALETTE.size()) * 28.0f) + 4.0f + 30.0f + 4.0f + 30.0f + 18.0f + (static_cast<float>(THICKNESSES.size()) * 34.0f) + 10.0f;
 
-        const float tw = std::min(sz.width - 24.0f, row1_w);
+        const float tw = std::min(sz.width - 24.0f, show_style_row ? std::max(row1_w, row2_w) : row1_w);
         const float th = show_style_row ? 88.0f : 48.0f;
         const float tx = std::clamp(((sr.left + sr.right) * 0.5f) - (tw * 0.5f), 12.0f, std::max(12.0f, sz.width - tw - 12.0f));
         float ty = sr.bottom + 12.0f;
@@ -909,15 +1001,36 @@ private:
             const float y2 = ty + 48.0f;
             cv.hline(tx + 10.0f, tx + tw - 10.0f, ty + 44.0f, with_alpha(cv.theme().outline_variant, 0.55f));
             float cx = tx + 14.0f;
+            bool in_palette = false;
             for (size_t i = 0; i < PALETTE.size(); ++i) {
                 const D2D1_RECT_F sr_col = rect(cx, y2 + 4.0f, 24.0f, 24.0f);
                 const D2D1_POINT_2F center{.x = cx + 12.0f, .y = y2 + 16.0f};
-                const bool sel = (color_idx_ == i);
+                const bool sel = (current_color_rgb_ == PALETTE[i]);
+                if (sel) in_palette = true;
                 cv.fill_circle(center, sel ? 9.0f : 7.5f, hex(PALETTE[i]));
                 cv.stroke_circle(center, sel ? 10.5f : 8.0f, sel ? cv.theme().primary : with_alpha(cv.theme().on_surface, 0.35f), sel ? 2.0f : 1.0f);
                 cv.hit(sr_col, IdColor, static_cast<int>(i));
                 cx += 28.0f;
             }
+
+            // Custom color picker button + screen color dropper button right next to the base colors
+            cx += 4.0f;
+            const D2D1_RECT_F pick_r = rect(cx, y2 + 2.0f, 30.0f, 28.0f);
+            color_picker_anchor_ = pick_r;
+            if (!in_palette) {
+                const Rgb8 cur_rgb = u32_to_rgb(current_color_rgb_);
+                cv.fill_round(pick_r, 8.0f, hex(current_color_rgb_));
+                cv.stroke_round(pick_r, 8.0f, cv.theme().primary, 2.0f);
+                cv.icon(glyph::palette, pick_r, is_light_rgb(cur_rgb) ? hex(0x141218) : hex(0xffffff), Font::IconSmall);
+                cv.hit(pick_r, IdColorPicker);
+            } else {
+                draw_button(cv, hover_id_ == IdColorPicker ? 1.0f : 0.0f, pick_r, glyph::palette, L"", IdColorPicker, 0, color_picker_open_ ? 1 : 3);
+            }
+            cx += 34.0f;
+
+            const D2D1_RECT_F drop_r = rect(cx, y2 + 2.0f, 30.0f, 28.0f);
+            draw_button(cv, hover_id_ == IdColorDropper ? 1.0f : 0.0f, drop_r, glyph::eyedropper, L"", IdColorDropper, 0, annotation_dropper_active_ ? 1 : 3);
+            cx += 30.0f;
 
             cv.vline(cx + 6.0f, y2 + 4.0f, y2 + 28.0f, with_alpha(cv.theme().outline_variant, 0.7f));
             cx += 18.0f;
@@ -931,7 +1044,252 @@ private:
                 cv.hit(tr, IdThick, static_cast<int>(i));
                 cx += 34.0f;
             }
+
+            if (color_picker_open_) {
+                draw_color_picker_popover(mw, cv, bar);
+            }
         }
+    }
+
+    // ------------------------------------------------------------------------------------------
+    // Color Picker Popover & Magnified Screen Color Loupe
+    // ------------------------------------------------------------------------------------------
+
+    [[nodiscard]] Rgb8 sample_screen_rgb(POINT vpt) const noexcept {
+        if (!capture_) return {};
+        const int rx = vpt.x - capture_->bounds.left;
+        const int ry = vpt.y - capture_->bounds.top;
+        if (const auto c = sample_bgra_pixel(capture_->raster.pixels, capture_->raster.w, capture_->raster.h, rx, ry)) {
+            return *c;
+        }
+        return {};
+    }
+
+    void sync_picker_hsv_from_current() noexcept {
+        const Hsv hsv = rgb_to_hsv(u32_to_rgb(current_color_rgb_));
+        picker_h_ = hsv.h;
+        picker_s_ = hsv.s;
+        picker_v_ = hsv.v;
+    }
+
+    void set_current_color_rgb(uint32_t rgb) noexcept {
+        current_color_rgb_ = rgb & 0xFFFFFFu;
+        sync_picker_hsv_from_current();
+    }
+
+    void ensure_picker_bitmaps(ID2D1DeviceContext6* dc) noexcept {
+        if (!dc) return;
+        if (picker_bmp_dc_ != dc) {
+            picker_sv_bmp_.reset();
+            picker_hue_bmp_.reset();
+            picker_sv_bmp_h_ = -1.0f;
+            picker_bmp_dc_ = dc;
+        }
+        const auto props = D2D1::BitmapProperties1(
+            D2D1_BITMAP_OPTIONS_NONE,
+            D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_IGNORE), 96.0f, 96.0f);
+
+        if (!picker_hue_bmp_) {
+            constexpr uint32_t hw = 256;
+            std::array<uint8_t, hw * 4u> buf; // NOLINT(cppcoreguidelines-pro-type-member-init)
+            for (uint32_t x = 0; x < hw; ++x) {
+                const Rgb8 c = hsv_to_rgb((static_cast<float>(x) / static_cast<float>(hw - 1)) * 360.0f, 1.0f, 1.0f);
+                buf[x * 4u + 0u] = c.b;
+                buf[x * 4u + 1u] = c.g;
+                buf[x * 4u + 2u] = c.r;
+                buf[x * 4u + 3u] = 255;
+            }
+            (void)dc->CreateBitmap(D2D1::SizeU(hw, 1), buf.data(), hw * 4u, &props, &picker_hue_bmp_);
+        }
+
+        if (!picker_sv_bmp_ || std::abs(picker_sv_bmp_h_ - picker_h_) > 0.05f) {
+            constexpr uint32_t sw = 64;
+            constexpr uint32_t sh = 64;
+            std::array<uint8_t, sw * sh * 4u> buf; // NOLINT(cppcoreguidelines-pro-type-member-init)
+            for (uint32_t y = 0; y < sh; ++y) {
+                const float v = 1.0f - (static_cast<float>(y) / static_cast<float>(sh - 1));
+                for (uint32_t x = 0; x < sw; ++x) {
+                    const float s = static_cast<float>(x) / static_cast<float>(sw - 1);
+                    const Rgb8 c = hsv_to_rgb(picker_h_, s, v);
+                    const size_t idx = (static_cast<size_t>(y) * sw + x) * 4u;
+                    buf[idx + 0u] = c.b;
+                    buf[idx + 1u] = c.g;
+                    buf[idx + 2u] = c.r;
+                    buf[idx + 3u] = 255;
+                }
+            }
+            picker_sv_bmp_.reset();
+            if (SUCCEEDED(dc->CreateBitmap(D2D1::SizeU(sw, sh), buf.data(), sw * 4u, &props, &picker_sv_bmp_))) {
+                picker_sv_bmp_h_ = picker_h_;
+            }
+        }
+    }
+
+    void draw_color_picker_popover(MonitorWindow& mw, Canvas& cv, D2D1_RECT_F toolbar_rect) {
+        const D2D1_SIZE_F sz = mw.target.size();
+        constexpr float pad = 12.0f;
+        constexpr float sv_w = 204.0f;
+        constexpr float sv_h = 126.0f;
+        constexpr float hue_h = 14.0f;
+        constexpr float info_h = 26.0f;
+        constexpr float pop_w = sv_w + (pad * 2.0f);
+        constexpr float pop_h = pad + sv_h + 10.0f + hue_h + 10.0f + info_h + pad;
+
+        const float anchor_cx = (color_picker_anchor_.left + color_picker_anchor_.right) * 0.5f;
+        const float px = std::clamp(anchor_cx - (pop_w * 0.5f), 12.0f, std::max(12.0f, sz.width - pop_w - 12.0f));
+        float py = toolbar_rect.bottom + 8.0f;
+        if (py + pop_h > sz.height - 12.0f) {
+            py = toolbar_rect.top - pop_h - 8.0f;
+        }
+        py = std::clamp(py, 12.0f, std::max(12.0f, sz.height - pop_h - 12.0f));
+
+        const D2D1_RECT_F panel = rect(px, py, pop_w, pop_h);
+        picker_panel_rect_ = panel;
+        cv.shadow(panel, 12.0f, 12.0f, 0.50f);
+        cv.fill_round(panel, 12.0f, with_alpha(cv.theme().surface, 0.98f));
+        cv.stroke_round(panel, 12.0f, cv.theme().outline_variant);
+        cv.hit(panel, IdPickerPanel);
+
+        ensure_picker_bitmaps(cv.dc());
+
+        // 2D Saturation / Value square
+        const D2D1_RECT_F sv_r = rect(px + pad, py + pad, sv_w, sv_h);
+        picker_sv_rect_ = sv_r;
+        if (picker_sv_bmp_) {
+            cv.dc()->DrawBitmap(picker_sv_bmp_.get(), sv_r, 1.0f, D2D1_INTERPOLATION_MODE_LINEAR);
+        }
+        cv.stroke(sv_r, with_alpha(cv.theme().outline_variant, 0.9f), 1.0f);
+        const D2D1_POINT_2F sv_pt{
+            .x = sv_r.left + (std::clamp(picker_s_, 0.0f, 1.0f) * width(sv_r)),
+            .y = sv_r.top + ((1.0f - std::clamp(picker_v_, 0.0f, 1.0f)) * height(sv_r)),
+        };
+        cv.stroke_circle(sv_pt, 6.0f, hex(0x000000, 0.85f), 2.5f);
+        cv.stroke_circle(sv_pt, 6.0f, hex(0xffffff), 1.5f);
+        cv.hit(sv_r, IdPickerSV);
+
+        // Horizontal Hue rainbow slider
+        const D2D1_RECT_F hue_r = rect(px + pad, sv_r.bottom + 10.0f, sv_w, hue_h);
+        picker_hue_rect_ = hue_r;
+        if (picker_hue_bmp_) {
+            cv.dc()->DrawBitmap(picker_hue_bmp_.get(), hue_r, 1.0f, D2D1_INTERPOLATION_MODE_LINEAR);
+        }
+        cv.stroke(hue_r, with_alpha(cv.theme().outline_variant, 0.9f), 1.0f);
+        const float hx = hue_r.left + ((std::clamp(picker_h_, 0.0f, 360.0f) / 360.0f) * width(hue_r));
+        const D2D1_POINT_2F hue_pt{.x = hx, .y = (hue_r.top + hue_r.bottom) * 0.5f};
+        cv.fill_circle(hue_pt, 7.0f, hex(rgb_to_u32(hsv_to_rgb(picker_h_, 1.0f, 1.0f))));
+        cv.stroke_circle(hue_pt, 7.5f, hex(0x000000, 0.75f), 2.5f);
+        cv.stroke_circle(hue_pt, 7.5f, hex(0xffffff), 1.5f);
+        cv.hit(D2D1::RectF(hue_r.left - 4.0f, hue_r.top - 4.0f, hue_r.right + 4.0f, hue_r.bottom + 4.0f), IdPickerHue);
+
+        // Live color swatch + HEX & RGB readout
+        const float iy = hue_r.bottom + 10.0f;
+        const Rgb8 rgb = u32_to_rgb(current_color_rgb_);
+        const D2D1_RECT_F sw_r = rect(px + pad, iy, 28.0f, info_h);
+        cv.fill_round(sw_r, 6.0f, hex(current_color_rgb_));
+        cv.stroke_round(sw_r, 6.0f, with_alpha(cv.theme().on_surface, 0.35f), 1.0f);
+
+        const FixedWString<16> hex_lbl = format_hex_rgb(rgb);
+        const FixedWString<32> rgb_lbl = format_rgb_label(rgb);
+        cv.text(hex_lbl, rect(sw_r.right + 8.0f, iy, 64.0f, info_h), Font::MonoSmall, cv.theme().on_surface);
+        cv.text(rgb_lbl, D2D1::RectF(sw_r.right + 72.0f, iy, px + pop_w - pad, iy + info_h), Font::Caption, cv.theme().on_surface_variant, Align::Right);
+    }
+
+    void draw_color_loupe(MonitorWindow& mw, Canvas& cv) const noexcept {
+        const D2D1_SIZE_F sz = mw.target.size();
+        const float inv_s = 1.0f / mw.target.scale();
+        const float cx = (static_cast<float>(cursor_vpt_.x) - static_cast<float>(mw.info.rect.left)) * inv_s;
+        const float cy = (static_cast<float>(cursor_vpt_.y) - static_cast<float>(mw.info.rect.top)) * inv_s;
+
+        const Rgb8 center_rgb = sample_screen_rgb(cursor_vpt_);
+
+        // Subtle pixel-precision crosshair reticle around the sampled pixel (leaves center pixel unobscured)
+        const D2D1_COLOR_F ret_outer = is_light_rgb(center_rgb) ? hex(0x000000, 0.85f) : hex(0xffffff, 0.90f);
+        const float px_dip = std::max(1.0f, inv_s);
+        cv.stroke(D2D1::RectF(cx - px_dip, cy - px_dip, cx + (px_dip * 2.0f), cy + (px_dip * 2.0f)), ret_outer, 1.2f);
+
+        constexpr int half = 6; // 13 x 13 zoomed pixel grid
+        constexpr int grid_n = (half * 2) + 1;
+        constexpr float cell = 13.0f;
+        constexpr float grid_sz = static_cast<float>(grid_n) * cell; // 169 DIPs
+        constexpr float pad = 10.0f;
+        constexpr float card_w = grid_sz + (pad * 2.0f); // 189 DIPs
+        constexpr float footer_h = 34.0f;
+        constexpr float card_h = pad + grid_sz + 8.0f + footer_h + pad; // 231 DIPs
+
+        float lx = cx + 22.0f;
+        float ly = cy + 22.0f;
+        if (lx + card_w > sz.width - 10.0f) lx = cx - card_w - 22.0f;
+        if (ly + card_h > sz.height - 10.0f) ly = cy - card_h - 22.0f;
+        lx = std::clamp(lx, 10.0f, std::max(10.0f, sz.width - card_w - 10.0f));
+        ly = std::clamp(ly, 10.0f, std::max(10.0f, sz.height - card_h - 10.0f));
+
+        const D2D1_RECT_F card = rect(lx, ly, card_w, card_h);
+        cv.shadow(card, 12.0f, 12.0f, 0.50f);
+        cv.fill_round(card, 12.0f, with_alpha(cv.theme().surface_lowest, 0.96f));
+        cv.stroke_round(card, 12.0f, with_alpha(cv.theme().outline_variant, 0.95f));
+
+        const float gx0 = lx + pad;
+        const float gy0 = ly + pad;
+        for (int dy = -half; dy <= half; ++dy) {
+            for (int dx = -half; dx <= half; ++dx) {
+                const Rgb8 c = sample_screen_rgb({.x = cursor_vpt_.x + dx, .y = cursor_vpt_.y + dy});
+                const float x0 = gx0 + (static_cast<float>(dx + half) * cell);
+                const float y0 = gy0 + (static_cast<float>(dy + half) * cell);
+                cv.fill(D2D1::RectF(x0, y0, x0 + cell, y0 + cell), hex(rgb_to_u32(c)));
+            }
+        }
+
+        // Subtle pixel grid lines
+        const D2D1_COLOR_F grid_line = hex(0x000000, 0.22f);
+        for (int i = 1; i < grid_n; ++i) {
+            const float off = static_cast<float>(i) * cell;
+            cv.vline(gx0 + off, gy0, gy0 + grid_sz, grid_line);
+            cv.hline(gx0, gx0 + grid_sz, gy0 + off, grid_line);
+        }
+        cv.stroke(rect(gx0, gy0, grid_sz, grid_sz), with_alpha(cv.theme().outline_variant, 0.9f), 1.0f);
+
+        // Highlight the exact center pixel cell
+        const D2D1_RECT_F center_cell = rect(gx0 + (static_cast<float>(half) * cell), gy0 + (static_cast<float>(half) * cell), cell, cell);
+        cv.stroke(D2D1::RectF(center_cell.left - 1.0f, center_cell.top - 1.0f, center_cell.right + 1.0f, center_cell.bottom + 1.0f),
+                  hex(0x000000, 0.85f), 1.5f);
+        cv.stroke(center_cell, hex(0xffffff), 1.5f);
+
+        // Bottom color swatch + RGB & #HEX readouts
+        const float fy = gy0 + grid_sz + 8.0f;
+        const D2D1_RECT_F sw_r = rect(gx0, fy + 2.0f, 30.0f, 30.0f);
+        cv.fill_round(sw_r, 7.0f, hex(rgb_to_u32(center_rgb)));
+        cv.stroke_round(sw_r, 7.0f, with_alpha(cv.theme().on_surface, 0.35f), 1.0f);
+
+        const float tx = sw_r.right + 8.0f;
+        const float tw = (lx + card_w - pad) - tx;
+        const FixedWString<32> rgb_lbl = format_rgb_label(center_rgb);
+        const FixedWString<16> hex_lbl = format_hex_rgb(center_rgb);
+        cv.text(rgb_lbl, rect(tx, fy, tw, 17.0f), Font::MonoSmall, cv.theme().on_surface);
+        cv.text(hex_lbl, rect(tx, fy + 17.0f, tw, 17.0f), Font::MonoSmall, cv.theme().primary);
+    }
+
+    void update_picker_sv(D2D1_POINT_2F dip) noexcept {
+        const float rw = std::max(1.0f, width(picker_sv_rect_));
+        const float rh = std::max(1.0f, height(picker_sv_rect_));
+        picker_s_ = std::clamp((dip.x - picker_sv_rect_.left) / rw, 0.0f, 1.0f);
+        picker_v_ = 1.0f - std::clamp((dip.y - picker_sv_rect_.top) / rh, 0.0f, 1.0f);
+        current_color_rgb_ = rgb_to_u32(hsv_to_rgb(picker_h_, picker_s_, picker_v_));
+    }
+
+    void update_picker_hue(D2D1_POINT_2F dip) noexcept {
+        const float rw = std::max(1.0f, width(picker_hue_rect_));
+        picker_h_ = std::clamp((dip.x - picker_hue_rect_.left) / rw, 0.0f, 1.0f) * 360.0f;
+        if (picker_h_ >= 360.0f) picker_h_ = 359.99f;
+        current_color_rgb_ = rgb_to_u32(hsv_to_rgb(picker_h_, picker_s_, picker_v_));
+    }
+
+    void nudge_cursor(int dx, int dy) {
+        if (!capture_) return;
+        const LONG nx = std::clamp<LONG>(cursor_vpt_.x + dx, capture_->bounds.left, capture_->bounds.right - 1);
+        const LONG ny = std::clamp<LONG>(cursor_vpt_.y + dy, capture_->bounds.top, capture_->bounds.bottom - 1);
+        cursor_vpt_ = {.x = nx, .y = ny};
+        SetCursorPos(nx, ny);
+        render_all();
     }
 
     // ------------------------------------------------------------------------------------------
@@ -970,8 +1328,9 @@ private:
         dc->DrawBitmap(src_bmp.get(), D2D1::RectF(0.0f, 0.0f, static_cast<float>(base->w), static_cast<float>(base->h)));
         const float ox = static_cast<float>(selection_.left);
         const float oy = static_cast<float>(selection_.top);
+        ID2D1Factory* fac = sh_.gfx.d2d_factory();
         for (const Annotation& a : annotations_) {
-            render_annotation(dc.get(), brush.get(), round_stroke_.get(), a, ox, oy, 1.0f);
+            render_annotation(dc.get(), fac, brush.get(), round_stroke_.get(), a, ox, oy, 1.0f);
         }
         const HRESULT end_hr = dc->EndDraw();
         dc->SetTarget(nullptr);
@@ -1052,8 +1411,14 @@ private:
 
     void update_cursor(const MonitorWindow& mw, POINT vpt, const Hit* h) noexcept {
         HCURSOR cur = cursor_cross_;
-        if (h) {
-            cur = cursor_hand_;
+        if (mode_ == OverlayMode::ColorPicker) {
+            cur = cursor_cross_;
+        } else if (h) {
+            if (h->id == IdPickerSV) cur = cursor_cross_;
+            else if (h->id == IdPickerPanel) cur = cursor_arrow_;
+            else cur = cursor_hand_;
+        } else if (annotation_dropper_active_) {
+            cur = cursor_cross_;
         } else if (has_selection_) {
             if (tool_ != DrawTool::Select && rect_contains_pt(selection_, vpt)) {
                 cur = cursor_cross_;
@@ -1080,10 +1445,30 @@ private:
         switch (id) {
             case IdTool:
                 tool_ = static_cast<DrawTool>(idx);
+                annotation_dropper_active_ = false;
+                if (tool_ == DrawTool::Select) color_picker_open_ = false;
                 break;
             case IdColor:
-                if (idx >= 0 && std::cmp_less(idx, PALETTE.size())) color_idx_ = static_cast<size_t>(idx);
+                if (idx >= 0 && std::cmp_less(idx, PALETTE.size())) {
+                    set_current_color_rgb(PALETTE[static_cast<size_t>(idx)]);
+                }
+                annotation_dropper_active_ = false;
                 break;
+            case IdColorPicker:
+                color_picker_open_ = !color_picker_open_;
+                if (color_picker_open_) {
+                    annotation_dropper_active_ = false;
+                    sync_picker_hsv_from_current();
+                }
+                break;
+            case IdColorDropper:
+                annotation_dropper_active_ = !annotation_dropper_active_;
+                if (annotation_dropper_active_) {
+                    color_picker_open_ = false;
+                }
+                break;
+            case IdPickerPanel:
+                return;
             case IdThick:
                 if (idx >= 0 && std::cmp_less(idx, THICKNESSES.size())) thick_idx_ = static_cast<size_t>(idx);
                 break;
@@ -1160,11 +1545,52 @@ private:
         render_all();
     }
 
+    void confirm_screen_color(POINT vpt) {
+        const Rgb8 rgb = sample_screen_rgb(vpt);
+        auto cb = on_color_picked;
+        cancel();
+        if (cb) cb(rgb);
+    }
+
     void on_lbutton_down(MonitorWindow& mw, LPARAM lp) {
+        const POINT vpt = to_virtual_px(mw, lp);
+        cursor_vpt_ = vpt;
+        if (mode_ == OverlayMode::ColorPicker) {
+            confirm_screen_color(vpt);
+            return;
+        }
+
         const bool tip_vis = dismiss_tooltip();
         const D2D1_POINT_2F dip = to_local_dip(mw, lp);
         if (const Hit* h = hit_test(mw.hits, dip)) {
+            if (h->id == IdPickerSV) {
+                drag_kind_ = DragKind::PickingSV;
+                SetCapture(mw.hwnd);
+                update_picker_sv(dip);
+                render_all();
+                return;
+            }
+            if (h->id == IdPickerHue) {
+                drag_kind_ = DragKind::PickingHue;
+                SetCapture(mw.hwnd);
+                update_picker_hue(dip);
+                render_all();
+                return;
+            }
             on_toolbar_click(h->id, h->index);
+            return;
+        }
+
+        if (color_picker_open_) {
+            color_picker_open_ = false;
+            render_all();
+            return;
+        }
+
+        if (annotation_dropper_active_) {
+            set_current_color_rgb(rgb_to_u32(sample_screen_rgb(vpt)));
+            annotation_dropper_active_ = false;
+            render_all();
             return;
         }
 
@@ -1174,14 +1600,13 @@ private:
             return;
         }
 
-        const POINT vpt = to_virtual_px(mw, lp);
         SetCapture(mw.hwnd);
 
         if (has_selection_ && tool_ != DrawTool::Select && mode_ == OverlayMode::Screenshot) {
             drag_kind_ = DragKind::Drawing;
             Annotation a;
             a.tool = tool_;
-            a.color = hex(PALETTE[color_idx_]);
+            a.color = hex(current_color_rgb_);
             a.thickness = THICKNESSES[thick_idx_] * mw.target.scale();
             a.points.push_back(D2D1::Point2F(static_cast<float>(vpt.x), static_cast<float>(vpt.y)));
             active_annotation_ = std::move(a);
@@ -1213,8 +1638,25 @@ private:
 
     void on_mouse_move(MonitorWindow& mw, LPARAM lp) {
         const POINT vpt = to_virtual_px(mw, lp);
+        cursor_vpt_ = vpt;
+        if (mode_ == OverlayMode::ColorPicker) {
+            update_cursor(mw, vpt, nullptr);
+            render_all();
+            return;
+        }
         const bool snap_on = (GetKeyState(VK_MENU) >= 0); // hold Alt to bypass magnetic snap
         const LONG snap_px = static_cast<LONG>(std::lround(10.0f * mw.target.scale()));
+
+        if (drag_kind_ == DragKind::PickingSV) {
+            update_picker_sv(to_local_dip(mw, lp));
+            render_all();
+            return;
+        }
+        if (drag_kind_ == DragKind::PickingHue) {
+            update_picker_hue(to_local_dip(mw, lp));
+            render_all();
+            return;
+        }
 
         if (drag_kind_ == DragKind::None) {
             const D2D1_POINT_2F dip = to_local_dip(mw, lp);
@@ -1222,7 +1664,7 @@ private:
             const int nid = h ? h->id : IdNone;
             const int nidx = h ? h->index : 0;
             const bool mon_changed = (tooltip_hwnd_ != mw.hwnd);
-            bool need_render = (nid != hover_id_ || nidx != hover_idx_);
+            bool need_render = (nid != hover_id_ || nidx != hover_idx_) || annotation_dropper_active_;
             if (need_render || (mon_changed && nid != IdNone)) {
                 if (mon_changed && tooltip_hwnd_) {
                     KillTimer(tooltip_hwnd_, TIMER_TOOLTIP);
@@ -1382,7 +1824,33 @@ private:
 
     void on_key_down(UINT vk) {
         const bool ctrl = GetKeyState(VK_CONTROL) < 0;
+        const bool shift = GetKeyState(VK_SHIFT) < 0;
+        if (mode_ == OverlayMode::ColorPicker) {
+            if (vk == VK_ESCAPE) {
+                cancel();
+                return;
+            }
+            if (vk == VK_RETURN || vk == VK_SPACE) {
+                confirm_screen_color(cursor_vpt_);
+                return;
+            }
+            if (vk == VK_LEFT)  { nudge_cursor(-1, 0); return; }
+            if (vk == VK_RIGHT) { nudge_cursor(1, 0); return; }
+            if (vk == VK_UP)    { nudge_cursor(0, -1); return; }
+            if (vk == VK_DOWN)  { nudge_cursor(0, 1); return; }
+            return;
+        }
         if (vk == VK_ESCAPE) {
+            if (color_picker_open_) {
+                color_picker_open_ = false;
+                render_all();
+                return;
+            }
+            if (annotation_dropper_active_) {
+                annotation_dropper_active_ = false;
+                render_all();
+                return;
+            }
             if (open_dropdown_ != AudioDropdown::None) {
                 open_dropdown_ = AudioDropdown::None;
                 render_all();
@@ -1390,6 +1858,12 @@ private:
             }
             cancel();
             return;
+        }
+        if (annotation_dropper_active_) {
+            if (vk == VK_LEFT)  { nudge_cursor(-1, 0); return; }
+            if (vk == VK_RIGHT) { nudge_cursor(1, 0); return; }
+            if (vk == VK_UP)    { nudge_cursor(0, -1); return; }
+            if (vk == VK_DOWN)  { nudge_cursor(0, 1); return; }
         }
         if (vk == 'E' && !ctrl && !has_selection_ && mode_ == OverlayMode::Screenshot) {
             instant_capture_ = !instant_capture_;
@@ -1401,7 +1875,7 @@ private:
             return;
         }
         if (ctrl && vk == 'Z') {
-            on_toolbar_click(IdUndo, 0);
+            on_toolbar_click(shift ? IdRedo : IdUndo, 0);
             return;
         }
         if (ctrl && vk == 'Y') {
@@ -1484,7 +1958,15 @@ private:
                 return 0;
             case WM_RBUTTONDOWN:
                 dismiss_tooltip();
-                if (open_dropdown_ != AudioDropdown::None) {
+                if (mode_ == OverlayMode::ColorPicker) {
+                    cancel();
+                } else if (color_picker_open_) {
+                    color_picker_open_ = false;
+                    render_all();
+                } else if (annotation_dropper_active_) {
+                    annotation_dropper_active_ = false;
+                    render_all();
+                } else if (open_dropdown_ != AudioDropdown::None) {
                     open_dropdown_ = AudioDropdown::None;
                     render_all();
                 } else if (has_selection_) {
@@ -1552,7 +2034,21 @@ private:
     RECT drag_orig_sel_{};
 
     DrawTool tool_ = DrawTool::Select;
-    size_t color_idx_ = 0;
+    uint32_t current_color_rgb_ = PALETTE[0];
+    float picker_h_ = 0.0f;
+    float picker_s_ = 1.0f;
+    float picker_v_ = 1.0f;
+    bool color_picker_open_ = false;
+    bool annotation_dropper_active_ = false;
+    POINT cursor_vpt_{};
+    D2D1_RECT_F color_picker_anchor_{};
+    D2D1_RECT_F picker_panel_rect_{};
+    D2D1_RECT_F picker_sv_rect_{};
+    D2D1_RECT_F picker_hue_rect_{};
+    ID2D1DeviceContext6* picker_bmp_dc_ = nullptr;
+    wil::com_ptr<ID2D1Bitmap1> picker_sv_bmp_;
+    wil::com_ptr<ID2D1Bitmap1> picker_hue_bmp_;
+    float picker_sv_bmp_h_ = -1.0f;
     size_t thick_idx_ = 1;
     std::vector<Annotation> annotations_;
     std::vector<Annotation> redo_stack_;

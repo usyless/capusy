@@ -34,6 +34,7 @@ enum TrayMenuId : UINT {
     IdTrayFull = 200,
     IdTrayRegion,
     IdTrayRecord,
+    IdTrayColorPicker,
     IdTrayHistory,
     IdTraySettings,
     IdTrayUpdate,
@@ -150,6 +151,7 @@ private:
         sh_.on_capture_full = [this] { trigger_full_screenshot(); };
         sh_.on_capture_region = [this] { trigger_region_screenshot(); };
         sh_.on_toggle_record = [this] { trigger_toggle_recording(); };
+        sh_.on_color_picker = [this] { trigger_color_picker(); };
         sh_.on_open_history = [this] {
             history_win_->show();
             settings_win_->maybe_auto_check_updates();
@@ -188,6 +190,15 @@ private:
         region_overlay_->on_record_region_selected = [this](RECT region, WindowInfo&& win_info) {
             start_region_recording(region, std::move(win_info));
         };
+        region_overlay_->on_color_picked = [this](Rgb8 rgb) {
+            const FixedWString<16> hex_str = format_hex_rgb(rgb);
+            const FixedWString<32> rgb_str = format_rgb_label(rgb);
+            const bool copied = set_clipboard_text(tray_hwnd_, hex_str.view());
+            if (sh_.settings.show_corner_toast) {
+                toast_win_->show_color(rgb, hex_str.view(), rgb_str.view(), copied);
+            }
+            schedule_idle_trim();
+        };
         region_overlay_->on_closed = [this] { schedule_idle_trim(); };
 
         rec_overlay_->on_stop_clicked = [this] { stop_region_recording(); };
@@ -213,8 +224,9 @@ private:
 
     void trigger_region_screenshot() {
         if (region_overlay_->active()) {
+            const bool same = (region_overlay_->mode() == OverlayMode::Screenshot);
             region_overlay_->cancel();
-            return;
+            if (same) return;
         }
         (void)region_overlay_->start(inst_, OverlayMode::Screenshot, sh_.settings.capture_cursor);
     }
@@ -225,10 +237,20 @@ private:
             return;
         }
         if (region_overlay_->active()) {
+            const bool same = (region_overlay_->mode() == OverlayMode::RecordRegion);
             region_overlay_->cancel();
-            return;
+            if (same) return;
         }
         (void)region_overlay_->start(inst_, OverlayMode::RecordRegion, false);
+    }
+
+    void trigger_color_picker() {
+        if (region_overlay_->active()) {
+            const bool same = (region_overlay_->mode() == OverlayMode::ColorPicker);
+            region_overlay_->cancel();
+            if (same) return;
+        }
+        (void)region_overlay_->start(inst_, OverlayMode::ColorPicker, false);
     }
 
     void start_region_recording(RECT region, WindowInfo win_info) {
@@ -628,6 +650,7 @@ private:
         AppendMenuW(menu.get(), MF_STRING, IdTrayRegion, menu_label(L"Region Screenshot", HotkeyAction::RegionScreenshot).c_str());
         AppendMenuW(menu.get(), MF_STRING, IdTrayRecord,
                     menu_label(recorder_.recording() ? L"Stop Region Recording" : L"Region Recording", HotkeyAction::RegionRecord).c_str());
+        AppendMenuW(menu.get(), MF_STRING, IdTrayColorPicker, menu_label(L"Screen Color Picker", HotkeyAction::ColorPicker).c_str());
         AppendMenuW(menu.get(), MF_SEPARATOR, 0, nullptr);
         AppendMenuW(menu.get(), MF_STRING, IdTrayHistory, menu_label(L"Open History", HotkeyAction::OpenHistory).c_str());
         AppendMenuW(menu.get(), MF_STRING, IdTraySettings, L"Settings");
@@ -653,6 +676,7 @@ private:
             case IdTrayFull: trigger_full_screenshot(); break;
             case IdTrayRegion: trigger_region_screenshot(); break;
             case IdTrayRecord: trigger_toggle_recording(); break;
+            case IdTrayColorPicker: trigger_color_picker(); break;
             case IdTrayHistory:
                 history_win_->show();
                 settings_win_->maybe_auto_check_updates();
@@ -698,6 +722,7 @@ private:
                 else if (idx == static_cast<int>(HotkeyAction::RegionScreenshot)) trigger_region_screenshot();
                 else if (idx == static_cast<int>(HotkeyAction::RegionRecord)) trigger_toggle_recording();
                 else if (idx == static_cast<int>(HotkeyAction::OpenHistory)) history_win_->show();
+                else if (idx == static_cast<int>(HotkeyAction::ColorPicker)) trigger_color_picker();
                 return 0;
             }
             case WM_APP_CALL:

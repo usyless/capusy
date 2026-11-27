@@ -22,6 +22,7 @@ struct Settings {
     HotkeyBinding hk_region = default_hotkey(HotkeyAction::RegionScreenshot);
     HotkeyBinding hk_record = default_hotkey(HotkeyAction::RegionRecord);
     HotkeyBinding hk_history = default_hotkey(HotkeyAction::OpenHistory);
+    HotkeyBinding hk_color_picker = default_hotkey(HotkeyAction::ColorPicker);
 
     // Capture behavior & output format
     std::string save_dir;
@@ -93,6 +94,7 @@ struct Settings {
             case HotkeyAction::RegionScreenshot: return hk_region;
             case HotkeyAction::RegionRecord: return hk_record;
             case HotkeyAction::OpenHistory: return hk_history;
+            case HotkeyAction::ColorPicker: return hk_color_picker;
             case HotkeyAction::Count: break;
         }
         return hk_full;
@@ -104,13 +106,14 @@ struct Settings {
             case HotkeyAction::RegionScreenshot: return hk_region;
             case HotkeyAction::RegionRecord: return hk_record;
             case HotkeyAction::OpenHistory: return hk_history;
+            case HotkeyAction::ColorPicker: return hk_color_picker;
             case HotkeyAction::Count: break;
         }
         return hk_full;
     }
 
     [[nodiscard]] std::array<HotkeyBinding, HOTKEY_COUNT> all_hotkeys() const noexcept {
-        return {hk_full, hk_region, hk_record, hk_history};
+        return {hk_full, hk_region, hk_record, hk_history, hk_color_picker};
     }
 };
 

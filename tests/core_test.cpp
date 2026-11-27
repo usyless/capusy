@@ -2,6 +2,7 @@
 
 #include <capusy/audio_capture.hpp>
 #include <capusy/capture_logic.hpp>
+#include <capusy/color_logic.hpp>
 #include <capusy/history_store.hpp>
 #include <capusy/hotkeys.hpp>
 #include <capusy/recording_logic.hpp>
@@ -44,6 +45,7 @@ static void test_hotkey_collisions() {
         {.enabled = true, .mods = MOD_ALT | MOD_SHIFT, .vk = '2'},
         {.enabled = true, .mods = MOD_ALT | MOD_SHIFT, .vk = '3'},
         {.enabled = true, .mods = MOD_ALT | MOD_SHIFT, .vk = 'H'},
+        {.enabled = true, .mods = MOD_ALT | MOD_SHIFT, .vk = 'C'},
     }};
 
     for (size_t i = 0; i < HOTKEY_COUNT; ++i) {
@@ -561,6 +563,56 @@ static void test_recording_logic() {
     CHECK(format_recording_spec_summary(RecordFormat::Gif, VideoCodec::H264, RateControlMode::Vbr, 60, 12, 80, 50, 128) == L"GIF • 30 FPS • 128c • 50%");
 }
 
+static void test_color_logic() {
+    using namespace capusy;
+
+    const Rgb8 coral{.r = 255, .g = 92, .b = 92};
+    CHECK(rgb_to_u32(coral) == 0xFF5C5Cu);
+    CHECK(u32_to_rgb(0xFF5C5Cu) == coral);
+    CHECK(format_hex_rgb(coral) == L"#FF5C5C");
+    CHECK(format_rgb_label(coral) == L"RGB(255, 92, 92)");
+    const Rgb8 dark_blue{0, 15, 160};
+    const Rgb8 white{255, 255, 255};
+    const Rgb8 yellow{255, 212, 59};
+    const Rgb8 dark_ink{20, 18, 24};
+    CHECK(format_hex_rgb(dark_blue) == L"#000FA0");
+    CHECK(format_rgb_label(dark_blue) == L"RGB(0, 15, 160)");
+
+    CHECK(is_light_rgb(white));
+    CHECK(is_light_rgb(yellow));
+    CHECK(!is_light_rgb(dark_ink));
+
+    // HSV <-> RGB round-trips across primaries & neutral tones
+    const std::array<Rgb8, 8> samples = {{
+        {255, 0, 0}, {0, 255, 0}, {0, 0, 255}, {255, 255, 0},
+        {0, 255, 255}, {255, 0, 255}, {255, 255, 255}, {0, 0, 0},
+    }};
+    for (const Rgb8 s : samples) {
+        const Hsv h = rgb_to_hsv(s);
+        const Rgb8 back = hsv_to_rgb(h.h, h.s, h.v);
+        CHECK(back == s);
+    }
+    const Rgb8 mid{.r = 77, .g = 171, .b = 247};
+    const Hsv mh = rgb_to_hsv(mid);
+    const Rgb8 mback = hsv_to_rgb(mh.h, mh.s, mh.v);
+    CHECK(std::abs(static_cast<int>(mback.r) - static_cast<int>(mid.r)) <= 1);
+    CHECK(std::abs(static_cast<int>(mback.g) - static_cast<int>(mid.g)) <= 1);
+    CHECK(std::abs(static_cast<int>(mback.b) - static_cast<int>(mid.b)) <= 1);
+
+    // BGRA pixel sampling + bounds checks
+    const std::array<uint8_t, 16> bgra = {
+        0x10, 0x20, 0x30, 0xFF,  0x40, 0x50, 0x60, 0xFF,
+        0x70, 0x80, 0x90, 0xFF,  0xAA, 0xBB, 0xCC, 0xFF,
+    };
+    const Rgb8 exp00{0x30, 0x20, 0x10};
+    const Rgb8 exp11{0xCC, 0xBB, 0xAA};
+    CHECK(sample_bgra_pixel(bgra, 2, 2, 0, 0) == exp00);
+    CHECK(sample_bgra_pixel(bgra, 2, 2, 1, 1) == exp11);
+    CHECK(!sample_bgra_pixel(bgra, 2, 2, -1, 0).has_value());
+    CHECK(!sample_bgra_pixel(bgra, 2, 2, 2, 0).has_value());
+    CHECK(!sample_bgra_pixel(bgra, 2, 2, 0, 2).has_value());
+}
+
 int main() {
     test_startup_logic();
     test_hotkey_collisions();
@@ -572,5 +624,6 @@ int main() {
     test_ui_primitives();
     test_audio_capture_helpers();
     test_recording_logic();
+    test_color_logic();
     return capusy::test::failures == 0 ? 0 : 1;
 }

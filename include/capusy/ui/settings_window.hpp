@@ -1449,25 +1449,49 @@ private:
     float draw_tab_about(Canvas& cv, float x, float y, float w) {
         const float lx = x + 22.0f;
         const float rw = w - 44.0f;
-        const float card_h = 260.0f;
+        const std::wstring ver = ulp::str::concat_strings(L"Version ", APP_VERSION, L"  •  by usy");
+        const std::wstring ai_title = L"AI-generated codebase";
+        const std::wstring ai_desc = L"All source code in capusy was written by AI.";
+        const float box_pad_x = 18.0f;
+        const float box_inner_w = std::max(120.0f, rw - (box_pad_x * 2.0f));
+        const float ai_title_h = text_height(cv, ai_title, Font::BodySemi, box_inner_w, 22.0f);
+        const float ai_desc_h = text_height(cv, ai_desc, Font::Small, box_inner_w, 18.0f);
+        const float box_h = 14.0f + ai_title_h + 4.0f + ai_desc_h + 14.0f;
+
+        constexpr float icon_sz = 72.0f;
+        const float icon_y = y + 28.0f;
+        const float name_y = icon_y + icon_sz + 14.0f;
+        const float ver_y = name_y + 28.0f;
+        const float line_y = ver_y + 22.0f + 16.0f;
+        const float box_y = line_y + 18.0f;
+        const float db_info_y = box_y + box_h + 16.0f;
+        const float db_path_y = db_info_y + 22.0f;
+        const float card_h = (db_path_y + 20.0f + 20.0f) - y;
         const float next_y = card_begin(cv, x, y, w, card_h, CARD_GAP);
 
-        const D2D1_RECT_F icon_r = cv.snap(rect(x + ((w - 72.0f) * 0.5f), y + 28.0f, 72.0f, 72.0f));
+        const D2D1_RECT_F icon_r = cv.snap(rect(x + ((w - icon_sz) * 0.5f), icon_y, icon_sz, icon_sz));
         if (ID2D1Bitmap1* bmp = ensure_app_icon(cv)) cv.bitmap(bmp, icon_r);
         else cv.icon(glyph::camera, icon_r, cv.theme().primary, Font::IconLarge);
 
-        cv.text(APP_NAME, rect(lx, y + 112.0f, rw, 26.0f), Font::Title, cv.theme().on_surface, Align::Center);
-        const std::wstring ver = ulp::str::concat_strings(L"Version ", APP_VERSION, L"  •  Win32 + Direct2D 1.3 + SQLite");
-        cv.text(ver, rect(lx, y + 140.0f, rw, 22.0f), Font::Body, cv.theme().on_surface_variant, Align::Center);
+        cv.text(APP_NAME, rect(lx, name_y, rw, 26.0f), Font::Title, cv.theme().on_surface, Align::Center);
+        cv.text(ver, rect(lx, ver_y, rw, 22.0f), Font::Body, cv.theme().on_surface_variant, Align::Center);
+        cv.hline(lx, lx + rw, line_y, with_alpha(cv.theme().outline_variant, 0.5f));
 
-        cv.hline(lx, lx + rw, y + 178.0f, with_alpha(cv.theme().outline_variant, 0.5f));
+        const D2D1_RECT_F box_r = rect(lx, box_y, rw, box_h);
+        const float box_rad = offset_radius(cv.theme().card_radius, -2.0f);
+        cv.fill_round(box_r, box_rad, with_alpha(cv.theme().surface_high, 0.55f));
+        cv.stroke_round(box_r, box_rad, with_alpha(cv.theme().outline_variant, 0.45f));
+        cv.text_wrap(ai_title, rect(lx + box_pad_x, box_y + 14.0f, box_inner_w, ai_title_h),
+                     Font::BodySemi, cv.theme().on_surface, Align::Center);
+        cv.text_wrap(ai_desc, rect(lx + box_pad_x, box_y + 14.0f + ai_title_h + 4.0f, box_inner_w, ai_desc_h),
+                     Font::Small, cv.theme().on_surface_variant, Align::Center);
 
         const std::wstring db_info = ulp::str::concat_strings(
             L"History database: ", format_count(stats_.total_count), L" captures (",
             format_count(stats_.image_count), L" images, ", format_count(stats_.video_count), L" videos)  •  ",
             format_size(stats_.db_bytes));
-        cv.text(db_info, rect(lx, y + 196.0f, rw, 22.0f), Font::Small, cv.theme().on_surface_variant, Align::Center);
-        cv.text(history_db_path().wstring(), rect(lx, y + 220.0f, rw, 20.0f), Font::MonoSmall, cv.theme().outline, Align::Center);
+        cv.text(db_info, rect(lx, db_info_y, rw, 22.0f), Font::Small, cv.theme().on_surface_variant, Align::Center);
+        cv.text(history_db_path().wstring(), rect(lx, db_path_y, rw, 20.0f), Font::MonoSmall, cv.theme().outline, Align::Center);
         y = next_y;
 
         // Software Updates card (modeled on usyseek)

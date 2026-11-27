@@ -273,6 +273,7 @@ private:
         IdBtnFull,
         IdBtnRegion,
         IdBtnRecord,
+        IdBtnColorPicker,
         IdBtnSettings,
         IdSearchBox,
         IdSearchClear,
@@ -490,6 +491,7 @@ private:
             case IdBtnFull:
             case IdBtnRegion:
             case IdBtnRecord:
+            case IdBtnColorPicker:
             case IdBtnSettings:
             case IdSearchBox:
             case IdSearchClear:
@@ -530,6 +532,10 @@ private:
             case IdBtnRecord:
                 title = sh_.recording_active ? L"Stop region recording" : L"Start region recording";
                 subtitle = hotkey_subtitle(HotkeyAction::RegionRecord);
+                return true;
+            case IdBtnColorPicker:
+                title = L"Pick screen color";
+                subtitle = hotkey_subtitle(HotkeyAction::ColorPicker);
                 return true;
             case IdBtnSettings:
                 title = sh_.has_update_available() ? L"Settings (Update available)" : L"Open settings";
@@ -600,6 +606,7 @@ private:
                 title = sel_n > 1
                     ? ulp::str::concat_strings(L"Delete ", format_count(sel_n).view(), L" files & remove from history (Del)")
                     : L"Delete file & remove from history (Del)";
+                subtitle = L"Hold Shift to delete immediately without confirmation";
                 return true;
             case IdVideoPlay: {
                 const bool playing = video_.is_scrubbing() ? video_.want_play() : video_.is_playing();
@@ -633,6 +640,7 @@ private:
 
         // Action buttons on right
         const float set_w = button_width(cv, L"Settings", true, 98.0f);
+        const float color_w = button_width(cv, L"Color", true, 78.0f);
         const wchar_t* rec_lbl = sh_.recording_active ? L"Stop Rec" : L"Record";
         const float rec_w = button_width(cv, rec_lbl, true, 96.0f);
         const float reg_w = button_width(cv, L"Region", true, 92.0f);
@@ -645,6 +653,8 @@ private:
         if (sh_.has_update_available()) {
             cv.fill_circle({.x = set_r.right - 7.0f, .y = set_r.top + 7.0f}, 4.0f, cv.theme().primary);
         }
+        rx -= 8.0f + color_w;
+        draw_button(cv, hover_.alpha(IdBtnColorPicker), rect(rx, 11.0f, color_w, 32.0f), glyph::eyedropper, L"Color", IdBtnColorPicker, 0, 0);
         rx -= 8.0f + rec_w;
         draw_button(cv, hover_.alpha(IdBtnRecord), rect(rx, 11.0f, rec_w, 32.0f), sh_.recording_active ? glyph::stop : glyph::video, rec_lbl, IdBtnRecord, 0, sh_.recording_active ? 2 : 0);
         rx -= 8.0f + reg_w;
@@ -1071,7 +1081,25 @@ private:
         (void)reveal_in_explorer(paths);
     }
 
-    void request_delete_selected(bool delete_files) {
+    void delete_selected_immediate(bool delete_files) {
+        const auto indices = selected_indices();
+        if (indices.empty()) return;
+        std::vector<int64_t> ids;
+        std::vector<std::wstring> paths;
+        ids.reserve(indices.size());
+        paths.reserve(indices.size());
+        for (const int idx : indices) {
+            ids.push_back(entries_[static_cast<size_t>(idx)].id);
+            paths.push_back(row_cache_[static_cast<size_t>(idx)].wpath);
+        }
+        delete_entries_immediate(ids, paths, indices.front(), delete_files);
+    }
+
+    void request_delete_selected(bool delete_files, bool skip_confirm = false) {
+        if (skip_confirm) {
+            delete_selected_immediate(delete_files);
+            return;
+        }
         const auto indices = selected_indices();
         if (indices.empty()) return;
         DeleteConfirm req;
@@ -1170,7 +1198,7 @@ private:
             const std::wstring copy_lbl = ulp::str::concat_strings(L"Copy ", cnt.view(), L" Files");
             const std::wstring path_lbl = ulp::str::concat_strings(L"Copy ", cnt.view(), L" File Paths");
             const std::wstring rem_lbl = ulp::str::concat_strings(L"Remove ", cnt.view(), L" Items from History");
-            const std::wstring del_lbl = ulp::str::concat_strings(L"Delete ", cnt.view(), L" Files & History");
+            const std::wstring del_lbl = ulp::str::concat_strings(L"Delete ", cnt.view(), L" Files && History");
             AppendMenuW(menu.get(), MF_STRING, CmdOpen, open_lbl.c_str());
             AppendMenuW(menu.get(), MF_STRING, CmdCopy, copy_lbl.c_str());
             AppendMenuW(menu.get(), MF_STRING, CmdCopyPath, path_lbl.c_str());
@@ -1185,7 +1213,7 @@ private:
             AppendMenuW(menu.get(), MF_STRING, CmdExplorer, L"Show in Explorer");
             AppendMenuW(menu.get(), MF_SEPARATOR, 0, nullptr);
             AppendMenuW(menu.get(), MF_STRING, CmdRemoveHistory, L"Remove from History");
-            AppendMenuW(menu.get(), MF_STRING, CmdDeleteFile, L"Delete File & History");
+            AppendMenuW(menu.get(), MF_STRING, CmdDeleteFile, L"Delete File && History");
         }
         SetMenuDefaultItem(menu.get(), CmdOpen, FALSE);
 
@@ -1208,19 +1236,8 @@ private:
                 break;
             }
             case CmdExplorer: reveal_selected_entries(); break;
-            case CmdRemoveHistory: {
-                std::vector<int64_t> ids;
-                std::vector<std::wstring> paths;
-                ids.reserve(indices.size());
-                paths.reserve(indices.size());
-                for (const int sel_i : indices) {
-                    ids.push_back(entries_[static_cast<size_t>(sel_i)].id);
-                    paths.push_back(row_cache_[static_cast<size_t>(sel_i)].wpath);
-                }
-                delete_entries_immediate(ids, paths, indices.front(), false);
-                break;
-            }
-            case CmdDeleteFile: request_delete_selected(true); break;
+            case CmdRemoveHistory: delete_selected_immediate(false); break;
+            case CmdDeleteFile: request_delete_selected(true, GetKeyState(VK_SHIFT) < 0); break;
             default: break;
         }
     }
@@ -1316,6 +1333,7 @@ private:
             case IdBtnFull: if (sh_.on_capture_full) sh_.on_capture_full(); return;
             case IdBtnRegion: if (sh_.on_capture_region) sh_.on_capture_region(); return;
             case IdBtnRecord: if (sh_.on_toggle_record) sh_.on_toggle_record(); return;
+            case IdBtnColorPicker: if (sh_.on_color_picker) sh_.on_color_picker(); return;
             case IdBtnSettings: if (sh_.on_open_settings) sh_.on_open_settings(0); return;
             case IdFilterAll: filter_ = Filter::All; reload_entries(true); return;
             case IdFilterImages: filter_ = Filter::Images; reload_entries(true); return;
@@ -1323,7 +1341,7 @@ private:
             case IdActCopy: copy_selected_entries(); return;
             case IdActOpen: open_selected_entries(); return;
             case IdActExplorer: reveal_selected_entries(); return;
-            case IdActDelete: request_delete_selected(true); return;
+            case IdActDelete: request_delete_selected(true, GetKeyState(VK_SHIFT) < 0); return;
             case IdVideoPlay:
                 if (!video_.active() || video_.failed()) {
                     sync_preview_media();
@@ -1563,7 +1581,7 @@ private:
             return;
         }
         if (vk == VK_RETURN && !selection_.empty()) { open_selected_entries(); return; }
-        if (vk == VK_DELETE && !selection_.empty()) { request_delete_selected(true); return; }
+        if (vk == VK_DELETE && !selection_.empty()) { request_delete_selected(true, shift); return; }
         if (ctrl && vk == 'C' && !selection_.empty()) { copy_selected_entries(); return; }
         if (vk == VK_SPACE && selected_entry() && is_playable_video(*selected_entry())) {
             if (!video_.active() || video_.failed()) {
