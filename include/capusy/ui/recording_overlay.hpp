@@ -47,6 +47,9 @@ public:
             registered = true;
         }
 
+        if (!cursor_arrow_) cursor_arrow_ = LoadCursorW(nullptr, IDC_ARROW);
+        if (!cursor_hand_) cursor_hand_ = LoadCursorW(nullptr, IDC_HAND);
+
         if (!sh_.gfx.ensure_device(nullptr)) return false;
 
         // 1. Click-through border window wrapping the recorded region by 3px.
@@ -195,10 +198,24 @@ private:
                 self->render_pill();
                 ValidateRect(hwnd, nullptr);
                 return 0;
+            case WM_SETCURSOR:
+                if (LOWORD(lp) == HTCLIENT) {
+                    POINT pt{};
+                    bool hov = self->hover_stop_;
+                    if (GetCursorPos(&pt) && ScreenToClient(hwnd, &pt)) {
+                        const float inv_s = 1.0f / self->pill_target_.scale();
+                        const D2D1_POINT_2F p{.x = static_cast<float>(pt.x) * inv_s, .y = static_cast<float>(pt.y) * inv_s};
+                        hov = hit_test(self->pill_hits_, p) != nullptr;
+                    }
+                    SetCursor(hov ? self->cursor_hand_ : self->cursor_arrow_);
+                    return TRUE;
+                }
+                break;
             case WM_MOUSEMOVE: {
                 const float inv_s = 1.0f / self->pill_target_.scale();
                 const D2D1_POINT_2F p{.x = GET_X_LPARAM(lp) * inv_s, .y = GET_Y_LPARAM(lp) * inv_s};
                 const bool hov = hit_test(self->pill_hits_, p) != nullptr;
+                SetCursor(hov ? self->cursor_hand_ : self->cursor_arrow_);
                 if (hov != self->hover_stop_) {
                     self->hover_stop_ = hov;
                     self->render_pill();
@@ -235,6 +252,8 @@ private:
     WindowTarget border_target_;
     WindowTarget pill_target_;
     std::vector<Hit> pill_hits_;
+    HCURSOR cursor_arrow_ = nullptr;
+    HCURSOR cursor_hand_ = nullptr;
     bool hover_stop_ = false;
 };
 
