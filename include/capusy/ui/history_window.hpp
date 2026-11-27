@@ -108,7 +108,6 @@ public:
         raw_hover_index_ = 0;
         set_search_focus(false);
         dragging_search_ = false;
-        delete_confirm_ = {};
         deferred_select_idx_ = -1;
         video_.close();
         sh_.previews.clear();
@@ -292,20 +291,6 @@ private:
         IdVideoMute,
         IdVideoScrub,
         IdFooterInfo,
-        IdConfirmBackdrop,
-        IdConfirmDialog,
-        IdConfirmCancel,
-        IdConfirmOk,
-    };
-
-    struct DeleteConfirm {
-        bool open = false;
-        bool delete_files = true;
-        int first_idx = 0;
-        std::vector<int64_t> ids;
-        std::vector<std::wstring> paths;
-        std::wstring first_filename;
-        uint64_t total_bytes = 0;
     };
 
     enum CtxCmd : UINT {
@@ -471,11 +456,7 @@ private:
         draw_sidebar(cv, D2D1::RectF(0.0f, body_top, sidebar_w, sz.height));
         cv.vline(sidebar_w, body_top, sz.height, with_alpha(cv.theme().outline_variant, 0.65f));
         draw_preview_pane(cv, D2D1::RectF(sidebar_w + 1.0f, body_top, sz.width, sz.height));
-        if (delete_confirm_.open) {
-            draw_delete_confirm(cv, sz);
-        } else {
-            draw_tooltip(cv, sz, tooltip_.anchor, tooltip_.title, tooltip_.subtitle, tooltip_.alpha.value);
-        }
+        draw_tooltip(cv, sz, tooltip_.anchor, tooltip_.title, tooltip_.subtitle, tooltip_.alpha.value);
     }
 
     [[nodiscard]] std::wstring hotkey_subtitle(HotkeyAction a) const {
@@ -487,7 +468,6 @@ private:
     }
 
     [[nodiscard]] bool has_tooltip(int id, int idx) const noexcept {
-        if (delete_confirm_.open) return false;
         switch (id) {
             case IdBtnFull:
             case IdBtnRegion:
@@ -518,7 +498,6 @@ private:
     }
 
     bool build_tooltip(int id, int idx, std::wstring& title, std::wstring& subtitle) const {
-        if (delete_confirm_.open) return false;
         title.clear();
         subtitle.clear();
         const size_t sel_n = selection_count();
@@ -610,9 +589,8 @@ private:
                 return true;
             case IdActDelete:
                 title = sel_n > 1
-                    ? ulp::str::concat_strings(L"Delete ", format_count(sel_n).view(), L" files & remove from history (Del)")
-                    : L"Delete file & remove from history (Del)";
-                subtitle = L"Hold Shift to delete immediately without confirmation";
+                    ? ulp::str::concat_strings(L"Move ", format_count(sel_n).view(), L" files to Recycle Bin & remove from history (Del)")
+                    : L"Move file to Recycle Bin & remove from history (Del)";
                 return true;
             case IdVideoPlay: {
                 const bool playing = video_.is_scrubbing() ? video_.want_play() : video_.is_playing();
@@ -886,13 +864,13 @@ private:
         cv.stroke_round(foot, 10.0f, with_alpha(cv.theme().outline_variant, 0.6f));
 
         const size_t sel_n = selection_count();
-        FixedWString<32> del_lbl{L"Delete"};
+        FixedWString<48> del_lbl{L"Move to Recycle Bin"};
         if (sel_n > 1) {
             del_lbl.append(L" (");
             del_lbl.append(format_count(sel_n));
             del_lbl.push_back(L')');
         }
-        const float del_w = button_width(cv, del_lbl, true, 84.0f);
+        const float del_w = button_width(cv, del_lbl, true, 154.0f);
         const float exp_w = button_width(cv, L"Folder", true, 84.0f);
         const float open_w = button_width(cv, L"Open", true, 78.0f);
         const float copy_w = button_width(cv, L"Copy", true, 78.0f);
@@ -971,87 +949,6 @@ private:
         }
     }
 
-    void draw_delete_confirm(Canvas& cv, D2D1_SIZE_F sz) {
-        const D2D1_RECT_F full = D2D1::RectF(0.0f, 0.0f, sz.width, sz.height);
-        cv.fill(full, hex(0x000000, 0.56f));
-        cv.hit(full, IdConfirmBackdrop);
-
-        const size_t n = delete_confirm_.ids.size();
-        FixedWString<64> title;
-        if (n <= 1) {
-            title.assign(delete_confirm_.delete_files ? L"Delete capture?" : L"Remove capture from history?");
-        } else {
-            title.assign(delete_confirm_.delete_files ? L"Delete " : L"Remove ");
-            title.append(format_count(n));
-            title.append(delete_confirm_.delete_files ? L" captures?" : L" captures from history?");
-        }
-
-        std::wstring body;
-        if (delete_confirm_.delete_files) {
-            if (n <= 1) {
-                body = ulp::str::concat_strings(
-                    L"Move \"", delete_confirm_.first_filename,
-                    L"\" to the Recycle Bin and remove it from history?");
-            } else {
-                body = ulp::str::concat_strings(L"Move ", format_count(n).view(), L" selected files");
-                if (delete_confirm_.total_bytes > 0) {
-                    append_to(body, L" (", format_size(delete_confirm_.total_bytes).view(), L")");
-                }
-                body += L" to the Recycle Bin and remove them from history?";
-            }
-        } else {
-            if (n <= 1) {
-                body = ulp::str::concat_strings(
-                    L"Remove \"", delete_confirm_.first_filename,
-                    L"\" from history? The file on disk will not be deleted.");
-            } else {
-                body = ulp::str::concat_strings(
-                    L"Remove ", format_count(n).view(),
-                    L" selected captures from history? The files on disk will not be deleted.");
-            }
-        }
-
-        const float card_w = std::clamp(sz.width - 48.0f, 280.0f, 430.0f);
-        const float pad = 20.0f;
-        const float body_w = std::max(120.0f, card_w - (pad * 2.0f));
-        const float body_h = std::max(22.0f, cv.measure_height(body, Font::BodyWrap, body_w));
-        const float header_h = 30.0f;
-        const float btn_h = 34.0f;
-        const float card_h = pad + header_h + 12.0f + body_h + 22.0f + btn_h + pad;
-        const float cx = std::round((sz.width - card_w) * 0.5f);
-        const float cy = std::round((sz.height - card_h) * 0.5f);
-        const D2D1_RECT_F card = rect(cx, cy, card_w, card_h);
-
-        cv.shadow(card, 14.0f, 18.0f, 0.55f);
-        cv.fill_round(card, 14.0f, cv.theme().surface);
-        cv.stroke_round(card, 14.0f, with_alpha(cv.theme().outline_variant, 0.9f), 1.0f);
-        cv.hit(card, IdConfirmDialog);
-
-        const D2D1_RECT_F icon_box = rect(card.left + pad, card.top + pad, 30.0f, 30.0f);
-        cv.fill_round(icon_box, 8.0f, with_alpha(cv.theme().error_container, 0.65f));
-        cv.icon(glyph::del, icon_box, cv.theme().error, Font::Icon);
-        cv.text(title, rect(icon_box.right + 12.0f, card.top + pad, card.right - pad - icon_box.right - 12.0f, 30.0f),
-                Font::Large, cv.theme().on_surface);
-
-        cv.text_wrap(body, rect(card.left + pad, card.top + pad + header_h + 12.0f, body_w, body_h + 4.0f),
-                     Font::BodyWrap, cv.theme().on_surface_variant);
-
-        FixedWString<32> ok_lbl{delete_confirm_.delete_files ? L"Delete" : L"Remove"};
-        if (n > 1) {
-            ok_lbl.append(L" (");
-            ok_lbl.append(format_count(n));
-            ok_lbl.push_back(L')');
-        }
-        const float ok_w = button_width(cv, ok_lbl, true, 96.0f);
-        const float cancel_w = button_width(cv, L"Cancel", false, 84.0f);
-        const float by = card.bottom - pad - btn_h;
-        const D2D1_RECT_F ok_r = rect(card.right - pad - ok_w, by, ok_w, btn_h);
-        const D2D1_RECT_F cancel_r = rect(ok_r.left - 8.0f - cancel_w, by, cancel_w, btn_h);
-
-        draw_button(cv, hover_.alpha(IdConfirmCancel), cancel_r, 0, L"Cancel", IdConfirmCancel, 0, 0);
-        draw_button(cv, hover_.alpha(IdConfirmOk), ok_r, glyph::del, ok_lbl, IdConfirmOk, 0, 2);
-    }
-
     // ------------------------------------------------------------------------------------------
     // Actions, Context Menu & OLE Drag-and-Drop
     // ------------------------------------------------------------------------------------------
@@ -1106,61 +1003,6 @@ private:
         delete_entries_immediate(ids, paths, indices.front(), delete_files);
     }
 
-    void request_delete_selected(bool delete_files, bool skip_confirm = false) {
-        if (skip_confirm) {
-            delete_selected_immediate(delete_files);
-            return;
-        }
-        const auto indices = selected_indices();
-        if (indices.empty()) return;
-        DeleteConfirm req;
-        req.open = true;
-        req.delete_files = delete_files;
-        req.first_idx = indices.front();
-        req.ids.reserve(indices.size());
-        req.paths.reserve(indices.size());
-        for (const int idx : indices) {
-            const CaptureEntry& e = entries_[static_cast<size_t>(idx)];
-            const RowCache& rc = row_cache_[static_cast<size_t>(idx)];
-            req.ids.push_back(e.id);
-            req.paths.push_back(rc.wpath);
-            req.total_bytes += e.size_bytes;
-        }
-        req.first_filename = row_cache_[static_cast<size_t>(indices.front())].filename;
-
-        delete_confirm_ = std::move(req);
-        drag_pending_ = false;
-        deferred_select_idx_ = -1;
-        dragging_scroll_ = false;
-        dragging_search_ = false;
-        if (scrubbing_video_) {
-            scrubbing_video_ = false;
-            video_.end_scrub();
-        }
-        if (GetCapture() == hwnd_) ReleaseCapture();
-        set_search_focus(false);
-        dismiss_tooltip();
-        raw_hover_id_ = IdNone;
-        raw_hover_index_ = 0;
-        hover_.set(IdNone, 0, false);
-        invalidate();
-    }
-
-    void cancel_delete_confirm() {
-        if (!delete_confirm_.open) return;
-        delete_confirm_ = {};
-        raw_hover_id_ = IdNone;
-        raw_hover_index_ = 0;
-        hover_.set(IdNone, 0, false);
-        invalidate();
-    }
-
-    void execute_delete_confirm() {
-        if (!delete_confirm_.open) return;
-        const DeleteConfirm req = std::exchange(delete_confirm_, {});
-        delete_entries_immediate(req.ids, req.paths, req.first_idx, req.delete_files);
-    }
-
     void delete_entries_immediate(std::span<const int64_t> ids, std::span<const std::wstring> paths, int first_idx, bool delete_files) {
         if (ids.empty()) return;
         if (video_.active()) {
@@ -1209,7 +1051,7 @@ private:
             const std::wstring copy_lbl = ulp::str::concat_strings(L"Copy ", cnt.view(), L" Files");
             const std::wstring path_lbl = ulp::str::concat_strings(L"Copy ", cnt.view(), L" File Paths");
             const std::wstring rem_lbl = ulp::str::concat_strings(L"Remove ", cnt.view(), L" Items from History");
-            const std::wstring del_lbl = ulp::str::concat_strings(L"Delete ", cnt.view(), L" Files && History");
+            const std::wstring del_lbl = ulp::str::concat_strings(L"Move ", cnt.view(), L" Files to Recycle Bin");
             AppendMenuW(menu.get(), MF_STRING, CmdOpen, open_lbl.c_str());
             AppendMenuW(menu.get(), MF_STRING, CmdCopy, copy_lbl.c_str());
             AppendMenuW(menu.get(), MF_STRING, CmdCopyPath, path_lbl.c_str());
@@ -1224,7 +1066,7 @@ private:
             AppendMenuW(menu.get(), MF_STRING, CmdExplorer, L"Show in Explorer");
             AppendMenuW(menu.get(), MF_SEPARATOR, 0, nullptr);
             AppendMenuW(menu.get(), MF_STRING, CmdRemoveHistory, L"Remove from History");
-            AppendMenuW(menu.get(), MF_STRING, CmdDeleteFile, L"Delete File && History");
+            AppendMenuW(menu.get(), MF_STRING, CmdDeleteFile, L"Move to Recycle Bin");
         }
         SetMenuDefaultItem(menu.get(), CmdOpen, FALSE);
 
@@ -1248,7 +1090,7 @@ private:
             }
             case CmdExplorer: reveal_selected_entries(); break;
             case CmdRemoveHistory: delete_selected_immediate(false); break;
-            case CmdDeleteFile: request_delete_selected(true, GetKeyState(VK_SHIFT) < 0); break;
+            case CmdDeleteFile: delete_selected_immediate(true); break;
             default: break;
         }
     }
@@ -1306,14 +1148,6 @@ private:
     void on_lbutton_down(LPARAM lp) {
         const D2D1_POINT_2F p = to_dip(lp);
         const Hit* h = hit_test(hits_, p);
-        if (delete_confirm_.open) {
-            if (!h || h->id == IdConfirmBackdrop || h->id == IdConfirmCancel) {
-                cancel_delete_confirm();
-            } else if (h->id == IdConfirmOk) {
-                execute_delete_confirm();
-            }
-            return;
-        }
         if (!h) {
             set_search_focus(false);
             return;
@@ -1353,7 +1187,7 @@ private:
             case IdActCopy: copy_selected_entries(); return;
             case IdActOpen: open_selected_entries(); return;
             case IdActExplorer: reveal_selected_entries(); return;
-            case IdActDelete: request_delete_selected(true, GetKeyState(VK_SHIFT) < 0); return;
+            case IdActDelete: delete_selected_immediate(true); return;
             case IdVideoPlay:
                 if (!video_.active() || video_.failed()) {
                     sync_preview_media();
@@ -1414,7 +1248,6 @@ private:
     }
 
     void on_lbutton_dblclk(LPARAM lp) {
-        if (delete_confirm_.open) return;
         const Hit* h = hit_test(hits_, to_dip(lp));
         if (!h) return;
         if (h->id == IdRow) {
@@ -1425,7 +1258,6 @@ private:
     }
 
     void on_rbutton_up(LPARAM lp) {
-        if (delete_confirm_.open) return;
         const Hit* h = hit_test(hits_, to_dip(lp));
         if (!h) return;
         if (h->id == IdRow) {
@@ -1437,19 +1269,6 @@ private:
 
     void on_mouse_move(LPARAM lp) {
         const D2D1_POINT_2F p = to_dip(lp);
-        if (delete_confirm_.open) {
-            const Hit* h = hit_test(hits_, p);
-            const int nid = (h && (h->id == IdConfirmCancel || h->id == IdConfirmOk)) ? h->id : IdNone;
-            if (nid != raw_hover_id_ || raw_hover_index_ != 0) {
-                raw_hover_id_ = nid;
-                raw_hover_index_ = 0;
-                if (hover_.set(nid, 0, true)) start_anim();
-            }
-            SetCursor(nid != IdNone ? cursor_hand_ : cursor_arrow_);
-            TRACKMOUSEEVENT tme{.cbSize = sizeof(tme), .dwFlags = TME_LEAVE, .hwndTrack = hwnd_};
-            TrackMouseEvent(&tme);
-            return;
-        }
         if (dragging_search_) {
             if (target_.ready()) {
                 std::vector<Hit> dummy;
@@ -1519,7 +1338,7 @@ private:
     }
 
     void on_char(wchar_t ch) {
-        if (delete_confirm_.open || !search_field_.focused) return;
+        if (!search_field_.focused) return;
         if (ch < 0x20 || ch == 0x7F) return;
         const std::wstring_view sv{&ch, 1};
         if (search_field_.replace_selection(sv)) {
@@ -1529,11 +1348,6 @@ private:
     }
 
     void on_key_down(UINT vk) {
-        if (delete_confirm_.open) {
-            if (vk == VK_ESCAPE) cancel_delete_confirm();
-            else if (vk == VK_RETURN) execute_delete_confirm();
-            return;
-        }
         const bool ctrl = GetKeyState(VK_CONTROL) < 0;
         const bool shift = GetKeyState(VK_SHIFT) < 0;
         if (ctrl && vk == 'F') {
@@ -1593,7 +1407,7 @@ private:
             return;
         }
         if (vk == VK_RETURN && !selection_.empty()) { open_selected_entries(); return; }
-        if (vk == VK_DELETE && !selection_.empty()) { request_delete_selected(true, shift); return; }
+        if (vk == VK_DELETE && !selection_.empty()) { delete_selected_immediate(true); return; }
         if (ctrl && vk == 'C' && !selection_.empty()) { copy_selected_entries(); return; }
         if (vk == VK_SPACE && selected_entry() && is_playable_video(*selected_entry())) {
             if (!video_.active() || video_.failed()) {
@@ -1708,7 +1522,6 @@ private:
                 }
                 return 0;
             case WM_MOUSEWHEEL: {
-                if (delete_confirm_.open) return 0;
                 dismiss_tooltip();
                 const float delta = static_cast<float>(GET_WHEEL_DELTA_WPARAM(wp)) / 120.0f;
                 target_scroll_ = std::clamp(target_scroll_ - (delta * 96.0f), 0.0f, max_scroll());
@@ -1766,7 +1579,6 @@ private:
     std::vector<RowCache> row_cache_;
     HistorySelection selection_;
     int deferred_select_idx_ = -1;
-    DeleteConfirm delete_confirm_;
 
     std::vector<Hit> hits_;
     HoverTracker hover_;
