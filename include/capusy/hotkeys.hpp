@@ -79,7 +79,7 @@ inline constexpr uint32_t VK_PRINTSCREEN_CODE = 0x2Cu;
         case HotkeyAction::RegionRecord: return L"Select a region to record video/GIF; press again to stop";
         case HotkeyAction::OpenHistory: return L"Shows the screenshot history and preview window";
         case HotkeyAction::ColorPicker: return L"Freezes all monitors, shows RGB under cursor, and copies #HEX on click";
-        case HotkeyAction::FullRecord: return L"Records the full monitor under the cursor immediately; click tray icon or press again to stop";
+        case HotkeyAction::FullRecord: return L"Records a full monitor without overlay (click to pick monitor on multi-display); click tray icon or press again to stop";
         case HotkeyAction::Count: break;
     }
     return L"";

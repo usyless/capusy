@@ -24,6 +24,7 @@ enum class OverlayMode : uint8_t {
     Screenshot = 0,
     RecordRegion = 1,
     ColorPicker = 2,
+    RecordMonitor = 3,
 };
 
 inline constexpr float HIGHLIGHTER_OPACITY = 0.24f;
@@ -169,6 +170,7 @@ public:
 
     std::function<void(Raster&&, WindowInfo&&)> on_screenshot_captured;
     std::function<void(RECT, WindowInfo&&)> on_record_region_selected;
+    std::function<void(RECT, WindowInfo&&)> on_record_monitor_selected;
     std::function<void(Rgb8)> on_color_picked;
     std::function<void()> on_closed;
 
@@ -185,11 +187,18 @@ public:
         if (!sh_.gfx.ensure_device(nullptr)) {
             return false;
         }
+        const bool need_snaps = (mode_ == OverlayMode::Screenshot || mode_ == OverlayMode::RecordRegion);
         foreground_info_ = (mode_ == OverlayMode::ColorPicker) ? WindowInfo{} : foreground_window_info();
-        const bool snap_cursor = (mode_ == OverlayMode::ColorPicker) ? false : include_cursor;
+        const bool snap_cursor = (mode_ == OverlayMode::Screenshot) ? include_cursor : false;
         auto cap = capture_virtual_screen(snap_cursor, sh_.gfx.d3d());
         if (!cap || cap->monitors.empty()) return false;
-        snaps_ = (mode_ == OverlayMode::ColorPicker) ? SnapTargets{} : enumerate_snap_targets(cap->monitors);
+        if (mode_ == OverlayMode::RecordMonitor) {
+            std::ranges::sort(cap->monitors, [](const MonitorInfo& a, const MonitorInfo& b) noexcept {
+                if (a.rect.left != b.rect.left) return a.rect.left < b.rect.left;
+                return a.rect.top < b.rect.top;
+            });
+        }
+        snaps_ = need_snaps ? enumerate_snap_targets(cap->monitors) : SnapTargets{};
         capture_ = std::move(*cap);
         ensure_stroke_style();
 
@@ -247,7 +256,8 @@ public:
         POINT cur{};
         GetCursorPos(&cur);
         cursor_vpt_ = cur;
-        hover_snap_ = (mode_ == OverlayMode::ColorPicker) ? std::nullopt : hit_snap_rect(snaps_, cur);
+        hovered_monitor_idx_ = monitor_index_at(cur);
+        hover_snap_ = need_snaps ? hit_snap_rect(snaps_, cur) : std::nullopt;
 
         // 2. Create one native-DPI overlay HWND per physical monitor!
         HWND primary_or_cursor_hwnd = nullptr;
@@ -509,6 +519,71 @@ private:
 
                 draw_color_loupe(mw, cv);
             }
+            return;
+        }
+
+        if (mode_ == OverlayMode::RecordMonitor) {
+            const bool hovered = (hovered_monitor_idx_ == mw.index);
+            if (!hovered) {
+                cv.fill(D2D1::RectF(0.0f, 0.0f, sz.width, sz.height), hex(0x09080c, 0.56f));
+            } else {
+                cv.fill(D2D1::RectF(0.0f, 0.0f, sz.width, sz.height), hex(0xff5c5c, 0.04f));
+                cv.stroke(D2D1::RectF(0.0f, 0.0f, sz.width, sz.height), hex(0xff5c5c, 0.95f), 4.0f);
+            }
+
+            if (hovered || (hovered_monitor_idx_ >= monitors_.size() && mw.info.primary)) {
+                FixedWString<96> hint{L"Click a monitor to start full-screen recording  •  Press 1–"};
+                hint.append(to_fixed_wstr<8>(std::min<size_t>(monitors_.size(), 9u)));
+                hint.append(L" or Enter  •  Esc to cancel");
+                const float hw = std::min(sz.width - 32.0f, cv.measure(hint, Font::SmallSemi) + 28.0f);
+                const D2D1_RECT_F hr = rect((sz.width - hw) * 0.5f, 18.0f, hw, 34.0f);
+                cv.shadow(hr, 17.0f, 8.0f, 0.35f);
+                cv.fill_round(hr, 17.0f, with_alpha(cv.theme().surface, 0.95f));
+                cv.stroke_round(hr, 17.0f, with_alpha(cv.theme().outline_variant, 0.85f));
+                cv.text(hint, hr, Font::SmallSemi, cv.theme().on_surface, Align::Center);
+            }
+
+            const float card_w = std::min(sz.width - 32.0f, 320.0f);
+            constexpr float card_h = 114.0f;
+            const D2D1_RECT_F card = rect((sz.width - card_w) * 0.5f, (sz.height - card_h) * 0.5f, card_w, card_h);
+            cv.shadow(card, 14.0f, 14.0f, hovered ? 0.52f : 0.35f);
+            cv.fill_round(card, 14.0f, with_alpha(cv.theme().surface, hovered ? 0.96f : 0.88f));
+            cv.stroke_round(card, 14.0f, hovered ? hex(0xff5c5c, 0.92f) : with_alpha(cv.theme().outline_variant, 0.8f), hovered ? 2.0f : 1.0f);
+
+            FixedWString<64> title{L"Display "};
+            title.append(to_fixed_wstr<8>(mw.index + 1));
+            if (mw.info.primary) title.append(L"  •  Primary");
+
+            const int mw_px = mw.info.rect.right - mw.info.rect.left;
+            const int mh_px = mw.info.rect.bottom - mw.info.rect.top;
+            const uint32_t scale_pct = static_cast<uint32_t>(std::lround((static_cast<double>(mw.info.dpi) * 100.0) / 96.0));
+            FixedWString<64> res;
+            res.assign(to_fixed_wstr<16>(mw_px));
+            res.append(L" × ");
+            res.append(to_fixed_wstr<16>(mh_px));
+            if (scale_pct != 100u) {
+                res.append(L"  •  ");
+                res.append(to_fixed_wstr<8>(scale_pct));
+                res.push_back(L'%');
+            }
+
+            cv.icon(glyph::monitor, rect(card.left, card.top + 14.0f, card_w, 24.0f),
+                    hovered ? hex(0xff5c5c) : cv.theme().on_surface_variant, Font::IconLarge);
+            cv.text(title, rect(card.left + 14.0f, card.top + 40.0f, card_w - 28.0f, 24.0f),
+                    Font::Large, cv.theme().on_surface, Align::Center);
+            cv.text(res, rect(card.left + 14.0f, card.top + 64.0f, card_w - 28.0f, 20.0f),
+                    Font::MonoSmall, cv.theme().on_surface_variant, Align::Center);
+
+            FixedWString<64> action;
+            if (hovered) {
+                action.assign(L"Click to record  (stops from tray)");
+            } else {
+                action.assign(L"Click or press ");
+                action.append(to_fixed_wstr<8>(mw.index + 1));
+                action.append(L" to record");
+            }
+            cv.text(action, rect(card.left + 14.0f, card.top + 86.0f, card_w - 28.0f, 18.0f),
+                    Font::SmallSemi, hovered ? hex(0xff5c5c) : cv.theme().outline, Align::Center);
             return;
         }
 
@@ -1411,7 +1486,9 @@ private:
 
     void update_cursor(const MonitorWindow& mw, POINT vpt, const Hit* h) noexcept {
         HCURSOR cur = cursor_cross_;
-        if (mode_ == OverlayMode::ColorPicker) {
+        if (mode_ == OverlayMode::RecordMonitor) {
+            cur = cursor_hand_;
+        } else if (mode_ == OverlayMode::ColorPicker) {
             cur = cursor_cross_;
         } else if (h) {
             if (h->id == IdPickerSV) cur = cursor_cross_;
@@ -1545,6 +1622,23 @@ private:
         render_all();
     }
 
+    [[nodiscard]] size_t monitor_index_at(POINT vpt) const noexcept {
+        if (!capture_) return 0;
+        for (size_t i = 0; i < capture_->monitors.size(); ++i) {
+            if (rect_contains_pt(capture_->monitors[i].rect, vpt)) return i;
+        }
+        return 0;
+    }
+
+    void confirm_record_monitor(size_t mon_idx) {
+        if (mon_idx >= monitors_.size()) return;
+        const RECT r = monitors_[mon_idx]->info.rect;
+        WindowInfo win_info = foreground_info_;
+        auto cb = on_record_monitor_selected;
+        cancel();
+        if (cb) cb(r, std::move(win_info));
+    }
+
     void confirm_screen_color(POINT vpt) {
         const Rgb8 rgb = sample_screen_rgb(vpt);
         auto cb = on_color_picked;
@@ -1555,6 +1649,10 @@ private:
     void on_lbutton_down(MonitorWindow& mw, LPARAM lp) {
         const POINT vpt = to_virtual_px(mw, lp);
         cursor_vpt_ = vpt;
+        if (mode_ == OverlayMode::RecordMonitor) {
+            confirm_record_monitor(mw.index);
+            return;
+        }
         if (mode_ == OverlayMode::ColorPicker) {
             confirm_screen_color(vpt);
             return;
@@ -1639,6 +1737,14 @@ private:
     void on_mouse_move(MonitorWindow& mw, LPARAM lp) {
         const POINT vpt = to_virtual_px(mw, lp);
         cursor_vpt_ = vpt;
+        if (mode_ == OverlayMode::RecordMonitor) {
+            update_cursor(mw, vpt, nullptr);
+            if (hovered_monitor_idx_ != mw.index) {
+                hovered_monitor_idx_ = mw.index;
+                render_all();
+            }
+            return;
+        }
         if (mode_ == OverlayMode::ColorPicker) {
             update_cursor(mw, vpt, nullptr);
             render_all();
@@ -1825,6 +1931,27 @@ private:
     void on_key_down(UINT vk) {
         const bool ctrl = GetKeyState(VK_CONTROL) < 0;
         const bool shift = GetKeyState(VK_SHIFT) < 0;
+        if (mode_ == OverlayMode::RecordMonitor) {
+            if (vk == VK_ESCAPE) {
+                cancel();
+                return;
+            }
+            if (vk == VK_RETURN || vk == VK_SPACE) {
+                confirm_record_monitor(hovered_monitor_idx_ < monitors_.size() ? hovered_monitor_idx_ : 0u);
+                return;
+            }
+            if (vk >= '1' && vk <= '9') {
+                const size_t idx = static_cast<size_t>(vk - '1');
+                if (idx < monitors_.size()) confirm_record_monitor(idx);
+                return;
+            }
+            if (vk >= VK_NUMPAD1 && vk <= VK_NUMPAD9) {
+                const size_t idx = static_cast<size_t>(vk - VK_NUMPAD1);
+                if (idx < monitors_.size()) confirm_record_monitor(idx);
+                return;
+            }
+            return;
+        }
         if (mode_ == OverlayMode::ColorPicker) {
             if (vk == VK_ESCAPE) {
                 cancel();
@@ -1958,7 +2085,7 @@ private:
                 return 0;
             case WM_RBUTTONDOWN:
                 dismiss_tooltip();
-                if (mode_ == OverlayMode::ColorPicker) {
+                if (mode_ == OverlayMode::ColorPicker || mode_ == OverlayMode::RecordMonitor) {
                     cancel();
                 } else if (color_picker_open_) {
                     color_picker_open_ = false;
@@ -2040,6 +2167,7 @@ private:
     float picker_v_ = 1.0f;
     bool color_picker_open_ = false;
     bool annotation_dropper_active_ = false;
+    size_t hovered_monitor_idx_ = 0;
     POINT cursor_vpt_{};
     D2D1_RECT_F color_picker_anchor_{};
     D2D1_RECT_F picker_panel_rect_{};

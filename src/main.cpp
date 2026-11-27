@@ -195,6 +195,9 @@ private:
         region_overlay_->on_record_region_selected = [this](RECT region, WindowInfo&& win_info) {
             start_recording(region, std::move(win_info), false);
         };
+        region_overlay_->on_record_monitor_selected = [this](RECT region, WindowInfo&& win_info) {
+            start_recording(region, std::move(win_info), true);
+        };
         region_overlay_->on_color_picked = [this](Rgb8 rgb) {
             const FixedWString<16> hex_str = format_hex_rgb(rgb);
             const FixedWString<32> rgb_str = format_rgb_label(rgb);
@@ -255,15 +258,18 @@ private:
             return;
         }
         if (region_overlay_->active()) {
+            const bool same = (region_overlay_->mode() == OverlayMode::RecordMonitor);
             region_overlay_->cancel();
+            if (same) return;
         }
-        POINT cur{};
-        GetCursorPos(&cur);
-        const HMONITOR mon = MonitorFromPoint(cur, MONITOR_DEFAULTTONEAREST);
-        MONITORINFO mi{.cbSize = sizeof(mi)};
-        if (!mon || !GetMonitorInfoW(mon, &mi)) return;
-        WindowInfo win_info = foreground_window_info();
-        start_recording(mi.rcMonitor, std::move(win_info), true);
+        const auto mons = enumerate_monitors();
+        if (mons.empty()) return;
+        if (mons.size() == 1) {
+            WindowInfo win_info = foreground_window_info();
+            start_recording(mons[0].rect, std::move(win_info), true);
+            return;
+        }
+        (void)region_overlay_->start(inst_, OverlayMode::RecordMonitor, false);
     }
 
     void trigger_color_picker() {
