@@ -41,6 +41,7 @@ struct HotkeyBinding {
 enum class HotkeyState : uint8_t {
     Disabled = 0,
     Registered,
+    RegisteredHook,   // intercepted via PrintScreen hook fallback while Windows holds VK_SNAPSHOT
     Unavailable,      // another application owns the combination
     ConflictInternal, // collides with another enabled capusy hotkey
 };
@@ -49,6 +50,12 @@ struct HotkeyStatus {
     HotkeyState state = HotkeyState::Disabled;
     std::optional<HotkeyAction> conflict_with;
 };
+
+inline constexpr uint32_t VK_PRINTSCREEN_CODE = 0x2Cu;
+
+[[nodiscard]] constexpr bool is_hotkey_active(HotkeyState s) noexcept {
+    return s == HotkeyState::Registered || s == HotkeyState::RegisteredHook;
+}
 
 [[nodiscard]] constexpr const wchar_t* hotkey_action_label(HotkeyAction a) noexcept {
     switch (a) {
@@ -90,15 +97,65 @@ struct HotkeyStatus {
 
 /// Keys that are sensible as standalone global hotkeys without requiring Ctrl/Alt/Shift/Win.
 [[nodiscard]] constexpr bool is_standalone_hotkey_vk(uint32_t vk) noexcept {
-    return vk == 0x2C /* VK_SNAPSHOT / PrintScreen */ ||
+    return vk == VK_PRINTSCREEN_CODE /* VK_SNAPSHOT / PrintScreen */ ||
            (vk >= 0x70 && vk <= 0x87) /* VK_F1..VK_F24 */ ||
            vk == 0x13 /* VK_PAUSE */ ||
            vk == 0x91 /* VK_SCROLL */;
 }
 
+/// True for generic or left/right modifier virtual-key codes.
+[[nodiscard]] constexpr bool is_modifier_vk(uint32_t vk) noexcept {
+    return vk == 0x10 /* VK_SHIFT */ || vk == 0x11 /* VK_CONTROL */ || vk == 0x12 /* VK_MENU */ ||
+           vk == 0x5B /* VK_LWIN */ || vk == 0x5C /* VK_RWIN */ ||
+           vk == 0xA0 /* VK_LSHIFT */ || vk == 0xA1 /* VK_RSHIFT */ ||
+           vk == 0xA2 /* VK_LCONTROL */ || vk == 0xA3 /* VK_RCONTROL */ ||
+           vk == 0xA4 /* VK_LMENU */ || vk == 0xA5 /* VK_RMENU */;
+}
+
 /// Normalises modifier flags to the four Win32 hotkey modifier bits (MOD_ALT|MOD_CONTROL|MOD_SHIFT|MOD_WIN).
 [[nodiscard]] constexpr uint32_t normalize_hotkey_mods(uint32_t mods) noexcept {
     return mods & 0x0Fu;
+}
+
+/// Resolves modifier bits for a recorded keybind: preserves standalone keys (like PrintScreen and F1-F24)
+/// with zero modifiers, while defaulting bare non-standalone keys to Alt.
+[[nodiscard]] constexpr uint32_t resolve_recorded_hotkey_mods(uint32_t mods, uint32_t vk) noexcept {
+    const uint32_t nm = normalize_hotkey_mods(mods);
+    if (nm == 0u && !is_standalone_hotkey_vk(vk)) return 0x0001u /* MOD_ALT */;
+    return nm;
+}
+
+[[nodiscard]] constexpr bool is_printscreen_hotkey(const HotkeyBinding& hb) noexcept {
+    return hb.enabled && hb.vk == VK_PRINTSCREEN_CODE;
+}
+
+[[nodiscard]] constexpr bool any_printscreen_hotkey(std::span<const HotkeyBinding> bindings) noexcept {
+    for (const HotkeyBinding& hb : bindings) {
+        if (is_printscreen_hotkey(hb)) return true;
+    }
+    return false;
+}
+
+/// True for PrintScreen bindings that Windows itself reserves by default (bare PrintScreen for
+/// Snipping Tool when enabled, or Win+PrintScreen for Windows screenshot saving).
+[[nodiscard]] constexpr bool is_windows_reserved_printscreen(uint32_t mods, uint32_t vk) noexcept {
+    if (vk != VK_PRINTSCREEN_CODE) return false;
+    const uint32_t nm = normalize_hotkey_mods(mods);
+    return nm == 0u || (nm & 0x08u /* MOD_WIN */) != 0u;
+}
+
+/// Evaluates `HKCU\Control Panel\Keyboard\PrintScreenKeyForSnippingEnabled`.
+/// Windows stores `0` when the built-in Snipping Tool binding is disabled and `1` when enabled.
+/// When absent (`std::nullopt`), returns `false` so the user can explicitly write `0` to disable it.
+[[nodiscard]] constexpr bool is_windows_printscreen_disabled_value(std::optional<uint32_t> reg_dword) noexcept {
+    return reg_dword.has_value() && *reg_dword == 0u;
+}
+
+/// True when a PrintScreen hotkey that failed `RegisterHotKey` with `ERROR_HOTKEY_ALREADY_REGISTERED`
+/// should fall back to capusy's targeted PrintScreen keyboard hook (only when the user has disabled
+/// Windows' built-in Print Screen binding).
+[[nodiscard]] constexpr bool should_use_printscreen_hook_fallback(const HotkeyBinding& hb, bool win_prtscn_disabled) noexcept {
+    return win_prtscn_disabled && is_printscreen_hotkey(hb);
 }
 
 /// Returns the first earlier or peer action index whose enabled binding collides with `idx`, or `std::nullopt`.

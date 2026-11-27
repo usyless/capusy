@@ -383,7 +383,56 @@ private:
     // Global Hotkeys with Internal + OS Collision Checking
     // ------------------------------------------------------------------------------------------
 
+    struct SnapshotHookSlot {
+        bool active = false;
+        uint32_t mods = 0;
+    };
+
+    static LRESULT CALLBACK ll_snapshot_proc(int code, WPARAM wp, LPARAM lp) {
+        if (code == HC_ACTION && snapshot_hook_target_ != nullptr) {
+            const auto* kb = reinterpret_cast<const KBDLLHOOKSTRUCT*>(lp);
+            if (kb->vkCode == VK_SNAPSHOT) {
+                if (wp == WM_KEYDOWN || wp == WM_SYSKEYDOWN) {
+                    if (snapshot_hook_target_->snapshot_hook_down_) {
+                        return 1;
+                    }
+                    uint32_t mods = 0;
+                    if (GetAsyncKeyState(VK_CONTROL) < 0) mods |= MOD_CONTROL;
+                    if ((kb->flags & LLKHF_ALTDOWN) != 0 || GetAsyncKeyState(VK_MENU) < 0) mods |= MOD_ALT;
+                    if (GetAsyncKeyState(VK_SHIFT) < 0) mods |= MOD_SHIFT;
+                    if (GetAsyncKeyState(VK_LWIN) < 0 || GetAsyncKeyState(VK_RWIN) < 0) mods |= MOD_WIN;
+                    for (size_t i = 0; i < HOTKEY_COUNT; ++i) {
+                        const SnapshotHookSlot& slot = snapshot_hook_target_->snapshot_hook_slots_[i];
+                        if (slot.active && slot.mods == mods) {
+                            snapshot_hook_target_->snapshot_hook_down_ = true;
+                            PostMessageW(snapshot_hook_target_->tray_hwnd_, WM_HOTKEY,
+                                         static_cast<WPARAM>(HOTKEY_BASE_ID + static_cast<int>(i)), 0);
+                            return 1;
+                        }
+                    }
+                } else if (wp == WM_KEYUP || wp == WM_SYSKEYUP) {
+                    if (snapshot_hook_target_->snapshot_hook_down_) {
+                        snapshot_hook_target_->snapshot_hook_down_ = false;
+                        return 1;
+                    }
+                }
+            }
+        }
+        return CallNextHookEx(nullptr, code, wp, lp);
+    }
+
+    void uninstall_snapshot_hook() noexcept {
+        if (snapshot_hook_) {
+            UnhookWindowsHookEx(snapshot_hook_);
+            snapshot_hook_ = nullptr;
+        }
+        if (snapshot_hook_target_ == this) snapshot_hook_target_ = nullptr;
+        snapshot_hook_slots_ = {};
+        snapshot_hook_down_ = false;
+    }
+
     void unregister_hotkeys() noexcept {
+        uninstall_snapshot_hook();
         if (!tray_hwnd_) return;
         for (size_t i = 0; i < HOTKEY_COUNT; ++i) {
             UnregisterHotKey(tray_hwnd_, HOTKEY_BASE_ID + static_cast<int>(i));
@@ -393,6 +442,9 @@ private:
     void register_hotkeys(bool notify_conflicts) {
         unregister_hotkeys();
         const auto all = sh_.settings.all_hotkeys();
+        const bool win_prtscn_disabled = is_windows_printscreen_snipping_disabled();
+        last_win_prtscn_disabled_ = win_prtscn_disabled;
+        bool need_snapshot_hook = false;
         std::wstring conflicts;
 
         for (size_t i = 0; i < HOTKEY_COUNT; ++i) {
@@ -410,10 +462,36 @@ private:
             }
             if (RegisterHotKey(tray_hwnd_, HOTKEY_BASE_ID + static_cast<int>(i), normalize_hotkey_mods(hb.mods) | MOD_NOREPEAT, hb.vk)) {
                 st.state = HotkeyState::Registered;
+            } else if (GetLastError() == ERROR_HOTKEY_ALREADY_REGISTERED &&
+                       should_use_printscreen_hook_fallback(hb, win_prtscn_disabled)) {
+                snapshot_hook_slots_[i] = {.active = true, .mods = normalize_hotkey_mods(hb.mods)};
+                need_snapshot_hook = true;
             } else {
                 st.state = HotkeyState::Unavailable;
                 if (!conflicts.empty()) conflicts += L", ";
                 conflicts += hotkey_action_label(static_cast<HotkeyAction>(i));
+            }
+        }
+        if (need_snapshot_hook) {
+            snapshot_hook_target_ = this;
+            snapshot_hook_down_ = (GetAsyncKeyState(VK_SNAPSHOT) < 0);
+            snapshot_hook_ = SetWindowsHookExW(WH_KEYBOARD_LL, &CapusyApp::ll_snapshot_proc, inst_, 0);
+            if (snapshot_hook_) {
+                for (size_t i = 0; i < HOTKEY_COUNT; ++i) {
+                    if (snapshot_hook_slots_[i].active) {
+                        sh_.hotkey_status[i].state = HotkeyState::RegisteredHook;
+                    }
+                }
+            } else {
+                snapshot_hook_target_ = nullptr;
+                snapshot_hook_down_ = false;
+                for (size_t i = 0; i < HOTKEY_COUNT; ++i) {
+                    if (!snapshot_hook_slots_[i].active) continue;
+                    snapshot_hook_slots_[i] = {};
+                    sh_.hotkey_status[i].state = HotkeyState::Unavailable;
+                    if (!conflicts.empty()) conflicts += L", ";
+                    conflicts += hotkey_action_label(static_cast<HotkeyAction>(i));
+                }
             }
         }
         if (notify_conflicts && !conflicts.empty()) {
@@ -509,7 +587,7 @@ private:
     std::wstring menu_label(const wchar_t* title, HotkeyAction a) const {
         std::wstring s{title};
         const auto idx = static_cast<size_t>(a);
-        if (sh_.hotkey_status[idx].state == HotkeyState::Registered) {
+        if (is_hotkey_active(sh_.hotkey_status[idx].state)) {
             const auto& hb = sh_.settings.hotkey(a);
             append_to(s, L"\t", format_hotkey(hb.mods, hb.vk, true));
         }
@@ -629,6 +707,21 @@ private:
                         break;
                 }
                 return 0;
+            case WM_SETTINGCHANGE: {
+                const bool cur_disabled = is_windows_printscreen_snipping_disabled();
+                if (cur_disabled != last_win_prtscn_disabled_) {
+                    last_win_prtscn_disabled_ = cur_disabled;
+                    sh_.call([this] {
+                        if (any_printscreen_hotkey(sh_.settings.all_hotkeys())) {
+                            register_hotkeys(false);
+                        }
+                        if (settings_win_) {
+                            settings_win_->refresh_external_state(false);
+                        }
+                    });
+                }
+                return 0;
+            }
             case WM_DPICHANGED:
             case WM_DISPLAYCHANGE: {
                 const UINT dpi = GetDpiForWindow(hwnd);
@@ -657,6 +750,11 @@ private:
     UINT taskbar_created_ = 0;
     wil::unique_hicon tray_icon_;
     UINT tray_icon_dpi_ = 0;
+    HHOOK snapshot_hook_ = nullptr;
+    std::array<SnapshotHookSlot, HOTKEY_COUNT> snapshot_hook_slots_{};
+    bool snapshot_hook_down_ = false;
+    bool last_win_prtscn_disabled_ = false;
+    static inline CapusyApp* snapshot_hook_target_ = nullptr;
 
     Shared sh_;
     RegionRecorder recorder_;

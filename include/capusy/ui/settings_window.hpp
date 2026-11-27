@@ -128,10 +128,27 @@ public:
         if (visible()) InvalidateRect(hwnd_, nullptr, FALSE);
     }
 
+    void refresh_external_state(bool reload_if_changed = true) {
+        const bool cur_startup = is_startup_enabled();
+        const bool cur_prtscn = is_windows_printscreen_snipping_disabled();
+        const bool prtscn_changed = (cur_prtscn != win_prtscn_disabled_);
+        if (cur_startup == startup_enabled_ && !prtscn_changed) return;
+        startup_enabled_ = cur_startup;
+        win_prtscn_disabled_ = cur_prtscn;
+        win_prtscn_err_.clear();
+        sw_startup_.set(startup_enabled_ ? 1.0f : 0.0f, false);
+        sw_win_prtscn_.set(win_prtscn_disabled_ ? 1.0f : 0.0f, false);
+        if (prtscn_changed && reload_if_changed && sh_.on_reload_hotkeys) {
+            sh_.on_reload_hotkeys();
+        }
+        invalidate();
+    }
+
 private:
     static constexpr float TABS_H = 52.0f;
     static constexpr float PAD = 24.0f;
     static constexpr float CARD_GAP = 14.0f;
+    static constexpr UINT WM_APP_RECORDED_KEY = WM_APP + 30;
 
     enum HitId : int {
         IdNone = 0,
@@ -141,6 +158,8 @@ private:
         IdToggleHotkey,
         IdRecordHotkey,
         IdResetHotkey,
+        IdToggleWinPrtSc,
+        IdOpenWinKeyboardSettings,
         IdToggleStartup,
         IdToggleAutoCopy,
         IdToggleCaptureCursor,
@@ -212,11 +231,13 @@ private:
 
     void sync_state(bool animate) {
         startup_enabled_ = is_startup_enabled();
+        win_prtscn_disabled_ = is_windows_printscreen_snipping_disabled();
         save_dir_w_ = resolve_save_dir(sh_.settings).wstring();
         if (auto st = sh_.history.stats()) stats_ = *st;
         for (size_t i = 0; i < HOTKEY_COUNT; ++i) {
             sw_hotkeys_[i].set(sh_.settings.hotkey(static_cast<HotkeyAction>(i)).enabled ? 1.0f : 0.0f, animate);
         }
+        sw_win_prtscn_.set(win_prtscn_disabled_ ? 1.0f : 0.0f, animate);
         sw_startup_.set(startup_enabled_ ? 1.0f : 0.0f, animate);
         sw_auto_copy_.set(sh_.settings.auto_copy_clipboard ? 1.0f : 0.0f, animate);
         sw_cap_cursor_.set(sh_.settings.capture_cursor ? 1.0f : 0.0f, animate);
@@ -241,6 +262,7 @@ private:
         bool moving = hover_.step(dt);
         if (tab_anim_.step(dt, 20.0f, 0.004f)) moving = true;
         for (auto& sw : sw_hotkeys_) { if (sw.step(dt, 22.0f, 0.004f)) moving = true; }
+        if (sw_win_prtscn_.step(dt, 22.0f, 0.004f)) moving = true;
         if (sw_startup_.step(dt, 22.0f, 0.004f)) moving = true;
         if (sw_auto_copy_.step(dt, 22.0f, 0.004f)) moving = true;
         if (sw_cap_cursor_.step(dt, 22.0f, 0.004f)) moving = true;
@@ -262,11 +284,72 @@ private:
         return moving;
     }
 
-    void stop_recording_hotkey() noexcept {
+    static LRESULT CALLBACK ll_record_keyboard_proc(int code, WPARAM wp, LPARAM lp) {
+        if (code == HC_ACTION && record_hook_target_ != nullptr &&
+            record_hook_target_->recording_action_.has_value() &&
+            GetForegroundWindow() == record_hook_target_->hwnd_) {
+            const auto* kb = reinterpret_cast<const KBDLLHOOKSTRUCT*>(lp);
+            if (kb->vkCode == VK_SNAPSHOT) {
+                const auto read_mods = [&]() noexcept -> uint32_t {
+                    uint32_t mods = 0;
+                    if (GetAsyncKeyState(VK_CONTROL) < 0) mods |= MOD_CONTROL;
+                    if ((kb->flags & LLKHF_ALTDOWN) != 0 || GetAsyncKeyState(VK_MENU) < 0) mods |= MOD_ALT;
+                    if (GetAsyncKeyState(VK_SHIFT) < 0) mods |= MOD_SHIFT;
+                    if (GetAsyncKeyState(VK_LWIN) < 0 || GetAsyncKeyState(VK_RWIN) < 0) mods |= MOD_WIN;
+                    return mods;
+                };
+                if (wp == WM_KEYDOWN || wp == WM_SYSKEYDOWN) {
+                    if (!record_hook_target_->pending_snapshot_down_) {
+                        record_hook_target_->pending_snapshot_mods_ = read_mods();
+                        record_hook_target_->pending_snapshot_down_ = true;
+                    }
+                    return 1;
+                }
+                if (wp == WM_KEYUP || wp == WM_SYSKEYUP) {
+                    const uint32_t mods = record_hook_target_->pending_snapshot_down_
+                        ? record_hook_target_->pending_snapshot_mods_
+                        : read_mods();
+                    record_hook_target_->pending_snapshot_down_ = false;
+                    PostMessageW(record_hook_target_->hwnd_, WM_APP_RECORDED_KEY, VK_SNAPSHOT, static_cast<LPARAM>(mods));
+                    return 1;
+                }
+            }
+        }
+        return CallNextHookEx(nullptr, code, wp, lp);
+    }
+
+    void install_record_hook() noexcept {
+        if (record_hook_) return;
+        record_hook_target_ = this;
+        record_hook_ = SetWindowsHookExW(WH_KEYBOARD_LL, &SettingsWindow::ll_record_keyboard_proc, inst_, 0);
+        if (!record_hook_) record_hook_target_ = nullptr;
+    }
+
+    void uninstall_record_hook() noexcept {
+        if (record_hook_) {
+            UnhookWindowsHookEx(record_hook_);
+            record_hook_ = nullptr;
+        }
+        if (record_hook_target_ == this) record_hook_target_ = nullptr;
+        pending_snapshot_down_ = false;
+        pending_snapshot_mods_ = 0;
+    }
+
+    void start_recording_hotkey(HotkeyAction a) {
+        recording_action_ = a;
+        record_conflict_msg_.clear();
+        pending_snapshot_down_ = false;
+        pending_snapshot_mods_ = 0;
+        if (sh_.on_suspend_hotkeys) sh_.on_suspend_hotkeys(true);
+        install_record_hook();
+    }
+
+    void stop_recording_hotkey(bool resume_hotkeys = true) noexcept {
+        uninstall_record_hook();
         if (!recording_action_) return;
         recording_action_.reset();
         record_conflict_msg_.clear();
-        if (sh_.on_suspend_hotkeys) sh_.on_suspend_hotkeys(false);
+        if (resume_hotkeys && sh_.on_suspend_hotkeys) sh_.on_suspend_hotkeys(false);
     }
 
     [[nodiscard]] float max_scroll() const noexcept {
@@ -389,8 +472,9 @@ private:
 
             const FixedWString<96> hk_lbl = is_rec ? FixedWString<96>{L"Press shortcut…"} : format_hotkey(hb.mods, hb.vk);
             const wchar_t* rec_btn = is_rec ? L"Cancel" : L"Record";
+            const float pill_w = std::max(210.0f, cv.measure(hk_lbl, Font::BodySemi) + 28.0f);
             Flow keys{8.0f, 8.0f};
-            keys.add(210.0f, 36.0f, [&](D2D1_RECT_F kr) {
+            keys.add(pill_w, 36.0f, [&](D2D1_RECT_F kr) {
                 cv.fill_round(kr, 9.0f, cv.theme().surface_lowest);
                 cv.stroke_round(kr, 9.0f, is_rec ? cv.theme().amber : cv.theme().outline_variant, is_rec ? 1.5f : 1.0f);
                 cv.text(hk_lbl, kr, Font::BodySemi, is_rec ? cv.theme().amber : cv.theme().primary, Align::Center);
@@ -403,6 +487,7 @@ private:
             });
 
             std::wstring warn_msg;
+            std::wstring info_msg;
             if (is_rec && !record_conflict_msg_.empty()) {
                 warn_msg = record_conflict_msg_;
             } else if (!is_rec && hb.enabled) {
@@ -410,21 +495,76 @@ private:
                     warn_msg = ulp::str::concat_strings(
                         format_hotkey(hb.mods, hb.vk), L" conflicts with '", hotkey_action_label(*st.conflict_with), L"'. Pick a unique shortcut.");
                 } else if (st.state == HotkeyState::Unavailable) {
-                    warn_msg = ulp::str::concat_strings(
-                        format_hotkey(hb.mods, hb.vk), L" is already registered by another app. Pick a different shortcut.");
+                    if (is_windows_reserved_printscreen(hb.mods, hb.vk) && !win_prtscn_disabled_) {
+                        warn_msg = ulp::str::concat_strings(
+                            format_hotkey(hb.mods, hb.vk),
+                            L" is reserved by Windows. Enable 'Disable built-in Windows Print Screen binding' below to use it.");
+                    } else if (hb.vk == VK_SNAPSHOT) {
+                        warn_msg = ulp::str::concat_strings(
+                            format_hotkey(hb.mods, hb.vk),
+                            L" is already registered by another app or Windows. Pick a different shortcut or check Windows Keyboard Settings.");
+                    } else {
+                        warn_msg = ulp::str::concat_strings(
+                            format_hotkey(hb.mods, hb.vk), L" is already registered by another app. Pick a different shortcut.");
+                    }
+                } else if (st.state == HotkeyState::RegisteredHook) {
+                    if ((hb.mods & MOD_WIN) != 0) {
+                        info_msg = L"Active via PrintScreen hook fallback (Windows reserves Win + PrintScreen).";
+                    } else {
+                        info_msg = L"Active via PrintScreen hook fallback until Windows releases PrintScreen (sign out/in or toggle in Windows Keyboard Settings for native registration).";
+                    }
                 }
             }
             const float warn_h = warn_msg.empty() ? 0.0f : error_row_height(cv, warn_msg, rw);
+            const float info_h = (warn_msg.empty() && !info_msg.empty()) ? text_height(cv, info_msg, Font::Caption, rw, 18.0f) : 0.0f;
 
             const float keys_y = y + 16.0f + hd.h + 10.0f;
-            const float warn_y = keys_y + keys.height(rw) + 8.0f;
-            const float card_h = (warn_msg.empty() ? (keys_y + keys.height(rw)) : (warn_y + warn_h)) + 16.0f - y;
+            const float note_y = keys_y + keys.height(rw) + 8.0f;
+            const float note_h = warn_h > 0.0f ? warn_h : info_h;
+            const float card_h = (note_h > 0.0f ? (note_y + note_h) : (keys_y + keys.height(rw))) + 16.0f - y;
             const float next_y = card_begin(cv, x, y, w, card_h, 10.0f);
 
             const D2D1_RECT_F side = draw_header(cv, lx, y, rw, hd);
             draw_switch(cv, hover_.alpha(IdToggleHotkey, static_cast<int>(i)), sw_hotkeys_[i].value, side.right, side.top + 12.0f, IdToggleHotkey, static_cast<int>(i));
             keys.draw(lx, keys_y, rw);
-            if (!warn_msg.empty()) draw_error_row(cv, warn_msg, lx, warn_y, rw, warn_h);
+            if (warn_h > 0.0f) draw_error_row(cv, warn_msg, lx, note_y, rw, warn_h);
+            else if (info_h > 0.0f) cv.text_wrap(info_msg, rect(lx, note_y, rw, info_h), Font::Caption, cv.theme().on_surface_variant);
+            y = next_y;
+        }
+
+        // 1b. Windows built-in Print Screen binding setting
+        {
+            const CardHeader hd = make_header(
+                cv, rw,
+                L"Disable built-in Windows Print Screen binding",
+                cv.theme().on_surface,
+                L"Turns off Windows' built-in Snipping Tool binding (HKCU\\Control Panel\\Keyboard) so PrintScreen or modifier + PrintScreen can be used as a capusy keybind.",
+                44.0f, 24.0f);
+
+            const std::wstring_view status_note = win_prtscn_disabled_
+                ? L"Built-in Windows Print Screen binding is disabled. You can bind PrintScreen alone or with Ctrl, Alt, Shift, or Win."
+                : L"Enable this if Windows Snipping Tool intercepts PrintScreen when you want to use it as a capusy keybind.";
+
+            Flow actions{8.0f, 8.0f};
+            actions.add(button_width(cv, L"Windows Keyboard Settings", true, 196.0f), 32.0f, [&](D2D1_RECT_F r) {
+                draw_button(cv, hover_.alpha(IdOpenWinKeyboardSettings), r, glyph::open, L"Windows Keyboard Settings", IdOpenWinKeyboardSettings, 0, 3);
+            });
+
+            const float note_y = y + 16.0f + hd.h + 10.0f;
+            const float err_h = win_prtscn_err_.empty() ? 0.0f : error_row_height(cv, win_prtscn_err_, rw);
+            const float note_h = err_h > 0.0f ? err_h : text_height(cv, status_note, Font::Caption, rw, 18.0f);
+            const float actions_y = note_y + note_h + 10.0f;
+            const float card_h = (actions_y + actions.height(rw) + 16.0f) - y;
+            const float next_y = card_begin(cv, x, y, w, card_h, CARD_GAP);
+
+            const D2D1_RECT_F side = draw_header(cv, lx, y, rw, hd);
+            draw_switch(cv, hover_.alpha(IdToggleWinPrtSc), sw_win_prtscn_.value, side.right, side.top + 12.0f, IdToggleWinPrtSc);
+            if (err_h > 0.0f) {
+                draw_error_row(cv, win_prtscn_err_, lx, note_y, rw, err_h);
+            } else {
+                cv.text_wrap(status_note, rect(lx, note_y, rw, note_h), Font::Caption, cv.theme().on_surface_variant);
+            }
+            actions.draw(lx, actions_y, rw);
             y = next_y;
         }
 
@@ -974,9 +1114,7 @@ private:
                 if (recording_action_ && *recording_action_ == a) {
                     stop_recording_hotkey();
                 } else {
-                    recording_action_ = a;
-                    record_conflict_msg_.clear();
-                    if (sh_.on_suspend_hotkeys) sh_.on_suspend_hotkeys(true);
+                    start_recording_hotkey(a);
                 }
                 invalidate();
                 return;
@@ -990,6 +1128,24 @@ private:
                 start_anim();
                 return;
             }
+            case IdToggleWinPrtSc: {
+                const bool want_disable = !win_prtscn_disabled_;
+                if (set_windows_printscreen_snipping_disabled(want_disable)) {
+                    win_prtscn_err_.clear();
+                    win_prtscn_disabled_ = is_windows_printscreen_snipping_disabled();
+                    if (sh_.on_reload_hotkeys) sh_.on_reload_hotkeys();
+                } else {
+                    win_prtscn_err_ = ulp::str::concat_strings(
+                        L"Could not update Windows Print Screen registry setting (",
+                        to_wide(win32_error_utf8(GetLastError())), L").");
+                }
+                sync_state(true);
+                start_anim();
+                return;
+            }
+            case IdOpenWinKeyboardSettings:
+                (void)open_file(L"ms-settings:easeofaccess-keyboard");
+                return;
             case IdToggleStartup:
                 if (set_startup_enabled(!startup_enabled_)) {
                     startup_enabled_ = is_startup_enabled();
@@ -1086,20 +1242,24 @@ private:
         }
     }
 
-    void on_key_down(UINT vk) {
+    void on_key_down(UINT vk, std::optional<uint32_t> explicit_mods = std::nullopt) {
         if (recording_action_) {
             if (vk == VK_ESCAPE) {
                 stop_recording_hotkey();
                 invalidate();
                 return;
             }
-            if (vk == VK_SHIFT || vk == VK_CONTROL || vk == VK_MENU || vk == VK_LWIN || vk == VK_RWIN) return;
+            if (is_modifier_vk(vk)) return;
             uint32_t mods = 0;
-            if (GetKeyState(VK_CONTROL) < 0) mods |= MOD_CONTROL;
-            if (GetKeyState(VK_MENU) < 0) mods |= MOD_ALT;
-            if (GetKeyState(VK_SHIFT) < 0) mods |= MOD_SHIFT;
-            if (GetKeyState(VK_LWIN) < 0 || GetKeyState(VK_RWIN) < 0) mods |= MOD_WIN;
-            if (mods == 0 && !is_standalone_hotkey_vk(vk)) mods = MOD_ALT;
+            if (explicit_mods) {
+                mods = *explicit_mods;
+            } else {
+                if (GetKeyState(VK_CONTROL) < 0) mods |= MOD_CONTROL;
+                if (GetKeyState(VK_MENU) < 0) mods |= MOD_ALT;
+                if (GetKeyState(VK_SHIFT) < 0) mods |= MOD_SHIFT;
+                if (GetKeyState(VK_LWIN) < 0 || GetKeyState(VK_RWIN) < 0) mods |= MOD_WIN;
+            }
+            mods = resolve_recorded_hotkey_mods(mods, vk);
 
             // Internal collision check BEFORE applying!
             const auto all = sh_.settings.all_hotkeys();
@@ -1113,7 +1273,7 @@ private:
             const HotkeyAction act = *recording_action_;
             sh_.settings.hotkey(act) = {.enabled = true, .mods = mods, .vk = vk};
             sh_.save();
-            stop_recording_hotkey();
+            stop_recording_hotkey(false);
             if (sh_.on_reload_hotkeys) sh_.on_reload_hotkeys();
             sync_state(true);
             invalidate();
@@ -1209,11 +1369,33 @@ private:
             case WM_MOUSELEAVE:
                 if (hover_.set(IdNone, 0, true)) start_anim();
                 return 0;
+            case WM_ACTIVATE:
+                if (LOWORD(wp) == WA_INACTIVE) {
+                    if (recording_action_ || record_hook_) {
+                        stop_recording_hotkey();
+                        invalidate();
+                    }
+                } else {
+                    refresh_external_state();
+                }
+                break;
+            case WM_APP_RECORDED_KEY:
+                if (recording_action_) {
+                    on_key_down(static_cast<UINT>(wp), static_cast<uint32_t>(lp));
+                }
+                return 0;
             case WM_KEYDOWN:
             case WM_SYSKEYDOWN:
                 if (msg == WM_SYSKEYDOWN && wp == VK_F4 && !recording_action_) break;
                 on_key_down(static_cast<UINT>(wp));
                 return 0;
+            case WM_KEYUP:
+            case WM_SYSKEYUP:
+                if (recording_action_ && wp == VK_SNAPSHOT) {
+                    on_key_down(VK_SNAPSHOT);
+                    return 0;
+                }
+                break;
             case WM_SETCURSOR:
                 if (LOWORD(lp) == HTCLIENT) return TRUE;
                 break;
@@ -1232,6 +1414,7 @@ private:
     int tab_ = 0;
     AnimFloat tab_anim_;
     std::array<AnimFloat, HOTKEY_COUNT> sw_hotkeys_{};
+    AnimFloat sw_win_prtscn_;
     AnimFloat sw_startup_;
     AnimFloat sw_auto_copy_;
     AnimFloat sw_cap_cursor_;
@@ -1241,10 +1424,16 @@ private:
     AnimFloat sw_auto_update_;
 
     bool startup_enabled_ = false;
+    bool win_prtscn_disabled_ = false;
+    std::wstring win_prtscn_err_;
     std::wstring save_dir_w_;
     HistoryStats stats_{};
     std::optional<HotkeyAction> recording_action_;
     std::wstring record_conflict_msg_;
+    HHOOK record_hook_ = nullptr;
+    bool pending_snapshot_down_ = false;
+    uint32_t pending_snapshot_mods_ = 0;
+    static inline SettingsWindow* record_hook_target_ = nullptr;
     UpdateJob update_job_;
     std::jthread update_check_thread_;
 

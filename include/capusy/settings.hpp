@@ -275,4 +275,55 @@ inline bool set_startup_enabled(bool enable) {
     return true;
 }
 
+// ---------------------------------------------------------------------------------------------
+// Windows Built-in Print Screen Binding Toggle (HKCU\Control Panel\Keyboard)
+// ---------------------------------------------------------------------------------------------
+
+inline constexpr const wchar_t* KEYBOARD_CONTROL_PANEL_SUBKEY = L"Control Panel\\Keyboard";
+inline constexpr const wchar_t* PRINTSCREEN_SNIPPING_VALUE_NAME = L"PrintScreenKeyForSnippingEnabled";
+
+/// True when `HKCU\Control Panel\Keyboard\PrintScreenKeyForSnippingEnabled` is explicitly set to `0`,
+/// disabling Windows' built-in Snipping Tool binding for the Print Screen key.
+inline bool is_windows_printscreen_snipping_disabled() noexcept {
+    HKEY key = nullptr;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, KEYBOARD_CONTROL_PANEL_SUBKEY, 0, KEY_READ, &key) != ERROR_SUCCESS) {
+        return false;
+    }
+    DWORD val = 1;
+    DWORD type = 0;
+    DWORD sz = sizeof(val);
+    const LSTATUS st = RegQueryValueExW(key, PRINTSCREEN_SNIPPING_VALUE_NAME, nullptr, &type,
+                                        reinterpret_cast<LPBYTE>(&val), &sz);
+    RegCloseKey(key);
+    if (st != ERROR_SUCCESS || type != REG_DWORD || sz != sizeof(val)) {
+        return is_windows_printscreen_disabled_value(std::nullopt);
+    }
+    return is_windows_printscreen_disabled_value(static_cast<uint32_t>(val));
+}
+
+/// Writes `PrintScreenKeyForSnippingEnabled` (`0` to disable Windows' built-in Print Screen binding,
+/// `1` to re-enable it) and broadcasts `WM_SETTINGCHANGE` so shell listeners can react.
+inline bool set_windows_printscreen_snipping_disabled(bool disable) noexcept {
+    HKEY key = nullptr;
+    LSTATUS st = RegCreateKeyExW(HKEY_CURRENT_USER, KEYBOARD_CONTROL_PANEL_SUBKEY, 0, nullptr, 0,
+                                 KEY_SET_VALUE, nullptr, &key, nullptr);
+    if (st != ERROR_SUCCESS) {
+        SetLastError(static_cast<DWORD>(st));
+        return false;
+    }
+    const DWORD val = disable ? 0u : 1u;
+    st = RegSetValueExW(key, PRINTSCREEN_SNIPPING_VALUE_NAME, 0, REG_DWORD,
+                        reinterpret_cast<const BYTE*>(&val), sizeof(val));
+    RegCloseKey(key);
+    if (st != ERROR_SUCCESS) {
+        SetLastError(static_cast<DWORD>(st));
+        return false;
+    }
+    DWORD_PTR ignored = 0;
+    (void)SendMessageTimeoutW(HWND_BROADCAST, WM_SETTINGCHANGE, 0,
+                              reinterpret_cast<LPARAM>(KEYBOARD_CONTROL_PANEL_SUBKEY),
+                              SMTO_ABORTIFHUNG, 500, &ignored);
+    return true;
+}
+
 } // namespace capusy

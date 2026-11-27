@@ -68,6 +68,55 @@ static void test_hotkey_collisions() {
     CHECK(is_standalone_hotkey_vk(VK_SNAPSHOT));
     CHECK(is_standalone_hotkey_vk(VK_F9));
     CHECK(!is_standalone_hotkey_vk('A'));
+
+    // PrintScreen standalone & modified keybind logic
+    CHECK(resolve_recorded_hotkey_mods(0, VK_SNAPSHOT) == 0u);
+    CHECK(resolve_recorded_hotkey_mods(MOD_CONTROL, VK_SNAPSHOT) == MOD_CONTROL);
+    CHECK(resolve_recorded_hotkey_mods(MOD_SHIFT | MOD_ALT, VK_SNAPSHOT) == (MOD_SHIFT | MOD_ALT));
+    CHECK(resolve_recorded_hotkey_mods(MOD_WIN, VK_SNAPSHOT) == MOD_WIN);
+    CHECK(resolve_recorded_hotkey_mods(0, 'A') == MOD_ALT);
+    CHECK(resolve_recorded_hotkey_mods(MOD_CONTROL, 'A') == MOD_CONTROL);
+
+    CHECK(is_modifier_vk(VK_SHIFT));
+    CHECK(is_modifier_vk(VK_LSHIFT));
+    CHECK(is_modifier_vk(VK_RCONTROL));
+    CHECK(is_modifier_vk(VK_RMENU));
+    CHECK(is_modifier_vk(VK_LWIN));
+    CHECK(!is_modifier_vk(VK_SNAPSHOT));
+
+    CHECK(format_hotkey(0, VK_SNAPSHOT) == L"PrintScreen");
+    CHECK(format_hotkey(MOD_CONTROL | MOD_SHIFT, VK_SNAPSHOT) == L"Ctrl + Shift + PrintScreen");
+    CHECK(format_hotkey(MOD_ALT, VK_SNAPSHOT, true) == L"Alt+PrintScreen");
+    CHECK(format_hotkey(MOD_WIN, VK_SNAPSHOT, true) == L"Win+PrintScreen");
+
+    // Distinct PrintScreen combinations do not collide with each other
+    bindings[0] = {.enabled = true, .mods = 0, .vk = VK_SNAPSHOT};
+    bindings[1] = {.enabled = true, .mods = MOD_SHIFT, .vk = VK_SNAPSHOT};
+    CHECK(!find_internal_hotkey_conflict(bindings, 0).has_value());
+    CHECK(!find_internal_hotkey_conflict(bindings, 1).has_value());
+    CHECK(check_candidate_hotkey_conflict(bindings, 2, MOD_SHIFT, VK_SNAPSHOT) == HotkeyAction::RegionScreenshot);
+    CHECK(any_printscreen_hotkey(bindings));
+
+    // Windows PrintScreen registry evaluation & fallback policy
+    CHECK(is_windows_printscreen_disabled_value(0u));
+    CHECK(!is_windows_printscreen_disabled_value(1u));
+    CHECK(!is_windows_printscreen_disabled_value(std::nullopt));
+    CHECK(is_windows_reserved_printscreen(0, VK_SNAPSHOT));
+    CHECK(is_windows_reserved_printscreen(MOD_WIN, VK_SNAPSHOT));
+    CHECK(!is_windows_reserved_printscreen(MOD_CONTROL, VK_SNAPSHOT));
+    CHECK(!is_windows_reserved_printscreen(0, VK_F9));
+
+    const HotkeyBinding prtscn_hb{.enabled = true, .mods = 0, .vk = VK_SNAPSHOT};
+    const HotkeyBinding win_prtscn_hb{.enabled = true, .mods = MOD_WIN, .vk = VK_SNAPSHOT};
+    const HotkeyBinding f9_hb{.enabled = true, .mods = 0, .vk = VK_F9};
+    CHECK(should_use_printscreen_hook_fallback(prtscn_hb, true));
+    CHECK(should_use_printscreen_hook_fallback(win_prtscn_hb, true));
+    CHECK(!should_use_printscreen_hook_fallback(prtscn_hb, false));
+    CHECK(!should_use_printscreen_hook_fallback(f9_hb, true));
+    CHECK(is_hotkey_active(HotkeyState::Registered));
+    CHECK(is_hotkey_active(HotkeyState::RegisteredHook));
+    CHECK(!is_hotkey_active(HotkeyState::Unavailable));
+    CHECK(!is_hotkey_active(HotkeyState::Disabled));
 }
 
 static void test_history_store() {
