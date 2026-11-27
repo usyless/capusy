@@ -141,7 +141,7 @@ private:
             return res;
         }
 
-        // Input stream: bottom-up 32bpp RGB32 (universally accepted by all HW & SW Windows H.264 MFTs)
+        // Input stream: top-down 32bpp RGB32 (positive MF_MT_DEFAULT_STRIDE = top-down, universally accepted by HW & SW Windows H.264 MFTs)
         wil::com_ptr<IMFMediaType> in_type;
         if (FAILED(MFCreateMediaType(&in_type)) || !in_type) {
             res.error = "MFCreateMediaType (input) failed";
@@ -164,7 +164,7 @@ private:
             return res;
         }
 
-        // Persistent GDI capture DIB section (bottom-up: biHeight = +h, zero per-frame allocations)
+        // Persistent GDI capture DIB section (top-down: biHeight = -h to match positive MF_MT_DEFAULT_STRIDE, zero per-frame allocations)
         const wil::unique_hdc_window screen_dc{GetDC(nullptr)};
         const wil::unique_hdc mem_dc{screen_dc ? CreateCompatibleDC(screen_dc.get()) : nullptr};
         if (!screen_dc || !mem_dc) {
@@ -175,7 +175,7 @@ private:
         BITMAPINFO bmi{};
         bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
         bmi.bmiHeader.biWidth = static_cast<LONG>(w);
-        bmi.bmiHeader.biHeight = static_cast<LONG>(h); // positive = bottom-up RGB32
+        bmi.bmiHeader.biHeight = -static_cast<LONG>(h); // negative = top-down RGB32
         bmi.bmiHeader.biPlanes = 1;
         bmi.bmiHeader.biBitCount = 32;
         bmi.bmiHeader.biCompression = BI_RGB;
@@ -206,19 +206,16 @@ private:
             }
             GdiFlush();
 
-            // Capture first frame (flipped to top-down BGRA) for instant corner thumbnail toast
+            // Capture first frame (already top-down BGRA) for instant corner thumbnail toast
             if (!res.first_frame) {
                 ui::Raster thumb;
                 thumb.w = w;
                 thumb.h = h;
                 thumb.pixels.resize(frame_bytes);
-                const size_t stride = static_cast<size_t>(w) * 4u;
-                for (uint32_t y = 0; y < h; ++y) {
-                    const uint8_t* src = static_cast<const uint8_t*>(bits) + (static_cast<size_t>(h - 1 - y) * stride);
-                    uint8_t* dst = thumb.pixels.data() + (static_cast<size_t>(y) * stride);
-                    std::memcpy(dst, src, stride);
-                    for (uint32_t x = 0; x < w; ++x) dst[(x * 4u) + 3u] = 255;
-                }
+                std::memcpy(thumb.pixels.data(), bits, frame_bytes);
+                const size_t pixel_count = static_cast<size_t>(w) * h;
+                auto* px32 = reinterpret_cast<uint32_t*>(thumb.pixels.data());
+                for (size_t i = 0; i < pixel_count; ++i) px32[i] |= 0xFF000000u;
                 res.first_frame = std::move(thumb);
             }
 

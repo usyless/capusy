@@ -175,6 +175,7 @@ public:
         cursor_nesw_ = LoadCursorW(nullptr, IDC_SIZENESW);
         cursor_ns_ = LoadCursorW(nullptr, IDC_SIZENS);
         cursor_we_ = LoadCursorW(nullptr, IDC_SIZEWE);
+        current_cursor_ = cursor_cross_;
 
         // Reset session state
         has_selection_ = false;
@@ -218,19 +219,19 @@ public:
                 cancel();
                 return false;
             }
-            if (!mw_ptr->target.attach(sh_.gfx, mw_ptr->hwnd)) {
+            MonitorWindow& mw_ref = *monitors_.emplace_back(std::move(mw_ptr));
+            if (!mw_ref.target.attach(sh_.gfx, mw_ref.hwnd)) {
                 cancel();
                 return false;
             }
             // Upload this monitor's slice of the frozen virtual capture as a native D2D bitmap!
-            if (!upload_monitor_slice(*mw_ptr)) {
+            if (!upload_monitor_slice(mw_ref)) {
                 cancel();
                 return false;
             }
             if (!primary_or_cursor_hwnd || rect_contains_pt(mi.rect, cur)) {
-                primary_or_cursor_hwnd = mw_ptr->hwnd;
+                primary_or_cursor_hwnd = mw_ref.hwnd;
             }
-            monitors_.push_back(std::move(mw_ptr));
         }
 
         // Render initial frozen frame before revealing so there is zero flash!
@@ -763,6 +764,7 @@ private:
                 }
             }
         }
+        current_cursor_ = cur;
         if (cur) SetCursor(cur);
     }
 
@@ -1021,20 +1023,26 @@ private:
 
     static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (msg == WM_NCCREATE) {
-            SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(reinterpret_cast<CREATESTRUCTW*>(lp)->lpCreateParams));
+            auto* mw = reinterpret_cast<MonitorWindow*>(reinterpret_cast<CREATESTRUCTW*>(lp)->lpCreateParams);
+            if (mw) mw->hwnd = hwnd;
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(mw));
         }
         if (auto* mw = reinterpret_cast<MonitorWindow*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA))) {
-            if (mw->owner) return mw->owner->handle(*mw, msg, wp, lp);
+            if (msg == WM_NCDESTROY) {
+                SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+                return DefWindowProcW(hwnd, msg, wp, lp);
+            }
+            if (mw->owner) return mw->owner->handle(*mw, hwnd, msg, wp, lp);
         }
         return DefWindowProcW(hwnd, msg, wp, lp);
     }
 
-    LRESULT handle(MonitorWindow& mw, UINT msg, WPARAM wp, LPARAM lp) {
+    LRESULT handle(MonitorWindow& mw, HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         switch (msg) {
             case WM_ERASEBKGND: return 1;
             case WM_PAINT:
                 render_monitor(mw);
-                ValidateRect(mw.hwnd, nullptr);
+                ValidateRect(hwnd, nullptr);
                 return 0;
             case WM_LBUTTONDOWN:
                 on_lbutton_down(mw, lp);
@@ -1074,12 +1082,15 @@ private:
                 on_key_down(static_cast<UINT>(wp));
                 return 0;
             case WM_SETCURSOR:
-                if (LOWORD(lp) == HTCLIENT) return TRUE;
+                if (LOWORD(lp) == HTCLIENT) {
+                    if (current_cursor_) SetCursor(current_cursor_);
+                    return TRUE;
+                }
                 break;
             default:
                 break;
         }
-        return DefWindowProcW(mw.hwnd, msg, wp, lp);
+        return DefWindowProcW(hwnd, msg, wp, lp);
     }
 
     Shared& sh_;
@@ -1120,6 +1131,7 @@ private:
     HCURSOR cursor_nesw_ = nullptr;
     HCURSOR cursor_ns_ = nullptr;
     HCURSOR cursor_we_ = nullptr;
+    HCURSOR current_cursor_ = nullptr;
 };
 
 } // namespace capusy::ui

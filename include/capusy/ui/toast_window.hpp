@@ -128,13 +128,14 @@ public:
         cloak_window(hwnd_, false);
         ShowWindow(hwnd_, SW_SHOWNOACTIVATE);
         SetWindowPos(hwnd_, HWND_TOPMOST, x, y, px_w, px_h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
-        InvalidateRect(hwnd_, nullptr, FALSE);
+        SetTimer(hwnd_, TIMER_ANIM, 16, nullptr);
         if (sh_.on_visibility_changed) sh_.on_visibility_changed();
     }
 
     void hide_immediate() noexcept {
         if (!hwnd_) return;
         const bool was = shown_;
+        KillTimer(hwnd_, TIMER_ANIM);
         shown_ = false;
         fading_out_ = false;
         hovered_ = false;
@@ -152,6 +153,8 @@ public:
     }
 
 private:
+    static constexpr UINT_PTR TIMER_ANIM = 1;
+
     bool step_anim() {
         if (!shown_) return false;
         const auto now = std::chrono::steady_clock::now();
@@ -177,7 +180,7 @@ private:
         if (!target_.ready()) return;
         const float alpha = std::clamp(opacity_.value, 0.0f, 1.0f);
         std::vector<Hit> unused;
-        (void)target_.render_frame(true, {}, WindowTarget::PresentMode::Vsync, [&](std::optional<D2D1_RECT_F> clip, bool) {
+        (void)target_.render_frame(true, {}, WindowTarget::PresentMode::Immediate, [&](std::optional<D2D1_RECT_F> clip, bool) {
             Canvas cv{target_, sh_.fonts, unused, default_theme(), clip, alpha};
             const D2D1_SIZE_F sz = target_.size();
             const D2D1_RECT_F card = D2D1::RectF(1.0f, 1.0f, sz.width - 1.0f, sz.height - 1.0f);
@@ -228,19 +231,22 @@ private:
         switch (msg) {
             case WM_MOUSEACTIVATE: return MA_NOACTIVATE; // NEVER steal focus!
             case WM_ERASEBKGND: return 1;
+            case WM_TIMER:
+                if (wp == TIMER_ANIM) {
+                    const bool keep_going = self->step_anim();
+                    if (!keep_going) {
+                        KillTimer(hwnd, TIMER_ANIM);
+                    }
+                    if (self->shown_) {
+                        self->render();
+                    }
+                }
+                return 0;
             case WM_PAINT: {
                 PAINTSTRUCT ps;
                 BeginPaint(hwnd, &ps);
-                const bool keep_going = self->step_anim();
                 if (self->shown_) self->render();
                 EndPaint(hwnd, &ps);
-                if (keep_going && self->shown_) {
-                    MSG m;
-                    while (PeekMessageW(&m, nullptr, WM_TIMER, WM_TIMER, PM_REMOVE)) {
-                        DispatchMessageW(&m);
-                    }
-                    if (self->shown_) InvalidateRect(hwnd, nullptr, FALSE);
-                }
                 return 0;
             }
             case WM_MOUSEMOVE:
@@ -249,6 +255,7 @@ private:
                     if (self->fading_out_) {
                         self->fading_out_ = false;
                         self->opacity_.set(1.0f, true);
+                        SetTimer(hwnd, TIMER_ANIM, 16, nullptr);
                     }
                     InvalidateRect(hwnd, nullptr, FALSE);
                     TRACKMOUSEEVENT tme{.cbSize = sizeof(tme), .dwFlags = TME_LEAVE, .hwndTrack = hwnd};
@@ -258,7 +265,10 @@ private:
             case WM_MOUSELEAVE:
                 self->hovered_ = false;
                 self->last_tick_ = std::chrono::steady_clock::now();
-                InvalidateRect(hwnd, nullptr, FALSE);
+                if (self->shown_) {
+                    SetTimer(hwnd, TIMER_ANIM, 16, nullptr);
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                }
                 return 0;
             case WM_LBUTTONUP: {
                 const std::wstring p = self->path_;
