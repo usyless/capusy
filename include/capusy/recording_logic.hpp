@@ -247,6 +247,23 @@ inline constexpr uint32_t RECORD_KEYFRAME_MAX_S = 10u;
     return static_cast<uint16_t>(std::clamp(cs, 2u, 100u));
 }
 
+struct RectI {
+    int left = 0;
+    int top = 0;
+    int right = 0;
+    int bottom = 0;
+};
+
+/// Returns true when a floating recording pill of height `pill_h` cannot sit cleanly
+/// below or above `region` inside `work_area` without overlapping `region`
+/// (e.g. full-screen or maximized recordings), so tray-icon controls should be used instead.
+[[nodiscard]] constexpr bool should_use_tray_recording_mode(
+    RectI region, RectI work_area, int pill_h, int gap = 10, int edge_pad = 8) noexcept {
+    const bool fits_below = (region.bottom + gap + pill_h) <= (work_area.bottom - edge_pad);
+    const bool fits_above = (region.top - gap - pill_h) >= (work_area.top + edge_pad);
+    return !fits_below && !fits_above;
+}
+
 /// Estimates a fallback average bitrate (in bps) for MF SinkWriter when operating in Quality rate-control mode.
 [[nodiscard]] inline uint32_t estimate_quality_hint_bitrate_bps(uint32_t quality, uint32_t fallback_mbps) noexcept {
     const uint32_t q = clamp_record_quality(quality);

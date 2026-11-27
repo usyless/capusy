@@ -58,6 +58,7 @@ struct RecordingConfig {
 
 struct RecordingResult {
     bool ok = false;
+    bool cancelled = false;
     fs::path path;
     std::string format_label;
     uint32_t width = 0;
@@ -159,6 +160,7 @@ public:
 
         const bool want_audio = record_format_supports_audio(cfg.format);
         stop_requested_.store(false, std::memory_order_release);
+        cancel_requested_.store(false, std::memory_order_release);
         desktop_audio_active_.store(want_audio && cfg.record_desktop_audio, std::memory_order_release);
         mic_audio_active_.store(want_audio && cfg.record_mic_audio, std::memory_order_release);
         active_.store(true, std::memory_order_release);
@@ -177,6 +179,11 @@ public:
     }
 
     void request_stop() noexcept {
+        stop_requested_.store(true, std::memory_order_release);
+    }
+
+    void request_cancel() noexcept {
+        cancel_requested_.store(true, std::memory_order_release);
         stop_requested_.store(true, std::memory_order_release);
     }
 
@@ -783,6 +790,14 @@ private:
         const auto end_time = std::chrono::steady_clock::now();
         res.duration_ms = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(end_time - t0).count());
 
+        if (cancel_requested_.load(std::memory_order_acquire)) {
+            writer.reset();
+            fs::remove(output_path, ec);
+            res.cancelled = true;
+            res.ok = false;
+            return res;
+        }
+
         if (frames_written > 0 && SUCCEEDED(writer->Finalize())) {
             res.size_bytes = fs::file_size(output_path, ec);
             if (ec) res.size_bytes = 0;
@@ -946,6 +961,15 @@ private:
         const auto end_time = std::chrono::steady_clock::now();
         res.duration_ms = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(end_time - t0).count());
 
+        if (cancel_requested_.load(std::memory_order_acquire)) {
+            encoder.reset();
+            stream.reset();
+            fs::remove(output_path, ec);
+            res.cancelled = true;
+            res.ok = false;
+            return res;
+        }
+
         if (frames_written > 0 && SUCCEEDED(encoder->Commit())) {
             encoder.reset();
             stream.reset();
@@ -963,6 +987,7 @@ private:
 
     std::atomic<bool> active_{false};
     std::atomic<bool> stop_requested_{false};
+    std::atomic<bool> cancel_requested_{false};
     std::atomic<bool> desktop_audio_active_{false};
     std::atomic<bool> mic_audio_active_{false};
     std::chrono::steady_clock::time_point start_time_{};

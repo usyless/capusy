@@ -26,7 +26,8 @@ enum class HotkeyAction : size_t {
     RegionRecord = 2,
     OpenHistory = 3,
     ColorPicker = 4,
-    Count = 5,
+    FullRecord = 5,
+    Count = 6,
 };
 
 inline constexpr size_t HOTKEY_COUNT = static_cast<size_t>(HotkeyAction::Count);
@@ -65,6 +66,7 @@ inline constexpr uint32_t VK_PRINTSCREEN_CODE = 0x2Cu;
         case HotkeyAction::RegionRecord: return L"Region Recording (Start / Stop)";
         case HotkeyAction::OpenHistory: return L"Open Screenshot History";
         case HotkeyAction::ColorPicker: return L"Screen Color Picker";
+        case HotkeyAction::FullRecord: return L"Full-Screen Recording (Start / Stop)";
         case HotkeyAction::Count: break;
     }
     return L"Shortcut";
@@ -74,9 +76,10 @@ inline constexpr uint32_t VK_PRINTSCREEN_CODE = 0x2Cu;
     switch (a) {
         case HotkeyAction::FullScreenshot: return L"Captures all monitors immediately (fills gaps with black)";
         case HotkeyAction::RegionScreenshot: return L"Freezes all monitors, snaps to windows & elements (instant or edit mode)";
-        case HotkeyAction::RegionRecord: return L"Select a region to record MP4 video; press again to stop";
+        case HotkeyAction::RegionRecord: return L"Select a region to record video/GIF; press again to stop";
         case HotkeyAction::OpenHistory: return L"Shows the screenshot history and preview window";
         case HotkeyAction::ColorPicker: return L"Freezes all monitors, shows RGB under cursor, and copies #HEX on click";
+        case HotkeyAction::FullRecord: return L"Records the full monitor under the cursor immediately; click tray icon or press again to stop";
         case HotkeyAction::Count: break;
     }
     return L"";
@@ -91,6 +94,7 @@ inline constexpr uint32_t VK_PRINTSCREEN_CODE = 0x2Cu;
         case HotkeyAction::RegionRecord: return {.enabled = true, .mods = kAltShift, .vk = '3'};
         case HotkeyAction::OpenHistory: return {.enabled = true, .mods = kAltShift, .vk = 'H'};
         case HotkeyAction::ColorPicker: return {.enabled = true, .mods = kAltShift, .vk = 'C'};
+        case HotkeyAction::FullRecord: return {.enabled = true, .mods = kAltShift, .vk = '4'};
         case HotkeyAction::Count: break;
     }
 #else

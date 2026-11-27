@@ -46,6 +46,7 @@ static void test_hotkey_collisions() {
         {.enabled = true, .mods = MOD_ALT | MOD_SHIFT, .vk = '3'},
         {.enabled = true, .mods = MOD_ALT | MOD_SHIFT, .vk = 'H'},
         {.enabled = true, .mods = MOD_ALT | MOD_SHIFT, .vk = 'C'},
+        {.enabled = true, .mods = MOD_ALT | MOD_SHIFT, .vk = '4'},
     }};
 
     for (size_t i = 0; i < HOTKEY_COUNT; ++i) {
@@ -561,6 +562,20 @@ static void test_recording_logic() {
     CHECK(format_recording_spec_summary(RecordFormat::Mp4, VideoCodec::Hevc, RateControlMode::Quality, 60, 12, 85, 75, 256) == L"MP4 • HEVC • 60 FPS • Q85 • 75%");
     CHECK(format_recording_spec_summary(RecordFormat::Wmv, VideoCodec::H264, RateControlMode::Cbr, 24, 8, 80, 100, 256) == L"WMV • 24 FPS • 8M");
     CHECK(format_recording_spec_summary(RecordFormat::Gif, VideoCodec::H264, RateControlMode::Vbr, 60, 12, 80, 50, 128) == L"GIF • 30 FPS • 128c • 50%");
+
+    // Full-screen / tray-only recording detection
+    const RectI work{.left = 0, .top = 0, .right = 1920, .bottom = 1040};
+    const RectI full_mon{.left = 0, .top = 0, .right = 1920, .bottom = 1080};
+    const RectI mid_region{.left = 200, .top = 150, .right = 1200, .bottom = 750};
+    const RectI bottom_region{.left = 200, .top = 300, .right = 1200, .bottom = 1030};
+    const RectI top_region{.left = 200, .top = 10, .right = 1200, .bottom = 800};
+    const RectI tall_region{.left = 100, .top = 20, .right = 1800, .bottom = 1010};
+    CHECK(should_use_tray_recording_mode(full_mon, work, 40));
+    CHECK(should_use_tray_recording_mode(work, work, 40));
+    CHECK(!should_use_tray_recording_mode(mid_region, work, 40));
+    CHECK(!should_use_tray_recording_mode(bottom_region, work, 40)); // fits above
+    CHECK(!should_use_tray_recording_mode(top_region, work, 40));    // fits below
+    CHECK(should_use_tray_recording_mode(tall_region, work, 40));    // neither fits
 }
 
 static void test_color_logic() {

@@ -49,6 +49,7 @@ struct Shared {
 
     std::function<void()> on_capture_full;
     std::function<void()> on_capture_region;
+    std::function<void()> on_toggle_full_record;
     std::function<void()> on_toggle_record;
     std::function<void()> on_color_picker;
     std::function<void()> on_open_history;

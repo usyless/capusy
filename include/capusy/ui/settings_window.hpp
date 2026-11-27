@@ -586,7 +586,7 @@ private:
         if (open_audio_drop_ != AudioDropdown::None) return false;
         switch (id) {
             case IdTab0: title = L"Global hotkeys, startup, save folder, and image format"; return true;
-            case IdTab1: title = L"Corner preview toast and region screen recording"; return true;
+            case IdTab1: title = L"Corner preview toast and screen recording"; return true;
             case IdTab2: title = L"App info, history database stats, and software updates"; return true;
             case IdToggleHotkey:
                 if (idx >= 0 && std::cmp_less(idx, HOTKEY_COUNT)) {

@@ -29,11 +29,15 @@ constexpr UINT WM_TRAY = WM_APP + 1;
 constexpr UINT TRAY_ID = 1;
 constexpr int HOTKEY_BASE_ID = 100;
 constexpr UINT_PTR TIMER_IDLE_TRIM = 50;
+constexpr UINT_PTR TIMER_REC_TRAY = 51;
 
 enum TrayMenuId : UINT {
     IdTrayFull = 200,
     IdTrayRegion,
+    IdTrayFullRecord,
     IdTrayRecord,
+    IdTrayStopRecord,
+    IdTrayCancelRecord,
     IdTrayColorPicker,
     IdTrayHistory,
     IdTraySettings,
@@ -150,6 +154,7 @@ private:
 
         sh_.on_capture_full = [this] { trigger_full_screenshot(); };
         sh_.on_capture_region = [this] { trigger_region_screenshot(); };
+        sh_.on_toggle_full_record = [this] { trigger_full_recording(); };
         sh_.on_toggle_record = [this] { trigger_toggle_recording(); };
         sh_.on_color_picker = [this] { trigger_color_picker(); };
         sh_.on_open_history = [this] {
@@ -188,7 +193,7 @@ private:
             enqueue_save(std::move(raster), CaptureMode::Region, std::move(win_info));
         };
         region_overlay_->on_record_region_selected = [this](RECT region, WindowInfo&& win_info) {
-            start_region_recording(region, std::move(win_info));
+            start_recording(region, std::move(win_info), false);
         };
         region_overlay_->on_color_picked = [this](Rgb8 rgb) {
             const FixedWString<16> hex_str = format_hex_rgb(rgb);
@@ -201,7 +206,7 @@ private:
         };
         region_overlay_->on_closed = [this] { schedule_idle_trim(); };
 
-        rec_overlay_->on_stop_clicked = [this] { stop_region_recording(); };
+        rec_overlay_->on_stop_clicked = [this] { stop_recording(); };
 
         recorder_.on_finished = [this](RecordingResult&& res) {
             sh_.call([this, res = std::move(res)] mutable {
@@ -233,7 +238,7 @@ private:
 
     void trigger_toggle_recording() {
         if (recorder_.recording()) {
-            stop_region_recording();
+            stop_recording();
             return;
         }
         if (region_overlay_->active()) {
@@ -242,6 +247,23 @@ private:
             if (same) return;
         }
         (void)region_overlay_->start(inst_, OverlayMode::RecordRegion, false);
+    }
+
+    void trigger_full_recording() {
+        if (recorder_.recording()) {
+            stop_recording();
+            return;
+        }
+        if (region_overlay_->active()) {
+            region_overlay_->cancel();
+        }
+        POINT cur{};
+        GetCursorPos(&cur);
+        const HMONITOR mon = MonitorFromPoint(cur, MONITOR_DEFAULTTONEAREST);
+        MONITORINFO mi{.cbSize = sizeof(mi)};
+        if (!mon || !GetMonitorInfoW(mon, &mi)) return;
+        WindowInfo win_info = foreground_window_info();
+        start_recording(mi.rcMonitor, std::move(win_info), true);
     }
 
     void trigger_color_picker() {
@@ -253,7 +275,7 @@ private:
         (void)region_overlay_->start(inst_, OverlayMode::ColorPicker, false);
     }
 
-    void start_region_recording(RECT region, WindowInfo win_info) {
+    void start_recording(RECT region, WindowInfo win_info, bool force_tray_only) {
         if (recorder_.recording()) return;
         const RecordFormat fmt = sh_.settings.resolved_record_format();
         const fs::path out = make_capture_path(resolve_save_dir(sh_.settings), record_format_ext(fmt), sh_.settings.split_by_month);
@@ -282,28 +304,71 @@ private:
         };
         if (!recorder_.start(region, out, std::move(cfg))) {
             balloon_opens_about_ = false;
-            show_balloon(L"Failed to start region recording.", NIIF_ERROR);
+            show_balloon(force_tray_only ? L"Failed to start full-screen recording." : L"Failed to start region recording.", NIIF_ERROR);
             return;
         }
         pending_record_window_ = std::move(win_info);
+        recording_stopping_ = false;
         sh_.recording_active = true;
-        (void)rec_overlay_->show(inst_, recorder_.region(), &recorder_);
+
+        bool tray_only = force_tray_only;
+        if (!tray_only) {
+            const RECT rec_r = recorder_.region();
+            const HMONITOR mon = MonitorFromRect(&rec_r, MONITOR_DEFAULTTONEAREST);
+            MONITORINFO mi{.cbSize = sizeof(mi)};
+            if (mon && GetMonitorInfoW(mon, &mi)) {
+                UINT dx = 96;
+                UINT dy = 96;
+                if (FAILED(GetDpiForMonitor(mon, MDT_EFFECTIVE_DPI, &dx, &dy)) || dx == 0) dx = 96;
+                const float s = static_cast<float>(dx) / 96.0f;
+                tray_only = should_use_tray_recording_mode(
+                    {.left = rec_r.left, .top = rec_r.top, .right = rec_r.right, .bottom = rec_r.bottom},
+                    {.left = mi.rcWork.left, .top = mi.rcWork.top, .right = mi.rcWork.right, .bottom = mi.rcWork.bottom},
+                    static_cast<int>(std::lround(40.0f * s)),
+                    static_cast<int>(std::lround(10.0f * s)));
+            }
+        }
+        if (!tray_only) {
+            (void)rec_overlay_->show(inst_, recorder_.region(), &recorder_);
+        }
+        update_tray_recording_visuals(true);
+        if (tray_hwnd_) SetTimer(tray_hwnd_, TIMER_REC_TRAY, 500, nullptr);
         if (history_win_->visible()) history_win_->invalidate();
         if (settings_win_->visible()) settings_win_->invalidate();
     }
 
-    void stop_region_recording() {
-        if (!recorder_.recording()) return;
+    void stop_recording() {
+        if (!recorder_.recording() || recording_stopping_) return;
+        recording_stopping_ = true;
         recorder_.request_stop();
         rec_overlay_->hide();
+        if (tray_hwnd_) KillTimer(tray_hwnd_, TIMER_REC_TRAY);
+        update_tray_recording_visuals(false);
+    }
+
+    void cancel_recording() {
+        if (!recorder_.recording() || recording_stopping_) return;
+        recording_stopping_ = true;
+        recorder_.request_cancel();
+        rec_overlay_->hide();
+        if (tray_hwnd_) KillTimer(tray_hwnd_, TIMER_REC_TRAY);
+        update_tray_recording_visuals(false);
     }
 
     void on_recording_finished(RecordingResult&& res) {
         sh_.recording_active = false;
+        recording_stopping_ = false;
         rec_overlay_->hide();
+        if (tray_hwnd_) KillTimer(tray_hwnd_, TIMER_REC_TRAY);
+        update_tray_recording_visuals(false);
         WindowInfo win_info = std::move(pending_record_window_);
         pending_record_window_ = {};
+        if (history_win_->visible()) history_win_->invalidate();
         if (settings_win_->visible()) settings_win_->invalidate();
+        if (res.cancelled) {
+            schedule_idle_trim();
+            return;
+        }
         if (!res.ok) {
             if (!res.error.empty()) {
                 balloon_opens_about_ = false;
@@ -591,16 +656,106 @@ private:
         return nid;
     }
 
+    static wil::unique_hicon create_recording_tray_icon(HICON base_icon, int w, int h) noexcept {
+        if (!base_icon || w <= 0 || h <= 0) return {};
+        BITMAPINFO bi{};
+        bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+        bi.bmiHeader.biWidth = w;
+        bi.bmiHeader.biHeight = -h; // top-down
+        bi.bmiHeader.biPlanes = 1;
+        bi.bmiHeader.biBitCount = 32;
+        bi.bmiHeader.biCompression = BI_RGB;
+
+        void* bits = nullptr;
+        const wil::unique_hdc screen_dc{GetDC(nullptr)};
+        const wil::unique_hdc mem_dc{CreateCompatibleDC(screen_dc.get())};
+        if (!mem_dc) return {};
+        const wil::unique_hbitmap color_bmp{CreateDIBSection(mem_dc.get(), &bi, DIB_RGB_COLORS, &bits, nullptr, 0)};
+        if (!color_bmp || !bits) return {};
+
+        std::memset(bits, 0, static_cast<size_t>(w) * static_cast<size_t>(h) * 4u);
+        {
+            const auto old_bmp = wil::SelectObject(mem_dc.get(), color_bmp.get());
+            DrawIconEx(mem_dc.get(), 0, 0, base_icon, w, h, 0, nullptr, DI_NORMAL);
+        }
+
+        // Composite an anti-aliased red REC badge with a dark outer ring in the bottom-right corner
+        auto* px = static_cast<uint8_t*>(bits);
+        const float fw = static_cast<float>(w);
+        const float fh = static_cast<float>(h);
+        const float cx = fw * 0.72f;
+        const float cy = fh * 0.72f;
+        const float r_dot = std::max(2.5f, fw * 0.25f);
+        const float r_ring = std::max(r_dot + 1.2f, fw * 0.34f);
+
+        const auto blend_px = [](uint8_t* p, float sr, float sg, float sb, float sa) noexcept {
+            if (sa <= 0.001f) return;
+            const float da = static_cast<float>(p[3]) / 255.0f;
+            const float out_a = sa + (da * (1.0f - sa));
+            if (out_a <= 0.001f) return;
+            const auto mix = [&](float s, uint8_t d) noexcept -> uint8_t {
+                const float v = ((s * sa) + ((static_cast<float>(d) / 255.0f) * da * (1.0f - sa))) / out_a;
+                return static_cast<uint8_t>(std::clamp(static_cast<int>(std::lround(v * 255.0f)), 0, 255));
+            };
+            p[0] = mix(sb, p[0]);
+            p[1] = mix(sg, p[1]);
+            p[2] = mix(sr, p[2]);
+            p[3] = static_cast<uint8_t>(std::clamp(static_cast<int>(std::lround(out_a * 255.0f)), 0, 255));
+        };
+
+        for (int y = 0; y < h; ++y) {
+            for (int x = 0; x < w; ++x) {
+                const float d = std::hypot((static_cast<float>(x) + 0.5f) - cx, (static_cast<float>(y) + 0.5f) - cy);
+                if (d > r_ring + 0.75f) continue;
+                uint8_t* p = px + ((static_cast<size_t>(y) * static_cast<size_t>(w) + static_cast<size_t>(x)) * 4u);
+                const float ring_a = std::clamp((r_ring + 0.5f) - d, 0.0f, 1.0f);
+                blend_px(p, 0.08f, 0.07f, 0.09f, ring_a * 0.92f);
+                const float dot_a = std::clamp((r_dot + 0.5f) - d, 0.0f, 1.0f);
+                blend_px(p, 1.0f, 0.24f, 0.22f, dot_a);
+            }
+        }
+
+        const wil::unique_hbitmap mask_bmp{CreateBitmap(w, h, 1, 1, nullptr)};
+        if (!mask_bmp) return {};
+        ICONINFO ii{};
+        ii.fIcon = TRUE;
+        ii.hbmMask = mask_bmp.get();
+        ii.hbmColor = color_bmp.get();
+        return wil::unique_hicon{CreateIconIndirect(&ii)};
+    }
+
     void load_tray_icon() noexcept {
         UINT dpi = GetDpiForWindow(tray_hwnd_);
         if (dpi == 0) dpi = GetDpiForSystem();
-        wil::unique_hicon next{static_cast<HICON>(LoadImageW(inst_, MAKEINTRESOURCEW(IDI_APP_ICON), IMAGE_ICON,
-                                                             GetSystemMetricsForDpi(SM_CXSMICON, dpi),
-                                                             GetSystemMetricsForDpi(SM_CYSMICON, dpi), LR_DEFAULTCOLOR))};
+        const int w = GetSystemMetricsForDpi(SM_CXSMICON, dpi);
+        const int h = GetSystemMetricsForDpi(SM_CYSMICON, dpi);
+        wil::unique_hicon next{static_cast<HICON>(LoadImageW(inst_, MAKEINTRESOURCEW(IDI_APP_ICON), IMAGE_ICON, w, h, LR_DEFAULTCOLOR))};
         if (next) {
             tray_icon_ = std::move(next);
+            tray_rec_icon_ = create_recording_tray_icon(tray_icon_.get(), w, h);
             tray_icon_dpi_ = dpi;
         }
+    }
+
+    [[nodiscard]] HICON active_tray_icon() const noexcept {
+        if (recorder_.recording() && !recording_stopping_ && tray_rec_icon_) return tray_rec_icon_.get();
+        return tray_icon_.get();
+    }
+
+    void update_tray_recording_visuals(bool recording) noexcept {
+        if (!tray_hwnd_) return;
+        NOTIFYICONDATAW nid = tray_data();
+        nid.uFlags = NIF_ICON | NIF_TIP | NIF_SHOWTIP;
+        nid.hIcon = (recording && tray_rec_icon_) ? tray_rec_icon_.get() : tray_icon_.get();
+        if (recording) {
+            FixedWString<96> tip{L"capusy — Recording "};
+            tip.append(format_duration_ms(recorder_.elapsed_ms()));
+            tip.append(L" (Click to stop)");
+            wcsncpy_s(nid.szTip, tip.c_str(), _TRUNCATE);
+        } else {
+            wcscpy_s(nid.szTip, L"capusy — Screenshot & Recorder");
+        }
+        Shell_NotifyIconW(NIM_MODIFY, &nid);
     }
 
     void add_tray() {
@@ -608,8 +763,16 @@ private:
         nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP | NIF_SHOWTIP;
         nid.uCallbackMessage = WM_TRAY;
         load_tray_icon();
-        nid.hIcon = tray_icon_.get();
-        wcscpy_s(nid.szTip, L"capusy — Screenshot & Recorder");
+        const bool rec = recorder_.recording() && !recording_stopping_;
+        nid.hIcon = active_tray_icon();
+        if (rec) {
+            FixedWString<96> tip{L"capusy — Recording "};
+            tip.append(format_duration_ms(recorder_.elapsed_ms()));
+            tip.append(L" (Click to stop)");
+            wcsncpy_s(nid.szTip, tip.c_str(), _TRUNCATE);
+        } else {
+            wcscpy_s(nid.szTip, L"capusy — Screenshot & Recorder");
+        }
         Shell_NotifyIconW(NIM_ADD, &nid);
         nid.uVersion = NOTIFYICON_VERSION_4;
         Shell_NotifyIconW(NIM_SETVERSION, &nid);
@@ -646,12 +809,21 @@ private:
         const std::wstring header = ulp::str::concat_strings(APP_NAME, L"  v", APP_VERSION);
         AppendMenuW(menu.get(), MF_STRING | MF_DISABLED, 0, header.c_str());
         AppendMenuW(menu.get(), MF_SEPARATOR, 0, nullptr);
-        AppendMenuW(menu.get(), MF_STRING, IdTrayFull, menu_label(L"Full-Screen Screenshot", HotkeyAction::FullScreenshot).c_str());
-        AppendMenuW(menu.get(), MF_STRING, IdTrayRegion, menu_label(L"Region Screenshot", HotkeyAction::RegionScreenshot).c_str());
-        AppendMenuW(menu.get(), MF_STRING, IdTrayRecord,
-                    menu_label(recorder_.recording() ? L"Stop Region Recording" : L"Region Recording", HotkeyAction::RegionRecord).c_str());
-        AppendMenuW(menu.get(), MF_STRING, IdTrayColorPicker, menu_label(L"Screen Color Picker", HotkeyAction::ColorPicker).c_str());
-        AppendMenuW(menu.get(), MF_SEPARATOR, 0, nullptr);
+        const bool is_rec = recorder_.recording() && !recording_stopping_;
+        if (is_rec) {
+            const std::wstring stop_lbl = ulp::str::concat_strings(
+                L"Stop Recording (", format_duration_ms(recorder_.elapsed_ms()).view(), L")");
+            AppendMenuW(menu.get(), MF_STRING, IdTrayStopRecord, stop_lbl.c_str());
+            AppendMenuW(menu.get(), MF_STRING, IdTrayCancelRecord, L"Cancel Recording (Discard)");
+            AppendMenuW(menu.get(), MF_SEPARATOR, 0, nullptr);
+        } else {
+            AppendMenuW(menu.get(), MF_STRING, IdTrayFull, menu_label(L"Full-Screen Screenshot", HotkeyAction::FullScreenshot).c_str());
+            AppendMenuW(menu.get(), MF_STRING, IdTrayRegion, menu_label(L"Region Screenshot", HotkeyAction::RegionScreenshot).c_str());
+            AppendMenuW(menu.get(), MF_STRING, IdTrayFullRecord, menu_label(L"Full-Screen Recording", HotkeyAction::FullRecord).c_str());
+            AppendMenuW(menu.get(), MF_STRING, IdTrayRecord, menu_label(L"Region Recording", HotkeyAction::RegionRecord).c_str());
+            AppendMenuW(menu.get(), MF_STRING, IdTrayColorPicker, menu_label(L"Screen Color Picker", HotkeyAction::ColorPicker).c_str());
+            AppendMenuW(menu.get(), MF_SEPARATOR, 0, nullptr);
+        }
         AppendMenuW(menu.get(), MF_STRING, IdTrayHistory, menu_label(L"Open History", HotkeyAction::OpenHistory).c_str());
         AppendMenuW(menu.get(), MF_STRING, IdTraySettings, L"Settings");
         if (sh_.has_update_available()) {
@@ -664,7 +836,7 @@ private:
         }
         AppendMenuW(menu.get(), MF_SEPARATOR, 0, nullptr);
         AppendMenuW(menu.get(), MF_STRING, IdTrayQuit, L"Quit capusy");
-        SetMenuDefaultItem(menu.get(), IdTrayHistory, FALSE);
+        SetMenuDefaultItem(menu.get(), is_rec ? IdTrayStopRecord : IdTrayHistory, FALSE);
 
         POINT pt{};
         GetCursorPos(&pt);
@@ -675,7 +847,10 @@ private:
         switch (cmd) {
             case IdTrayFull: trigger_full_screenshot(); break;
             case IdTrayRegion: trigger_region_screenshot(); break;
+            case IdTrayFullRecord: trigger_full_recording(); break;
             case IdTrayRecord: trigger_toggle_recording(); break;
+            case IdTrayStopRecord: stop_recording(); break;
+            case IdTrayCancelRecord: cancel_recording(); break;
             case IdTrayColorPicker: trigger_color_picker(); break;
             case IdTrayHistory:
                 history_win_->show();
@@ -721,6 +896,7 @@ private:
                 if (idx == static_cast<int>(HotkeyAction::FullScreenshot)) trigger_full_screenshot();
                 else if (idx == static_cast<int>(HotkeyAction::RegionScreenshot)) trigger_region_screenshot();
                 else if (idx == static_cast<int>(HotkeyAction::RegionRecord)) trigger_toggle_recording();
+                else if (idx == static_cast<int>(HotkeyAction::FullRecord)) trigger_full_recording();
                 else if (idx == static_cast<int>(HotkeyAction::OpenHistory)) history_win_->show();
                 else if (idx == static_cast<int>(HotkeyAction::ColorPicker)) trigger_color_picker();
                 return 0;
@@ -735,6 +911,12 @@ private:
                 if (wp == TIMER_IDLE_TRIM) {
                     KillTimer(hwnd, TIMER_IDLE_TRIM);
                     perform_idle_trim();
+                } else if (wp == TIMER_REC_TRAY) {
+                    if (recorder_.recording() && !recording_stopping_) {
+                        update_tray_recording_visuals(true);
+                    } else {
+                        KillTimer(hwnd, TIMER_REC_TRAY);
+                    }
                 }
                 return 0;
             case WM_TRAY:
@@ -742,8 +924,12 @@ private:
                     case NIN_SELECT:
                     case NIN_KEYSELECT:
                     case WM_LBUTTONDBLCLK:
-                        history_win_->show();
-                        settings_win_->maybe_auto_check_updates();
+                        if (recorder_.recording()) {
+                            stop_recording();
+                        } else if (!recording_stopping_) {
+                            history_win_->show();
+                            settings_win_->maybe_auto_check_updates();
+                        }
                         break;
                     case WM_CONTEXTMENU:
                     case WM_RBUTTONUP:
@@ -777,14 +963,16 @@ private:
                 const UINT dpi = GetDpiForWindow(hwnd);
                 if (dpi != 0 && dpi != tray_icon_dpi_) {
                     wil::unique_hicon old = std::move(tray_icon_);
+                    wil::unique_hicon old_rec = std::move(tray_rec_icon_);
                     load_tray_icon();
                     if (tray_icon_) {
                         NOTIFYICONDATAW nid = tray_data();
                         nid.uFlags = NIF_ICON;
-                        nid.hIcon = tray_icon_.get();
+                        nid.hIcon = active_tray_icon();
                         Shell_NotifyIconW(NIM_MODIFY, &nid);
                     } else {
                         tray_icon_ = std::move(old);
+                        tray_rec_icon_ = std::move(old_rec);
                     }
                 }
                 return 0;
@@ -799,7 +987,9 @@ private:
     HWND tray_hwnd_ = nullptr;
     UINT taskbar_created_ = 0;
     wil::unique_hicon tray_icon_;
+    wil::unique_hicon tray_rec_icon_;
     UINT tray_icon_dpi_ = 0;
+    bool recording_stopping_ = false;
     HHOOK snapshot_hook_ = nullptr;
     std::array<SnapshotHookSlot, HOTKEY_COUNT> snapshot_hook_slots_{};
     bool snapshot_hook_down_ = false;

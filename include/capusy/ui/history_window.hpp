@@ -272,6 +272,7 @@ private:
         IdNone = 0,
         IdBtnFull,
         IdBtnRegion,
+        IdBtnFullRecord,
         IdBtnRecord,
         IdBtnColorPicker,
         IdBtnSettings,
@@ -490,6 +491,7 @@ private:
         switch (id) {
             case IdBtnFull:
             case IdBtnRegion:
+            case IdBtnFullRecord:
             case IdBtnRecord:
             case IdBtnColorPicker:
             case IdBtnSettings:
@@ -529,8 +531,12 @@ private:
                 title = L"Capture region";
                 subtitle = hotkey_subtitle(HotkeyAction::RegionScreenshot);
                 return true;
+            case IdBtnFullRecord:
+                title = L"Start full-screen recording (tray controls)";
+                subtitle = hotkey_subtitle(HotkeyAction::FullRecord);
+                return true;
             case IdBtnRecord:
-                title = sh_.recording_active ? L"Stop region recording" : L"Start region recording";
+                title = sh_.recording_active ? L"Stop recording" : L"Start region recording";
                 subtitle = hotkey_subtitle(HotkeyAction::RegionRecord);
                 return true;
             case IdBtnColorPicker:
@@ -643,6 +649,7 @@ private:
         const float color_w = button_width(cv, L"Color", true, 78.0f);
         const wchar_t* rec_lbl = sh_.recording_active ? L"Stop Rec" : L"Record";
         const float rec_w = button_width(cv, rec_lbl, true, 96.0f);
+        const float frec_w = button_width(cv, L"Full Rec", true, 96.0f);
         const float reg_w = button_width(cv, L"Region", true, 92.0f);
         const float full_w = button_width(cv, L"Full Screen", true, 112.0f);
 
@@ -657,6 +664,10 @@ private:
         draw_button(cv, hover_.alpha(IdBtnColorPicker), rect(rx, 11.0f, color_w, 32.0f), glyph::eyedropper, L"Color", IdBtnColorPicker, 0, 0);
         rx -= 8.0f + rec_w;
         draw_button(cv, hover_.alpha(IdBtnRecord), rect(rx, 11.0f, rec_w, 32.0f), sh_.recording_active ? glyph::stop : glyph::video, rec_lbl, IdBtnRecord, 0, sh_.recording_active ? 2 : 0);
+        if (!sh_.recording_active) {
+            rx -= 8.0f + frec_w;
+            draw_button(cv, hover_.alpha(IdBtnFullRecord), rect(rx, 11.0f, frec_w, 32.0f), glyph::video, L"Full Rec", IdBtnFullRecord, 0, 0);
+        }
         rx -= 8.0f + reg_w;
         draw_button(cv, hover_.alpha(IdBtnRegion), rect(rx, 11.0f, reg_w, 32.0f), glyph::crop, L"Region", IdBtnRegion, 0, 0);
         rx -= 8.0f + full_w;
@@ -1332,6 +1343,7 @@ private:
                 return;
             case IdBtnFull: if (sh_.on_capture_full) sh_.on_capture_full(); return;
             case IdBtnRegion: if (sh_.on_capture_region) sh_.on_capture_region(); return;
+            case IdBtnFullRecord: if (sh_.on_toggle_full_record) sh_.on_toggle_full_record(); return;
             case IdBtnRecord: if (sh_.on_toggle_record) sh_.on_toggle_record(); return;
             case IdBtnColorPicker: if (sh_.on_color_picker) sh_.on_color_picker(); return;
             case IdBtnSettings: if (sh_.on_open_settings) sh_.on_open_settings(0); return;
