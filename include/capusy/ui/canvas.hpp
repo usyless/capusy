@@ -253,6 +253,9 @@ struct Hit {
 inline bool contains(const D2D1_RECT_F& r, D2D1_POINT_2F p) noexcept {
     return p.x >= r.left && p.x < r.right && p.y >= r.top && p.y < r.bottom;
 }
+[[nodiscard]] inline bool rect_equal(const D2D1_RECT_F& a, const D2D1_RECT_F& b) noexcept {
+    return a.left == b.left && a.top == b.top && a.right == b.right && a.bottom == b.bottom;
+}
 inline D2D1_RECT_F rect(float x, float y, float w, float h) noexcept { return D2D1::RectF(x, y, x + w, y + h); }
 inline D2D1_RECT_F inset(D2D1_RECT_F r, float dx, float dy) noexcept { return D2D1::RectF(r.left + dx, r.top + dy, r.right - dx, r.bottom - dy); }
 inline float width(const D2D1_RECT_F& r) noexcept { return r.right - r.left; }
@@ -269,6 +272,8 @@ public:
     [[nodiscard]] ID2D1DeviceContext6* dc() const noexcept { return dc_; }
     [[nodiscard]] Fonts& fonts() const noexcept { return fonts_; }
     [[nodiscard]] const Theme& theme() const noexcept { return theme_; }
+    [[nodiscard]] bool has_dirty_clip() const noexcept { return dirty_clip_.has_value(); }
+    [[nodiscard]] std::optional<D2D1_RECT_F> dirty_clip() const noexcept { return dirty_clip_; }
     [[nodiscard]] float scale() const noexcept {
         const float s = target_.scale();
         return s > 0.0f ? s : 1.0f;

@@ -51,6 +51,16 @@ public:
         scroll_ = 0.0f;
     }
 
+    void clear_cached_layout() noexcept {
+        cached_layout_.reset();
+        cached_dwrite_ = nullptr;
+        cached_h_ = 0.0f;
+        cached_text_.clear();
+        cached_text_.shrink_to_fit();
+        sel_ranges_.clear();
+        sel_ranges_.shrink_to_fit();
+    }
+
     bool on_key(HWND hwnd, UINT vk, bool& handled) {
         const bool ctrl = GetKeyState(VK_CONTROL) < 0;
         const bool shift = GetKeyState(VK_SHIFT) < 0;

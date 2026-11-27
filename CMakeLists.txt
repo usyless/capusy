@@ -190,6 +190,9 @@ if(CAPUSY_USE_MIMALLOC AND NOT (MSVC AND CMAKE_BUILD_TYPE STREQUAL "Debug"))
     target_link_libraries(capusy_common INTERFACE
         mimalloc-obj
     )
+    target_sources(capusy_common INTERFACE
+        $<TARGET_OBJECTS:mimalloc-obj>
+    )
 endif()
 
 ##### capusy.exe

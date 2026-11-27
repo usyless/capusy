@@ -86,7 +86,10 @@ public:
 
         SetWindowPos(hwnd_, HWND_TOPMOST, x, y, px_w, px_h, SWP_NOACTIVATE);
         if (!target_.ready()) {
-            if (!target_.attach(sh_.gfx, hwnd_)) return;
+            if (!target_.attach(sh_.gfx, hwnd_)) {
+                if (sh_.on_visibility_changed) sh_.on_visibility_changed();
+                return;
+            }
         } else {
             (void)target_.resize(static_cast<UINT>(px_w), static_cast<UINT>(px_h));
         }
@@ -128,6 +131,9 @@ public:
         if (opacity_.value < 0.05f) opacity_.snap(0.0f);
         opacity_.set(1.0f, true);
         last_tick_ = std::chrono::steady_clock::now();
+        full_dirty_ = true;
+        last_drawn_alpha_ = -1.0f;
+        last_drawn_bar_w_ = -1.0f;
 
         render();
         cloak_window(hwnd_, false);
@@ -168,7 +174,10 @@ public:
 
         SetWindowPos(hwnd_, HWND_TOPMOST, x, y, px_w, px_h, SWP_NOACTIVATE);
         if (!target_.ready()) {
-            if (!target_.attach(sh_.gfx, hwnd_)) return;
+            if (!target_.attach(sh_.gfx, hwnd_)) {
+                if (sh_.on_visibility_changed) sh_.on_visibility_changed();
+                return;
+            }
         } else {
             (void)target_.resize(static_cast<UINT>(px_w), static_cast<UINT>(px_h));
         }
@@ -181,6 +190,9 @@ public:
         if (opacity_.value < 0.05f) opacity_.snap(0.0f);
         opacity_.set(1.0f, true);
         last_tick_ = std::chrono::steady_clock::now();
+        full_dirty_ = true;
+        last_drawn_alpha_ = -1.0f;
+        last_drawn_bar_w_ = -1.0f;
 
         render();
         cloak_window(hwnd_, false);
@@ -198,6 +210,11 @@ public:
         fading_out_ = false;
         hovered_ = false;
         opacity_.snap(0.0f);
+        full_dirty_ = true;
+        last_drawn_alpha_ = -1.0f;
+        last_drawn_bar_w_ = -1.0f;
+        path_.clear();
+        path_.shrink_to_fit();
         thumb_bmp_.reset();
         target_.release();
         cloak_window(hwnd_, true);
@@ -208,6 +225,9 @@ public:
     void reset_gpu() noexcept {
         thumb_bmp_.reset();
         target_.release();
+        full_dirty_ = true;
+        last_drawn_alpha_ = -1.0f;
+        last_drawn_bar_w_ = -1.0f;
     }
 
 private:
@@ -234,13 +254,28 @@ private:
         return shown_ && (!hovered_ || opacity_.active(0.005f));
     }
 
-    void render() {
+    void render(bool force_full = false) {
         if (!target_.ready()) return;
+        const D2D1_SIZE_F sz = target_.size();
         const float alpha = std::clamp(opacity_.value, 0.0f, 1.0f);
+        const float frac = std::clamp(1.0f - (elapsed_s_ / std::max(0.1f, timeout_s_)), 0.0f, 1.0f);
+        const float bar_w = (sz.width - 20.0f) * frac;
+
+        const bool need_full = force_full || full_dirty_ ||
+                               std::abs(alpha - last_drawn_alpha_) > 0.001f ||
+                               hovered_ != last_drawn_hovered_;
+        if (!need_full && std::abs(bar_w - last_drawn_bar_w_) < 0.25f) {
+            return;
+        }
+
+        const D2D1_RECT_F bar_dirty = D2D1::RectF(8.0f, sz.height - 8.0f, sz.width - 8.0f, sz.height - 1.0f);
+        const std::span<const D2D1_RECT_F> dirty_span = need_full
+            ? std::span<const D2D1_RECT_F>{}
+            : std::span<const D2D1_RECT_F>{&bar_dirty, 1};
+
         std::vector<Hit> unused;
-        (void)target_.render_frame(true, {}, WindowTarget::PresentMode::Immediate, [&](std::optional<D2D1_RECT_F> clip, bool) {
+        const bool ok = target_.render_frame(need_full, dirty_span, WindowTarget::PresentMode::Immediate, [&](std::optional<D2D1_RECT_F> clip, bool) {
             Canvas cv{target_, sh_.fonts, unused, default_theme(), clip, alpha};
-            const D2D1_SIZE_F sz = target_.size();
             const D2D1_RECT_F card = D2D1::RectF(1.0f, 1.0f, sz.width - 1.0f, sz.height - 1.0f);
             cv.fill_round(card, 12.0f, with_alpha(cv.theme().surface, 0.96f));
             cv.stroke_round(card, 12.0f, hovered_ ? cv.theme().primary : cv.theme().outline_variant, hovered_ ? 1.5f : 1.0f);
@@ -285,12 +320,16 @@ private:
             }
 
             // Auto-hide countdown bar
-            const float frac = std::clamp(1.0f - (elapsed_s_ / std::max(0.1f, timeout_s_)), 0.0f, 1.0f);
-            const float bar_w = (sz.width - 20.0f) * frac;
             if (bar_w > 1.0f) {
                 cv.fill_round(rect(10.0f, sz.height - 5.0f, bar_w, 2.5f), 1.2f, with_alpha(cv.theme().primary, 0.85f));
             }
         });
+        if (ok) {
+            full_dirty_ = false;
+            last_drawn_alpha_ = alpha;
+            last_drawn_hovered_ = hovered_;
+            last_drawn_bar_w_ = bar_w;
+        }
     }
 
     static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
@@ -323,6 +362,7 @@ private:
             case WM_MOUSEMOVE:
                 if (!self->hovered_) {
                     self->hovered_ = true;
+                    self->full_dirty_ = true;
                     if (self->fading_out_) {
                         self->fading_out_ = false;
                         self->opacity_.set(1.0f, true);
@@ -335,6 +375,7 @@ private:
                 return 0;
             case WM_MOUSELEAVE:
                 self->hovered_ = false;
+                self->full_dirty_ = true;
                 self->last_tick_ = std::chrono::steady_clock::now();
                 if (self->shown_) {
                     SetTimer(hwnd, TIMER_ANIM, 16, nullptr);
@@ -377,6 +418,10 @@ private:
     float timeout_s_ = 4.0f;
     AnimFloat opacity_;
     std::chrono::steady_clock::time_point last_tick_{};
+    bool full_dirty_ = true;
+    float last_drawn_alpha_ = -1.0f;
+    bool last_drawn_hovered_ = false;
+    float last_drawn_bar_w_ = -1.0f;
 };
 
 } // namespace capusy::ui

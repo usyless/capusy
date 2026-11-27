@@ -551,9 +551,13 @@ private:
                 return false;
             }
             if (!configure_video_stream(writer.get(), w, h, fps, cfg, eff_codec, use_dxgi_nv12, video_stream_idx, res.error)) {
+                writer.reset();
+                fs::remove(output_path, ec);
                 return false;
             }
             if (with_audio && !configure_audio_stream(writer.get(), cfg, audio_stream_idx, actual_audio_sr, actual_audio_ch)) {
+                writer.reset();
+                fs::remove(output_path, ec);
                 return false;
             }
             using_dxgi_nv12 = use_dxgi_nv12;
@@ -588,6 +592,8 @@ private:
         }
 
         if (!using_dxgi_nv12 && !surface.init_cpu_pipeline(res.error)) {
+            writer.reset();
+            fs::remove(output_path, ec);
             return res;
         }
 
@@ -600,6 +606,8 @@ private:
         mic_audio_active_.store(mic_ok, std::memory_order_release);
 
         if (FAILED(writer->BeginWriting())) {
+            writer.reset();
+            fs::remove(output_path, ec);
             res.error = "IMFSinkWriter::BeginWriting failed";
             return res;
         }
@@ -792,6 +800,8 @@ private:
 
         if (cancel_requested_.load(std::memory_order_acquire)) {
             writer.reset();
+            dxgi_mgr.reset();
+            surface.shutdown();
             fs::remove(output_path, ec);
             res.cancelled = true;
             res.ok = false;
@@ -799,11 +809,16 @@ private:
         }
 
         if (frames_written > 0 && SUCCEEDED(writer->Finalize())) {
+            writer.reset();
+            dxgi_mgr.reset();
+            surface.shutdown();
             res.size_bytes = fs::file_size(output_path, ec);
             if (ec) res.size_bytes = 0;
             res.ok = true;
         } else {
             writer.reset();
+            dxgi_mgr.reset();
+            surface.shutdown();
             fs::remove(output_path, ec);
             res.error = frames_written == 0
                 ? "No video frames were captured"
@@ -846,6 +861,9 @@ private:
         wil::com_ptr<IWICBitmapEncoder> encoder;
         if (FAILED(wic->CreateEncoder(GUID_ContainerFormatGif, nullptr, &encoder)) || !encoder ||
             FAILED(encoder->Initialize(stream.get(), WICBitmapEncoderNoCache))) {
+            encoder.reset();
+            stream.reset();
+            fs::remove(output_path, ec);
             res.error = "Failed to initialize WIC GIF encoder";
             return res;
         }
@@ -873,6 +891,10 @@ private:
         const auto wgc_mons = enumerate_wgc_monitors();
         if (!surface.init(region, wgc_mons, src_w, src_h, w, h, cfg.include_cursor, fps, res.error) ||
             !surface.init_cpu_pipeline(res.error)) {
+            global_meta.reset();
+            encoder.reset();
+            stream.reset();
+            fs::remove(output_path, ec);
             return res;
         }
         surface.wait_initial_frames(stop_requested_, 600u);
@@ -961,7 +983,10 @@ private:
         const auto end_time = std::chrono::steady_clock::now();
         res.duration_ms = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(end_time - t0).count());
 
+        surface.shutdown();
+
         if (cancel_requested_.load(std::memory_order_acquire)) {
+            global_meta.reset();
             encoder.reset();
             stream.reset();
             fs::remove(output_path, ec);
@@ -971,12 +996,14 @@ private:
         }
 
         if (frames_written > 0 && SUCCEEDED(encoder->Commit())) {
+            global_meta.reset();
             encoder.reset();
             stream.reset();
             res.size_bytes = fs::file_size(output_path, ec);
             if (ec) res.size_bytes = 0;
             res.ok = true;
         } else {
+            global_meta.reset();
             encoder.reset();
             stream.reset();
             fs::remove(output_path, ec);

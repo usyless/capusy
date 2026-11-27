@@ -144,16 +144,36 @@ struct WgcDevice {
     wil::com_ptr<ID3D11Device> d3d;
     wil::com_ptr<ID3D11DeviceContext> ctx;
     wil::com_ptr<ABI::Windows::Graphics::DirectX::Direct3D11::IDirect3DDevice> winrt_dev;
+    bool owns_d3d = false;
+
+    WgcDevice() = default;
+    WgcDevice(const WgcDevice&) = delete;
+    WgcDevice& operator=(const WgcDevice&) = delete;
+    WgcDevice(WgcDevice&&) = delete;
+    WgcDevice& operator=(WgcDevice&&) = delete;
+    ~WgcDevice() { reset(); }
+
+    void reset() noexcept {
+        close_winrt_object(winrt_dev.get());
+        winrt_dev.reset();
+        if (ctx) {
+            if (owns_d3d) ctx->ClearState();
+            ctx->Flush();
+        }
+        ctx.reset();
+        d3d.reset();
+        owns_d3d = false;
+    }
 
     bool init(ID3D11Device* shared_d3d = nullptr, bool need_video = false) noexcept {
-        d3d.reset();
-        ctx.reset();
-        winrt_dev.reset();
+        reset();
 
         if (shared_d3d) {
             d3d = shared_d3d;
             d3d->GetImmediateContext(&ctx);
+            owns_d3d = false;
         } else {
+            owns_d3d = true;
             static constexpr std::array<D3D_FEATURE_LEVEL, 4> levels = {
                 D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_1, D3D_FEATURE_LEVEL_10_0};
             const UINT base_flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
@@ -174,21 +194,37 @@ struct WgcDevice {
                                        levels.data(), static_cast<UINT>(levels.size()),
                                        D3D11_SDK_VERSION, &d3d, nullptr, &ctx);
             }
-            if (FAILED(hr)) return false;
+            if (FAILED(hr)) {
+                reset();
+                return false;
+            }
         }
-        if (!d3d || !ctx) return false;
+        if (!d3d || !ctx) {
+            reset();
+            return false;
+        }
 
         if (const auto mt = d3d.try_query<ID3D10Multithread>()) {
             mt->SetMultithreadProtected(TRUE);
         }
 
         const auto dxgi_dev = d3d.try_query<IDXGIDevice>();
-        if (!dxgi_dev) return false;
+        if (!dxgi_dev) {
+            reset();
+            return false;
+        }
 
         wil::com_ptr<IInspectable> insp;
-        if (FAILED(CreateDirect3D11DeviceFromDXGIDevice(dxgi_dev.get(), &insp)) || !insp) return false;
+        if (FAILED(CreateDirect3D11DeviceFromDXGIDevice(dxgi_dev.get(), &insp)) || !insp) {
+            reset();
+            return false;
+        }
         winrt_dev = insp.try_query<ABI::Windows::Graphics::DirectX::Direct3D11::IDirect3DDevice>();
-        return winrt_dev != nullptr;
+        if (!winrt_dev) {
+            reset();
+            return false;
+        }
+        return true;
     }
 };
 
@@ -562,6 +598,9 @@ inline std::optional<ui::Raster> wgc_capture_monitors_to_raster(
     }
 
     for (auto& s : slots) s->session.stop();
+    slots.clear();
+    staging.reset();
+    dev.reset();
     if (completed == 0) return std::nullopt;
     return out;
 }
@@ -668,9 +707,8 @@ public:
         video_dev_.reset();
         src_tex_.reset();
         cpu_buf_.clear();
-        dev_.winrt_dev.reset();
-        dev_.ctx.reset();
-        dev_.d3d.reset();
+        cpu_buf_.shrink_to_fit();
+        dev_.reset();
     }
 
     [[nodiscard]] ID3D11Device* d3d_device() const noexcept { return dev_.d3d.get(); }

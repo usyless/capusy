@@ -3,6 +3,7 @@
 #include "canvas.hpp"
 #include "shared.hpp"
 #include "widgets.hpp"
+#include "window_lifecycle.hpp"
 
 #include <capusy/audio_capture.hpp>
 #include <capusy/recorder.hpp>
@@ -94,17 +95,24 @@ public:
             scroll_ = target_scroll_ = 0.0f;
         }
         if (!sh_.gfx.ensure_device(hwnd_)) return;
-        if (!target_.ready() && !target_.attach(sh_.gfx, hwnd_)) return;
+        if (!target_.ready() && !target_.attach(sh_.gfx, hwnd_)) {
+            if (sh_.on_visibility_changed) sh_.on_visibility_changed();
+            return;
+        }
 
         sync_state(false);
         apply_dark_window(hwnd_, DWMSBT_MAINWINDOW, true);
         cloak_window(hwnd_, false);
+        minimized_ = false;
         if (IsIconic(hwnd_)) ShowWindow(hwnd_, SW_RESTORE);
         else ShowWindow(hwnd_, SW_SHOWNORMAL);
         SetForegroundWindow(hwnd_);
         SetFocus(hwnd_);
         window_active_ = true;
         tooltip_.clear(hwnd_, TIMER_TOOLTIP, false);
+        last_tooltip_dirty_.reset();
+        full_dirty_ = true;
+        pending_dirty_.clear();
         anim_active_ = false;
         render();
         ValidateRect(hwnd_, nullptr);
@@ -115,14 +123,29 @@ public:
         if (!hwnd_) return;
         stop_recording_hotkey();
         tooltip_.clear(hwnd_, TIMER_TOOLTIP, false);
+        last_tooltip_dirty_.reset();
         raw_hover_id_ = IdNone;
         raw_hover_index_ = 0;
         dragging_scroll_ = false;
         in_sizemove_ = false;
+        minimized_ = false;
         dragging_slider_ = IdNone;
         open_audio_drop_ = AudioDropdown::None;
         anim_active_ = false;
+        full_dirty_ = true;
         hover_.set(IdNone, 0, false);
+        desktop_devices_.clear();
+        desktop_devices_.shrink_to_fit();
+        mic_devices_.clear();
+        mic_devices_.shrink_to_fit();
+        hits_.clear();
+        hits_.shrink_to_fit();
+        scratch_hits_.clear();
+        scratch_hits_.shrink_to_fit();
+        pending_dirty_.clear();
+        pending_dirty_.shrink_to_fit();
+        dirty_dips_scratch_.clear();
+        dirty_dips_scratch_.shrink_to_fit();
         app_icon_.reset();
         target_.release();
         cloak_window(hwnd_, true);
@@ -133,10 +156,23 @@ public:
     void reset_gpu() noexcept {
         app_icon_.reset();
         target_.release();
+        full_dirty_ = true;
+        pending_dirty_.clear();
     }
 
     void invalidate() noexcept {
-        if (visible()) InvalidateRect(hwnd_, nullptr, FALSE);
+        full_dirty_ = true;
+        pending_dirty_.clear();
+        if (window_can_render_live(visible(), minimized_)) InvalidateRect(hwnd_, nullptr, FALSE);
+    }
+
+    void invalidate_rect(D2D1_RECT_F r) {
+        if (r.right <= r.left || r.bottom <= r.top) {
+            invalidate();
+            return;
+        }
+        if (!full_dirty_) pending_dirty_.push_back(r);
+        if (window_can_render_live(visible(), minimized_)) InvalidateRect(hwnd_, nullptr, FALSE);
     }
 
     void sync_and_invalidate() {
@@ -361,10 +397,58 @@ private:
     }
 
     void start_anim() noexcept {
-        if (!visible()) return;
+        if (!window_can_render_live(visible(), minimized_)) return;
         if (!anim_active_) last_anim_ = std::chrono::steady_clock::now();
         anim_active_ = true;
         InvalidateRect(hwnd_, nullptr, FALSE);
+    }
+
+    void queue_hit_dirty(std::vector<D2D1_RECT_F>& out, int id, int idx, bool& full_dirty) const {
+        if (id == IdNone) return;
+        if (id == IdScrollbar) {
+            if (view_rect_.right > view_rect_.left && view_rect_.bottom > view_rect_.top) {
+                out.push_back(D2D1::RectF(view_rect_.right - 14.0f, view_rect_.top, view_rect_.right, view_rect_.bottom));
+            } else {
+                full_dirty = true;
+            }
+            return;
+        }
+        bool found = false;
+        const bool is_slider = (id == IdSliderImageQuality || id == IdSliderToastSize || id == IdSliderToastTimeout ||
+                                id == IdSliderRecFps || id == IdSliderRecScale || id == IdSliderRecBitrate ||
+                                id == IdSliderRecQuality);
+        const float pad = is_slider ? 10.0f : 3.0f;
+        for (const Hit& h : hits_) {
+            if (h.id == id && h.index == idx) {
+                out.push_back(D2D1::RectF(h.r.left - pad, h.r.top - pad, h.r.right + pad, h.r.bottom + pad));
+                found = true;
+            }
+        }
+        if (!found) full_dirty = true;
+    }
+
+    void queue_animating_switches(std::vector<D2D1_RECT_F>& out, bool& full_dirty) const {
+        const auto check = [&](const AnimFloat& sw, int id, int idx = 0) {
+            if (sw.value != sw.target) queue_hit_dirty(out, id, idx, full_dirty);
+        };
+        for (size_t i = 0; i < HOTKEY_COUNT; ++i) {
+            check(sw_hotkeys_[i], IdToggleHotkey, static_cast<int>(i));
+        }
+        check(sw_win_prtscn_, IdToggleWinPrtSc);
+        check(sw_startup_, IdToggleStartup);
+        check(sw_auto_copy_, IdToggleAutoCopy);
+        check(sw_cap_cursor_, IdToggleCaptureCursor);
+        check(sw_instant_region_, IdToggleInstantRegion);
+        check(sw_split_month_, IdToggleSplitMonth);
+        check(sw_sharex_existing_only_, IdToggleShareXExistingOnly);
+        check(sw_toast_, IdToggleToast);
+        check(sw_rec_cursor_, IdToggleRecordCursor);
+        check(sw_rec_hw_accel_, IdToggleRecHwAccel);
+        check(sw_rec_frag_mp4_, IdToggleRecFragMp4);
+        check(sw_rec_gif_dither_, IdToggleRecGifDither);
+        check(sw_rec_desktop_, IdToggleRecDesktop);
+        check(sw_rec_mic_, IdToggleRecMic);
+        check(sw_auto_update_, IdToggleAutoUpdate);
     }
 
     bool step_anim() noexcept {
@@ -479,21 +563,68 @@ private:
     }
 
     void render() {
-        if (!visible() || rendering_) return;
+        if (!window_can_render_live(visible(), minimized_) || rendering_) return;
         if (!target_.ready()) {
             if (!sh_.gfx.ensure_device(hwnd_) || !target_.rebuild()) return;
+            full_dirty_ = true;
         }
         rendering_ = true;
         const auto guard = wil::scope_exit([&] { rendering_ = false; });
 
+        const float prev_scroll = scroll_;
+        if (dragging_scroll_ || std::abs(target_scroll_ - scroll_) >= 0.5f) {
+            full_dirty_ = true;
+        }
+
+        dirty_dips_scratch_.clear();
+        if (!full_dirty_) {
+            dirty_dips_scratch_.swap(pending_dirty_);
+            if (hover_.in_anim.value != hover_.in_anim.target) {
+                queue_hit_dirty(dirty_dips_scratch_, hover_.id, hover_.index, full_dirty_);
+            }
+            if (hover_.prev_id != IdNone && hover_.out_anim.value != hover_.out_anim.target) {
+                queue_hit_dirty(dirty_dips_scratch_, hover_.prev_id, hover_.prev_index, full_dirty_);
+            }
+            if (tab_anim_.value != tab_anim_.target) {
+                dirty_dips_scratch_.push_back(D2D1::RectF(0.0f, 0.0f, target_.size().width, TABS_H + 2.0f));
+            }
+            queue_animating_switches(dirty_dips_scratch_, full_dirty_);
+        } else {
+            pending_dirty_.clear();
+        }
+
         const bool anim = step_anim();
+        if (scroll_ != prev_scroll) {
+            full_dirty_ = true;
+        }
+
+        std::optional<D2D1_RECT_F> curr_tip_dirty;
+        if (open_audio_drop_ == AudioDropdown::None && tooltip_.visible()) {
+            const TooltipLayout tl = measure_tooltip_layout(sh_.fonts, target_.size(), tooltip_.anchor, tooltip_.title, tooltip_.subtitle);
+            if (tl.valid) curr_tip_dirty = tl.dirty;
+        }
+        if (!full_dirty_) {
+            if (curr_tip_dirty) dirty_dips_scratch_.push_back(*curr_tip_dirty);
+            if (last_tooltip_dirty_ && (!curr_tip_dirty || !rect_equal(*last_tooltip_dirty_, *curr_tip_dirty))) {
+                dirty_dips_scratch_.push_back(*last_tooltip_dirty_);
+            }
+        }
+
+        const bool request_full = std::exchange(full_dirty_, false);
         const auto mode = in_sizemove_ ? WindowTarget::PresentMode::Immediate : WindowTarget::PresentMode::Vsync;
-        const bool ok = target_.render_frame(true, {}, mode, [&](std::optional<D2D1_RECT_F> clip, bool) {
-            hits_.clear();
-            Canvas cv{target_, sh_.fonts, hits_, default_theme(), clip};
-            draw(cv);
+        const bool ok = target_.render_frame(request_full, dirty_dips_scratch_, mode, [&](std::optional<D2D1_RECT_F> clip, bool full_frame) {
+            if (full_frame) {
+                hits_.clear();
+                Canvas cv{target_, sh_.fonts, hits_, default_theme(), clip};
+                draw(cv);
+            } else {
+                scratch_hits_.clear();
+                Canvas cv{target_, sh_.fonts, scratch_hits_, default_theme(), clip};
+                draw(cv);
+            }
         });
-        anim_active_ = visible() && anim;
+        last_tooltip_dirty_ = curr_tip_dirty;
+        anim_active_ = window_can_render_live(visible(), minimized_) && anim;
         if (!ok) {
             target_.release();
             sh_.gfx.recover(hwnd_);
@@ -775,13 +906,17 @@ private:
         }
     }
 
-    void dismiss_tooltip() noexcept {
+    void dismiss_tooltip() {
         const bool was_vis = tooltip_.visible();
         tooltip_.clear(hwnd_, TIMER_TOOLTIP, false);
-        if (was_vis) invalidate();
+        if (was_vis) {
+            if (last_tooltip_dirty_) invalidate_rect(*last_tooltip_dirty_);
+            else invalidate();
+        }
     }
 
     void draw_tabs(Canvas& cv, D2D1_SIZE_F sz) {
+        if (cv.has_dirty_clip() && !cv.intersects_clip(D2D1::RectF(0.0f, 0.0f, sz.width, TABS_H + 2.0f), 2.0f)) return;
         cv.fill(D2D1::RectF(0.0f, 0.0f, sz.width, TABS_H), with_alpha(cv.theme().surface_lowest, 0.78f));
 
         struct TabDef { wchar_t g; const wchar_t* label; int id; };
@@ -1815,6 +1950,7 @@ private:
             const bool ok = check_latest_release(st, is_newer, stop);
             if (stop.stop_requested()) return;
             sh_.call([this, st = std::move(st), ok, is_newer] mutable {
+                if (update_check_thread_.joinable()) update_check_thread_.join();
                 sh_.update_checking = false;
                 if (sh_.background_jobs > 0) --sh_.background_jobs;
                 if (ok && is_newer) {
@@ -1877,6 +2013,7 @@ private:
             }
 
             sh_.call([this, staged_root, stage_ok] {
+                if (update_job_.thread.joinable()) update_job_.thread.join();
                 update_job_.busy = false;
                 if (sh_.background_jobs > 0) --sh_.background_jobs;
                 if (sh_.on_visibility_changed) sh_.on_visibility_changed();
@@ -1982,6 +2119,7 @@ private:
             }
 
             sh_.call([this, ok, res, filename, err = std::move(err)] {
+                if (sharex_job_.thread.joinable()) sharex_job_.thread.join();
                 sharex_job_.busy = false;
                 if (sh_.background_jobs > 0) --sh_.background_jobs;
                 {
@@ -2071,7 +2209,11 @@ private:
                 return;
         }
         sh_.save();
-        invalidate();
+        if (r.right > r.left && r.bottom > r.top) {
+            invalidate_rect(D2D1::RectF(0.0f, r.top - 8.0f, target_.size().width, r.bottom + 8.0f));
+        } else {
+            invalidate();
+        }
     }
 
     void on_lbutton_down(LPARAM lp) {
@@ -2101,6 +2243,8 @@ private:
                 } else if (tab_ == 2) {
                     if (auto st = sh_.history.stats()) stats_ = *st;
                 }
+                full_dirty_ = true;
+                pending_dirty_.clear();
                 start_anim();
                 return;
             case IdToggleHotkey: {
@@ -2109,6 +2253,8 @@ private:
                 sh_.save();
                 if (sh_.on_reload_hotkeys) sh_.on_reload_hotkeys();
                 sync_state(true);
+                full_dirty_ = true;
+                pending_dirty_.clear();
                 start_anim();
                 return;
             }
@@ -2128,6 +2274,8 @@ private:
                 sh_.save();
                 if (sh_.on_reload_hotkeys) sh_.on_reload_hotkeys();
                 sync_state(true);
+                full_dirty_ = true;
+                pending_dirty_.clear();
                 start_anim();
                 return;
             }
@@ -2143,6 +2291,8 @@ private:
                         to_wide(win32_error_utf8(GetLastError())), L").");
                 }
                 sync_state(true);
+                full_dirty_ = true;
+                pending_dirty_.clear();
                 start_anim();
                 return;
             }
@@ -2317,6 +2467,7 @@ private:
                 sh_.settings.record_desktop_audio = !sh_.settings.record_desktop_audio;
                 sh_.save();
                 sync_state(true);
+                invalidate_rect(inset(desktop_drop_r_, -4.0f, -4.0f));
                 start_anim();
                 return;
             case IdDropRecDesktop:
@@ -2328,6 +2479,7 @@ private:
                 sh_.settings.record_mic_audio = !sh_.settings.record_mic_audio;
                 sh_.save();
                 sync_state(true);
+                invalidate_rect(inset(mic_drop_r_, -4.0f, -4.0f));
                 start_anim();
                 return;
             case IdDropRecMic:
@@ -2455,9 +2607,12 @@ private:
                 invalidate();
                 return 0;
             case WM_SIZE:
-                if (wp != SIZE_MINIMIZED && visible()) {
+                minimized_ = (wp == SIZE_MINIMIZED);
+                if (!minimized_ && visible()) {
                     (void)target_.resize(LOWORD(lp), HIWORD(lp));
                     scroll_ = target_scroll_ = std::clamp(scroll_, 0.0f, max_scroll());
+                    full_dirty_ = true;
+                    pending_dirty_.clear();
                     render();
                 }
                 return 0;
@@ -2476,12 +2631,12 @@ private:
                 BeginPaint(hwnd, &ps);
                 render();
                 EndPaint(hwnd, &ps);
-                if (visible() && anim_active_) {
+                if (window_can_render_live(visible(), minimized_) && anim_active_) {
                     MSG m;
                     while (PeekMessageW(&m, nullptr, WM_TIMER, WM_TIMER, PM_REMOVE)) {
                         DispatchMessageW(&m);
                     }
-                    if (visible() && anim_active_) InvalidateRect(hwnd, nullptr, FALSE);
+                    if (window_can_render_live(visible(), minimized_) && anim_active_) InvalidateRect(hwnd, nullptr, FALSE);
                 }
                 return 0;
             }
@@ -2648,11 +2803,13 @@ private:
     uint64_t app_icon_epoch_ = 0;
 
     std::vector<Hit> hits_;
+    std::vector<Hit> scratch_hits_;
     HoverTracker hover_;
     int raw_hover_id_ = IdNone;
     int raw_hover_index_ = 0;
     bool window_active_ = true;
     HoverTooltip tooltip_;
+    std::optional<D2D1_RECT_F> last_tooltip_dirty_;
     float scroll_ = 0.0f;
     float target_scroll_ = 0.0f;
     float content_h_ = 0.0f;
@@ -2667,10 +2824,14 @@ private:
     D2D1_RECT_F slider_rec_quality_r_{};
     bool dragging_scroll_ = false;
     bool in_sizemove_ = false;
+    bool minimized_ = false;
     float scroll_drag_offset_ = 0.0f;
     int dragging_slider_ = IdNone;
     bool anim_active_ = false;
     bool rendering_ = false;
+    bool full_dirty_ = true;
+    std::vector<D2D1_RECT_F> pending_dirty_;
+    std::vector<D2D1_RECT_F> dirty_dips_scratch_;
     std::chrono::steady_clock::time_point last_anim_{};
     HCURSOR cursor_arrow_ = nullptr;
     HCURSOR cursor_hand_ = nullptr;

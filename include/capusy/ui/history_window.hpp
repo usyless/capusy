@@ -31,6 +31,7 @@ public:
     HistoryWindow(HistoryWindow&&) = delete;
     HistoryWindow& operator=(HistoryWindow&&) = delete;
     ~HistoryWindow() {
+        async_drops_.clear();
         video_.shutdown();
         target_.release();
         if (hwnd_) DestroyWindow(hwnd_);
@@ -77,22 +78,29 @@ public:
     void show() {
         if (!hwnd_) return;
         if (!sh_.gfx.ensure_device(hwnd_)) return;
-        if (!target_.ready() && !target_.attach(sh_.gfx, hwnd_)) return;
+        if (!target_.ready() && !target_.attach(sh_.gfx, hwnd_)) {
+            if (sh_.on_visibility_changed) sh_.on_visibility_changed();
+            return;
+        }
         sh_.thumbs.start(hwnd_, WM_APP_THUMBS, 2);
         sh_.previews.start(hwnd_, WM_APP_THUMBS, 1);
 
         reload_entries(true);
         apply_dark_window(hwnd_, DWMSBT_MAINWINDOW, true);
         cloak_window(hwnd_, false);
+        minimized_ = false;
         if (IsIconic(hwnd_)) ShowWindow(hwnd_, SW_RESTORE);
         else ShowWindow(hwnd_, SW_SHOWNORMAL);
         SetForegroundWindow(hwnd_);
         SetFocus(hwnd_);
         window_active_ = true;
         tooltip_.clear(hwnd_, TIMER_TOOLTIP, false);
+        last_tooltip_dirty_.reset();
         sync_preview_media();
+        sync_caret_timer();
         anim_active_ = false;
         full_dirty_ = true;
+        pending_dirty_.clear();
         render();
         ValidateRect(hwnd_, nullptr);
         if (sh_.on_visibility_changed) sh_.on_visibility_changed();
@@ -101,30 +109,45 @@ public:
     void hide() {
         if (!hwnd_ || dragging_out_) return;
         KillTimer(hwnd_, TIMER_VIDEO);
-        KillTimer(hwnd_, TIMER_DROP);
+        if (async_drops_.empty()) KillTimer(hwnd_, TIMER_DROP);
         KillTimer(hwnd_, TIMER_CARET);
         KillTimer(hwnd_, TIMER_SEARCH);
         tooltip_.clear(hwnd_, TIMER_TOOLTIP, false);
+        last_tooltip_dirty_.reset();
         raw_hover_id_ = IdNone;
         raw_hover_index_ = 0;
         set_search_focus(false);
+        search_field_.clear_cached_layout();
         dragging_search_ = false;
         deferred_select_idx_ = -1;
-        video_.close();
+        video_.shutdown();
         sh_.previews.clear();
+        sh_.previews.stop();
         sh_.thumbs.clear();
+        sh_.thumbs.stop();
         page_cache_.clear();
+        page_cache_.shrink_to_fit();
         search_ids_.clear();
         search_ids_.shrink_to_fit();
+        hits_.clear();
+        hits_.shrink_to_fit();
+        scratch_hits_.clear();
+        scratch_hits_.shrink_to_fit();
+        pending_dirty_.clear();
+        pending_dirty_.shrink_to_fit();
+        dirty_dips_scratch_.clear();
+        dirty_dips_scratch_.shrink_to_fit();
         focused_row_.reset();
         total_count_ = 0;
         unfiltered_count_ = 0;
         target_.release();
         dragging_scroll_ = false;
         in_sizemove_ = false;
+        minimized_ = false;
         scrubbing_video_ = false;
         drag_pending_ = false;
         anim_active_ = false;
+        full_dirty_ = true;
         hover_.set(IdNone, 0, false);
         cloak_window(hwnd_, true);
         ShowWindow(hwnd_, SW_HIDE);
@@ -174,21 +197,44 @@ public:
     }
 
     void on_thumbs_ready() {
-        if (!visible() || !target_.ready()) return;
-        bool changed = false;
-        if (sh_.thumbs.process(target_.dc())) changed = true;
-        if (sh_.previews.process(target_.dc())) changed = true;
-        if (changed) invalidate();
+        if (!window_can_render_live(visible(), minimized_) || !target_.ready()) return;
+        const bool thumbs_changed = sh_.thumbs.process(target_.dc());
+        const bool previews_changed = sh_.previews.process(target_.dc());
+        if (thumbs_changed) {
+            invalidate_rect(list_rect_);
+            if (preview_rect_.right > preview_rect_.left && preview_rect_.bottom > preview_rect_.top) {
+                invalidate_rect(preview_rect_);
+            }
+        }
+        if (previews_changed) {
+            if (preview_rect_.right > preview_rect_.left && preview_rect_.bottom > preview_rect_.top) {
+                invalidate_rect(preview_rect_);
+            } else {
+                invalidate();
+            }
+        }
     }
 
     void reset_gpu() noexcept {
         video_.reset_gpu();
         target_.release();
+        full_dirty_ = true;
+        pending_dirty_.clear();
     }
 
     void invalidate() noexcept {
         full_dirty_ = true;
-        if (visible()) InvalidateRect(hwnd_, nullptr, FALSE);
+        pending_dirty_.clear();
+        if (window_can_render_live(visible(), minimized_)) InvalidateRect(hwnd_, nullptr, FALSE);
+    }
+
+    void invalidate_rect(D2D1_RECT_F r) {
+        if (r.right <= r.left || r.bottom <= r.top) {
+            invalidate();
+            return;
+        }
+        if (!full_dirty_) pending_dirty_.push_back(r);
+        if (window_can_render_live(visible(), minimized_)) InvalidateRect(hwnd_, nullptr, FALSE);
     }
 
 private:
@@ -721,29 +767,56 @@ private:
         start_anim();
     }
 
-    void set_search_focus(bool focus) noexcept {
+    void sync_caret_timer() noexcept {
+        if (!hwnd_) return;
+        const auto blink_ms = caret_blink_interval_ms(GetCaretBlinkTime());
+        const CaretDecision dec = caret_timer_decision(visible(), minimized_, false, window_active_, search_field_.focused, blink_ms);
+        search_field_.caret_on = dec.visible;
+        if (dec.run_timer && blink_ms) {
+            SetTimer(hwnd_, TIMER_CARET, *blink_ms, nullptr);
+        } else {
+            KillTimer(hwnd_, TIMER_CARET);
+        }
+    }
+
+    void set_search_focus(bool focus) {
         if (search_field_.focused == focus) return;
         search_field_.focused = focus;
-        search_field_.caret_on = focus;
-        if (hwnd_) {
-            if (focus) SetTimer(hwnd_, TIMER_CARET, 530, nullptr);
-            else KillTimer(hwnd_, TIMER_CARET);
-        }
-        invalidate();
+        sync_caret_timer();
+        if (search_box_rect_.right > search_box_rect_.left) invalidate_rect(inset(search_box_rect_, -3.0f, -3.0f));
+        else invalidate();
     }
 
     void reset_caret_blink() noexcept {
-        search_field_.caret_on = true;
-        if (hwnd_ && search_field_.focused) {
-            SetTimer(hwnd_, TIMER_CARET, 530, nullptr);
-        }
+        sync_caret_timer();
     }
 
     void start_anim() noexcept {
-        if (!visible()) return;
+        if (!window_can_render_live(visible(), minimized_)) return;
         if (!anim_active_) last_anim_ = std::chrono::steady_clock::now();
         anim_active_ = true;
         InvalidateRect(hwnd_, nullptr, FALSE);
+    }
+
+    void queue_hover_dirty(std::vector<D2D1_RECT_F>& out, int id, int idx, bool& full_dirty) const {
+        if (id == IdNone) return;
+        if (id == IdScrollbar) {
+            if (list_rect_.right > list_rect_.left && list_rect_.bottom > list_rect_.top) {
+                out.push_back(D2D1::RectF(list_rect_.right - 14.0f, list_rect_.top, list_rect_.right, list_rect_.bottom));
+            } else {
+                full_dirty = true;
+            }
+            return;
+        }
+        bool found = false;
+        const float pad = (id == IdVideoScrub) ? 10.0f : 3.0f;
+        for (const Hit& h : hits_) {
+            if (h.id == id && h.index == idx) {
+                out.push_back(D2D1::RectF(h.r.left - pad, h.r.top - pad, h.r.right + pad, h.r.bottom + pad));
+                found = true;
+            }
+        }
+        if (!found) full_dirty = true;
     }
 
     bool step_anim() noexcept {
@@ -768,32 +841,77 @@ private:
     }
 
     void render() {
-        if (!visible() || rendering_) return;
+        if (!window_can_render_live(visible(), minimized_) || rendering_) return;
         if (!target_.ready()) {
             if (!sh_.gfx.ensure_device(hwnd_) || !target_.rebuild()) return;
+            full_dirty_ = true;
         }
         rendering_ = true;
         const auto clear_r = wil::scope_exit([&] { rendering_ = false; });
 
-        const bool anim = step_anim();
+        const double prev_scroll = scroll_;
+        if (dragging_scroll_ || std::abs(target_scroll_ - scroll_) >= 0.5) {
+            full_dirty_ = true;
+        }
 
         if (video_.needs_recover() && sh_.gfx.d3d()) {
             if (video_.recover_if_needed(sh_.gfx.d3d(), sh_.gfx.epoch())) {
                 SetTimer(hwnd_, TIMER_VIDEO, 16, nullptr);
+                full_dirty_ = true;
             }
         }
         if (video_.active() && target_.dc()) {
-            (void)video_.tick(sh_.gfx.d3d(), sh_.gfx.epoch(), target_.dc());
+            if (video_.tick(sh_.gfx.d3d(), sh_.gfx.epoch(), target_.dc()) == MediaTickStatus::FrameReady && !full_dirty_) {
+                if (preview_rect_.right > preview_rect_.left) pending_dirty_.push_back(preview_rect_);
+                if (video_bar_rect_.right > video_bar_rect_.left) pending_dirty_.push_back(video_bar_rect_);
+            }
         }
 
+        dirty_dips_scratch_.clear();
+        if (!full_dirty_) {
+            dirty_dips_scratch_.swap(pending_dirty_);
+            if (hover_.in_anim.value != hover_.in_anim.target) {
+                queue_hover_dirty(dirty_dips_scratch_, hover_.id, hover_.index, full_dirty_);
+            }
+            if (hover_.prev_id != IdNone && hover_.out_anim.value != hover_.out_anim.target) {
+                queue_hover_dirty(dirty_dips_scratch_, hover_.prev_id, hover_.prev_index, full_dirty_);
+            }
+        } else {
+            pending_dirty_.clear();
+        }
+
+        const bool anim = step_anim();
+        if (scroll_ != prev_scroll) {
+            full_dirty_ = true;
+        }
+
+        std::optional<D2D1_RECT_F> curr_tip_dirty;
+        if (tooltip_.visible()) {
+            const TooltipLayout tl = measure_tooltip_layout(sh_.fonts, target_.size(), tooltip_.anchor, tooltip_.title, tooltip_.subtitle);
+            if (tl.valid) curr_tip_dirty = tl.dirty;
+        }
+        if (!full_dirty_) {
+            if (curr_tip_dirty) dirty_dips_scratch_.push_back(*curr_tip_dirty);
+            if (last_tooltip_dirty_ && (!curr_tip_dirty || !rect_equal(*last_tooltip_dirty_, *curr_tip_dirty))) {
+                dirty_dips_scratch_.push_back(*last_tooltip_dirty_);
+            }
+        }
+
+        const bool request_full = std::exchange(full_dirty_, false);
         const auto mode = in_sizemove_ ? WindowTarget::PresentMode::Immediate : WindowTarget::PresentMode::Vsync;
-        const bool ok = target_.render_frame(true, {}, mode, [&](std::optional<D2D1_RECT_F> clip, bool) {
-            hits_.clear();
-            Canvas cv{target_, sh_.fonts, hits_, default_theme(), clip};
-            draw(cv);
+        const bool ok = target_.render_frame(request_full, dirty_dips_scratch_, mode, [&](std::optional<D2D1_RECT_F> clip, bool full_frame) {
+            if (full_frame) {
+                hits_.clear();
+                Canvas cv{target_, sh_.fonts, hits_, default_theme(), clip};
+                draw(cv);
+            } else {
+                scratch_hits_.clear();
+                Canvas cv{target_, sh_.fonts, scratch_hits_, default_theme(), clip};
+                draw(cv);
+            }
         });
-        full_dirty_ = false;
-        anim_active_ = visible() && anim;
+        last_tooltip_dirty_ = curr_tip_dirty;
+        anim_active_ = window_can_render_live(visible(), minimized_) && anim;
         if (!ok) {
             target_.release();
             sh_.gfx.recover(hwnd_);
@@ -968,13 +1086,17 @@ private:
         }
     }
 
-    void dismiss_tooltip() noexcept {
+    void dismiss_tooltip() {
         const bool was_vis = tooltip_.visible();
         tooltip_.clear(hwnd_, TIMER_TOOLTIP, false);
-        if (was_vis) invalidate();
+        if (was_vis) {
+            if (last_tooltip_dirty_) invalidate_rect(*last_tooltip_dirty_);
+            else invalidate();
+        }
     }
 
     void draw_header(Canvas& cv, D2D1_SIZE_F sz) {
+        if (cv.has_dirty_clip() && !cv.intersects_clip(D2D1::RectF(0.0f, 0.0f, sz.width, HEADER_H + 2.0f), 2.0f)) return;
         cv.fill(D2D1::RectF(0.0f, 0.0f, sz.width, HEADER_H), with_alpha(cv.theme().surface_lowest, 0.78f));
         cv.hline(0.0f, sz.width, HEADER_H, with_alpha(cv.theme().outline_variant, 0.65f));
 
@@ -1012,6 +1134,7 @@ private:
     }
 
     void draw_sidebar(Canvas& cv, D2D1_RECT_F area) {
+        if (cv.has_dirty_clip() && !cv.intersects_clip(area, 2.0f)) return;
         cv.fill(area, with_alpha(cv.theme().surface_low, 0.55f));
 
         // Search bar
@@ -1079,12 +1202,13 @@ private:
         const UINT thumb_px = static_cast<UINT>(std::lround(112.0f * target_.scale()));
 
         for (int i = first; i <= last; ++i) {
+            const float ry = list_r.top + 6.0f + static_cast<float>((static_cast<double>(i) * step) - scroll_);
+            const D2D1_RECT_F rr = rect(list_r.left + 8.0f, ry, width(list_r) - 20.0f, ROW_H);
+            if (cv.has_dirty_clip() && !cv.intersects_clip(rr, 4.0f)) continue;
             const RowItem* item = row_at(i);
             if (!item) continue;
             const CaptureEntry& e = item->entry;
             const RowCache& rc = item->cache;
-            const float ry = list_r.top + 6.0f + static_cast<float>((static_cast<double>(i) * step) - scroll_);
-            const D2D1_RECT_F rr = rect(list_r.left + 8.0f, ry, width(list_r) - 20.0f, ROW_H);
             const bool sel = selection_.contains(e.id);
             const bool active = (i == selection_.focus);
             const float ha = hover_.alpha(IdRow, i);
@@ -1141,6 +1265,7 @@ private:
     }
 
     void draw_preview_pane(Canvas& cv, D2D1_RECT_F area) {
+        if (cv.has_dirty_clip() && !cv.intersects_clip(area, 2.0f)) return;
         const CaptureEntry* e = selected_entry();
         if (!e) {
             cv.icon(glyph::photo, rect(area.left, area.top + (height(area) * 0.5f) - 42.0f, width(area), 36.0f), cv.theme().outline, Font::IconLarge);
@@ -1181,6 +1306,7 @@ private:
 
             // Video controls bar
             const D2D1_RECT_F vb = D2D1::RectF(area.left + 18.0f, stage.bottom + 8.0f, area.right - 18.0f, stage.bottom + 44.0f);
+            video_bar_rect_ = vb;
             cv.fill_round(vb, 10.0f, with_alpha(cv.theme().surface, 0.92f));
             cv.stroke_round(vb, 10.0f, with_alpha(cv.theme().outline_variant, 0.6f));
 
@@ -1204,6 +1330,7 @@ private:
                 draw_slider(cv, hover_.alpha(IdVideoScrub), scrub_rect_, ratio, scrubbing_video_, IdVideoScrub);
             }
         } else {
+            video_bar_rect_ = {};
             const uint64_t tid = static_cast<uint64_t>(e->id);
             ID2D1Bitmap1* bmp = sh_.previews.get(tid);
             if (!bmp) {
@@ -1495,13 +1622,14 @@ private:
         return {.x = GET_X_LPARAM(lp) / s, .y = GET_Y_LPARAM(lp) / s};
     }
 
-    void scrub_to_x(float x) noexcept {
+    void scrub_to_x(float x) {
         const float pad = 8.0f;
         const float l = scrub_rect_.left + pad;
         const float r = std::max(l + 4.0f, scrub_rect_.right - pad);
         const float ratio = std::clamp((x - l) / (r - l), 0.0f, 1.0f);
         video_.seek(static_cast<double>(ratio) * video_.duration());
-        invalidate();
+        if (video_bar_rect_.right > video_bar_rect_.left) invalidate_rect(video_bar_rect_);
+        else invalidate();
     }
 
     void on_lbutton_down(LPARAM lp) {
@@ -1550,17 +1678,20 @@ private:
             case IdVideoPlay:
                 if (!video_.active() || video_.failed()) {
                     sync_preview_media();
+                    invalidate();
                 } else {
                     video_.toggle_play();
                     if (video_.needs_timer()) SetTimer(hwnd_, TIMER_VIDEO, 16, nullptr);
+                    if (video_bar_rect_.right > video_bar_rect_.left) invalidate_rect(video_bar_rect_);
+                    else invalidate();
                 }
-                invalidate();
                 return;
             case IdVideoMute:
                 video_.toggle_mute();
                 sh_.settings.video_muted = video_.is_muted();
                 sh_.save();
-                invalidate();
+                if (video_bar_rect_.right > video_bar_rect_.left) invalidate_rect(video_bar_rect_);
+                else invalidate();
                 return;
             case IdVideoScrub:
                 scrubbing_video_ = true;
@@ -1803,10 +1934,18 @@ private:
                 invalidate();
                 return 0;
             case WM_SIZE:
-                if (wp != SIZE_MINIMIZED && visible()) {
+                minimized_ = (wp == SIZE_MINIMIZED);
+                if (minimized_) {
+                    KillTimer(hwnd, TIMER_VIDEO);
+                    sync_caret_timer();
+                } else if (visible()) {
                     (void)target_.resize(LOWORD(lp), HIWORD(lp));
                     clamp_scroll();
+                    full_dirty_ = true;
+                    pending_dirty_.clear();
                     render();
+                    sync_caret_timer();
+                    if (video_.needs_timer()) SetTimer(hwnd, TIMER_VIDEO, 16, nullptr);
                 }
                 return 0;
             case WM_DPICHANGED: {
@@ -1824,13 +1963,13 @@ private:
                 BeginPaint(hwnd, &ps);
                 render();
                 EndPaint(hwnd, &ps);
-                if (visible() && anim_active_) {
+                if (window_can_render_live(visible(), minimized_) && anim_active_) {
                     // Drain due timers while QS_PAINT is clear so VSync frames never starve timers.
                     MSG m;
                     while (PeekMessageW(&m, nullptr, WM_TIMER, WM_TIMER, PM_REMOVE)) {
                         DispatchMessageW(&m);
                     }
-                    if (visible() && anim_active_) InvalidateRect(hwnd, nullptr, FALSE);
+                    if (window_can_render_live(visible(), minimized_) && anim_active_) InvalidateRect(hwnd, nullptr, FALSE);
                 }
                 return 0;
             }
@@ -1839,17 +1978,24 @@ private:
                 return 0;
             case WM_APP_VIDEO:
                 if (video_.process_events()) {
-                    if (video_.needs_timer()) SetTimer(hwnd, TIMER_VIDEO, 16, nullptr);
-                    invalidate();
+                    if (window_can_render_live(visible(), minimized_) && video_.needs_timer()) SetTimer(hwnd, TIMER_VIDEO, 16, nullptr);
+                    if (preview_rect_.right > preview_rect_.left) invalidate_rect(preview_rect_);
+                    if (video_bar_rect_.right > video_bar_rect_.left) invalidate_rect(video_bar_rect_);
+                    if (preview_rect_.right <= preview_rect_.left) invalidate();
                 }
                 return 0;
             case WM_TIMER:
                 if (wp == TIMER_VIDEO) {
-                    if (!visible() || !video_.active()) {
+                    if (!window_can_render_live(visible(), minimized_) || !video_.active()) {
                         KillTimer(hwnd, TIMER_VIDEO);
                     } else if (target_.ready()) {
                         const auto st = video_.tick(sh_.gfx.d3d(), sh_.gfx.epoch(), target_.dc());
-                        if (st == MediaTickStatus::FrameReady || video_.is_playing()) invalidate();
+                        if (st == MediaTickStatus::FrameReady) {
+                            if (preview_rect_.right > preview_rect_.left) invalidate_rect(preview_rect_);
+                            if (video_bar_rect_.right > video_bar_rect_.left) invalidate_rect(video_bar_rect_);
+                        } else if (video_.is_playing()) {
+                            if (video_bar_rect_.right > video_bar_rect_.left) invalidate_rect(video_bar_rect_);
+                        }
                         if (!video_.needs_timer()) KillTimer(hwnd, TIMER_VIDEO);
                     }
                 } else if (wp == TIMER_DROP) {
@@ -1860,11 +2006,15 @@ private:
                         }
                         return false;
                     });
-                    if (async_drops_.empty()) KillTimer(hwnd, TIMER_DROP);
+                    if (async_drops_.empty()) {
+                        KillTimer(hwnd, TIMER_DROP);
+                        if (sh_.on_visibility_changed) sh_.on_visibility_changed();
+                    }
                 } else if (wp == TIMER_CARET) {
-                    if (search_field_.focused && visible()) {
+                    if (search_field_.focused && window_can_render_live(visible(), minimized_) && window_active_) {
                         search_field_.caret_on = !search_field_.caret_on;
-                        invalidate();
+                        if (search_box_rect_.right > search_box_rect_.left) invalidate_rect(inset(search_box_rect_, -2.0f, -2.0f));
+                        else invalidate();
                     } else {
                         KillTimer(hwnd, TIMER_CARET);
                     }
@@ -1872,7 +2022,7 @@ private:
                     KillTimer(hwnd, TIMER_SEARCH);
                     apply_search_filter();
                 } else if (wp == TIMER_TOOLTIP) {
-                    if (!visible() || !window_active_) {
+                    if (!window_can_render_live(visible(), minimized_) || !window_active_) {
                         tooltip_.clear(hwnd_, TIMER_TOOLTIP, false);
                         return 0;
                     }
@@ -1904,8 +2054,12 @@ private:
                 return 0;
             }
             case WM_ACTIVATE:
-                window_active_ = (LOWORD(wp) != WA_INACTIVE);
+                window_active_ = wm_activate_is_active(LOWORD(wp), HIWORD(wp) != 0);
                 if (!window_active_) dismiss_tooltip();
+                sync_caret_timer();
+                if (search_field_.focused && search_box_rect_.right > search_box_rect_.left) {
+                    invalidate_rect(inset(search_box_rect_, -2.0f, -2.0f));
+                }
                 break;
             case WM_DESTROY:
                 KillTimer(hwnd, TIMER_VIDEO);
@@ -1951,20 +2105,24 @@ private:
     int deferred_select_idx_ = -1;
 
     std::vector<Hit> hits_;
+    std::vector<Hit> scratch_hits_;
     HoverTracker hover_;
     int raw_hover_id_ = IdNone;
     int raw_hover_index_ = 0;
     bool window_active_ = true;
     HoverTooltip tooltip_;
+    std::optional<D2D1_RECT_F> last_tooltip_dirty_;
     double scroll_ = 0.0;
     double target_scroll_ = 0.0;
     D2D1_RECT_F list_rect_{};
     D2D1_RECT_F scroll_thumb_{};
     D2D1_RECT_F preview_rect_{};
+    D2D1_RECT_F video_bar_rect_{};
     D2D1_RECT_F scrub_rect_{};
 
     bool dragging_scroll_ = false;
     bool in_sizemove_ = false;
+    bool minimized_ = false;
     float scroll_drag_offset_ = 0.0f;
     bool scrubbing_video_ = false;
     bool drag_pending_ = false;
@@ -1976,6 +2134,8 @@ private:
     bool anim_active_ = false;
     bool rendering_ = false;
     bool full_dirty_ = true;
+    std::vector<D2D1_RECT_F> pending_dirty_;
+    std::vector<D2D1_RECT_F> dirty_dips_scratch_;
     std::chrono::steady_clock::time_point last_anim_{};
     HCURSOR cursor_arrow_ = nullptr;
     HCURSOR cursor_hand_ = nullptr;

@@ -70,6 +70,9 @@ public:
             if (border_target_.attach(sh_.gfx, border_hwnd_)) {
                 render_border();
                 ShowWindow(border_hwnd_, SW_SHOWNOACTIVATE);
+            } else {
+                DestroyWindow(border_hwnd_);
+                border_hwnd_ = nullptr;
             }
         }
 
@@ -97,12 +100,17 @@ public:
             WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_NOREDIRECTIONBITMAP,
             REC_PILL_CLASS, L"capusy rec pill", WS_POPUP,
             px, py, pw, ph, nullptr, nullptr, inst, this);
-        if (!pill_hwnd_) return false;
+        if (!pill_hwnd_) {
+            hide();
+            return false;
+        }
         exclude_window_from_capture(pill_hwnd_, true);
         if (!pill_target_.attach(sh_.gfx, pill_hwnd_)) {
             hide();
             return false;
         }
+        pill_full_dirty_ = true;
+        last_pill_sec_ = std::numeric_limits<uint64_t>::max();
         render_pill();
         ShowWindow(pill_hwnd_, SW_SHOWNOACTIVATE);
         SetTimer(pill_hwnd_, 1, 250, nullptr);
@@ -115,8 +123,21 @@ public:
         pill_target_.release();
         if (border_hwnd_) { DestroyWindow(border_hwnd_); border_hwnd_ = nullptr; }
         if (pill_hwnd_) { DestroyWindow(pill_hwnd_); pill_hwnd_ = nullptr; }
+        pill_hits_.clear();
+        pill_hits_.shrink_to_fit();
+        pill_scratch_hits_.clear();
+        pill_scratch_hits_.shrink_to_fit();
         recorder_ = nullptr;
         hover_stop_ = false;
+        pill_full_dirty_ = true;
+        last_pill_sec_ = std::numeric_limits<uint64_t>::max();
+    }
+
+    void reset_gpu() noexcept {
+        border_target_.release();
+        pill_target_.release();
+        pill_full_dirty_ = true;
+        last_pill_sec_ = std::numeric_limits<uint64_t>::max();
     }
 
     [[nodiscard]] bool visible() const noexcept { return pill_hwnd_ != nullptr; }
@@ -132,18 +153,41 @@ private:
         });
     }
 
-    void render_pill() {
+    void render_pill(bool force_full = false) {
         if (!pill_target_.ready()) return;
-        (void)pill_target_.render_frame(true, {}, WindowTarget::PresentMode::Immediate, [&](std::optional<D2D1_RECT_F> clip, bool) {
-            pill_hits_.clear();
-            Canvas cv{pill_target_, sh_.fonts, pill_hits_, default_theme(), clip};
-            const D2D1_SIZE_F sz = pill_target_.size();
+        const D2D1_SIZE_F sz = pill_target_.size();
+        const uint64_t ms = recorder_ ? recorder_->elapsed_ms() : 0;
+        const uint64_t sec = ms / 1000u;
+        const bool blink = ((ms / 500u) % 2u) == 0u;
+        const bool need_full = force_full || pill_full_dirty_;
+
+        std::array<D2D1_RECT_F, 3> dirty_rects{};
+        size_t dirty_n = 0;
+        if (!need_full) {
+            if (blink != last_pill_blink_) {
+                dirty_rects[dirty_n++] = rect(10.0f, 0.0f, 20.0f, sz.height);
+            }
+            if (sec != last_pill_sec_) {
+                dirty_rects[dirty_n++] = rect(28.0f, 0.0f, 86.0f, sz.height);
+            }
+            if (hover_stop_ != last_pill_hover_) {
+                dirty_rects[dirty_n++] = rect(sz.width - 76.0f, 4.0f, 70.0f, sz.height - 8.0f);
+            }
+            if (dirty_n == 0) return;
+        }
+
+        const std::span<const D2D1_RECT_F> dirty_span = need_full
+            ? std::span<const D2D1_RECT_F>{}
+            : std::span<const D2D1_RECT_F>{dirty_rects.data(), dirty_n};
+
+        const bool ok = pill_target_.render_frame(need_full, dirty_span, WindowTarget::PresentMode::Immediate, [&](std::optional<D2D1_RECT_F> clip, bool full_frame) {
+            std::vector<Hit>& target_hits = full_frame ? pill_hits_ : pill_scratch_hits_;
+            target_hits.clear();
+            Canvas cv{pill_target_, sh_.fonts, target_hits, default_theme(), clip};
             const D2D1_RECT_F r = D2D1::RectF(1.0f, 1.0f, sz.width - 1.0f, sz.height - 1.0f);
             cv.fill_round(r, 12.0f, with_alpha(cv.theme().surface_lowest, 0.94f));
             cv.stroke_round(r, 12.0f, with_alpha(hex(0xff5c5c), 0.70f), 1.2f);
 
-            const uint64_t ms = recorder_ ? recorder_->elapsed_ms() : 0;
-            const bool blink = ((ms / 500) % 2) == 0;
             cv.fill_circle({.x = 18.0f, .y = sz.height * 0.5f}, 4.5f, with_alpha(hex(0xff5c5c), blink ? 1.0f : 0.35f));
 
             FixedWString<32> lbl{L"REC  "};
@@ -163,6 +207,12 @@ private:
             draw_button(cv, hover_stop_ ? 1.0f : 0.0f, rect(stop_x, 6.0f, 66.0f, sz.height - 12.0f),
                         glyph::stop, L"Stop", 1, 0, 2);
         });
+        if (ok) {
+            pill_full_dirty_ = false;
+            last_pill_sec_ = sec;
+            last_pill_blink_ = blink;
+            last_pill_hover_ = hover_stop_;
+        }
     }
 
     static LRESULT CALLBACK border_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
@@ -195,7 +245,7 @@ private:
                 self->render_pill();
                 return 0;
             case WM_PAINT:
-                self->render_pill();
+                self->render_pill(true);
                 ValidateRect(hwnd, nullptr);
                 return 0;
             case WM_SETCURSOR:
@@ -252,9 +302,14 @@ private:
     WindowTarget border_target_;
     WindowTarget pill_target_;
     std::vector<Hit> pill_hits_;
+    std::vector<Hit> pill_scratch_hits_;
     HCURSOR cursor_arrow_ = nullptr;
     HCURSOR cursor_hand_ = nullptr;
     bool hover_stop_ = false;
+    bool pill_full_dirty_ = true;
+    uint64_t last_pill_sec_ = std::numeric_limits<uint64_t>::max();
+    bool last_pill_blink_ = false;
+    bool last_pill_hover_ = false;
 };
 
 } // namespace capusy::ui

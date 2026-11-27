@@ -47,6 +47,58 @@ struct Annotation {
     std::vector<D2D1_POINT_2F> points; // freehand points (Pen / Highlighter) or {start, end} (shapes)
 };
 
+/// Computes the conservative local DIP bounding box of `a` (inflated for stroke width, highlighter width, and arrowheads).
+[[nodiscard]] inline D2D1_RECT_F annotation_bounds_dip(const Annotation& a, float offset_x, float offset_y, float inv_s) noexcept {
+    if (a.points.empty()) return {};
+    float min_x = a.points[0].x;
+    float max_x = a.points[0].x;
+    float min_y = a.points[0].y;
+    float max_y = a.points[0].y;
+    for (size_t i = 1; i < a.points.size(); ++i) {
+        min_x = std::min(min_x, a.points[i].x);
+        max_x = std::max(max_x, a.points[i].x);
+        min_y = std::min(min_y, a.points[i].y);
+        max_y = std::max(max_y, a.points[i].y);
+    }
+    const float w = std::max(1.0f, a.thickness * inv_s);
+    float pad = (w * 0.5f) + 4.0f;
+    if (a.tool == DrawTool::Highlighter) {
+        pad = (w * 1.8f) + 4.0f;
+    } else if (a.tool == DrawTool::Arrow) {
+        pad = std::max(12.0f * inv_s, w * 3.8f) + 4.0f;
+    }
+    return D2D1::RectF(
+        ((min_x - offset_x) * inv_s) - pad,
+        ((min_y - offset_y) * inv_s) - pad,
+        ((max_x - offset_x) * inv_s) + pad,
+        ((max_y - offset_y) * inv_s) + pad);
+}
+
+/// Computes the conservative virtual-pixel bounding rect of `a` (for dirty-rect invalidation during live drawing).
+[[nodiscard]] inline RECT annotation_bounds_vpx(const Annotation& a) noexcept {
+    if (a.points.empty()) return {};
+    float min_x = a.points[0].x;
+    float max_x = a.points[0].x;
+    float min_y = a.points[0].y;
+    float max_y = a.points[0].y;
+    for (size_t i = 1; i < a.points.size(); ++i) {
+        min_x = std::min(min_x, a.points[i].x);
+        max_x = std::max(max_x, a.points[i].x);
+        min_y = std::min(min_y, a.points[i].y);
+        max_y = std::max(max_y, a.points[i].y);
+    }
+    const float w = std::max(1.0f, a.thickness);
+    float pad = (w * 0.5f) + 8.0f;
+    if (a.tool == DrawTool::Highlighter) pad = (w * 1.8f) + 8.0f;
+    else if (a.tool == DrawTool::Arrow) pad = std::max(14.0f, w * 4.0f) + 8.0f;
+    return RECT{
+        .left = static_cast<LONG>(std::floor(min_x - pad)),
+        .top = static_cast<LONG>(std::floor(min_y - pad)),
+        .right = static_cast<LONG>(std::ceil(max_x + pad)),
+        .bottom = static_cast<LONG>(std::ceil(max_y + pad)),
+    };
+}
+
 /// Renders a single annotation onto `dc` shifted by `(-offset_x, -offset_y)` and divided by `scale`
 /// (pass `scale = 1.0f` for 1:1 physical export, or `monitor_dpi / 96.0f` for DPI-aware overlay display).
 inline void render_annotation(ID2D1DeviceContext6* dc, ID2D1Factory* factory, ID2D1SolidColorBrush* brush,
@@ -191,7 +243,10 @@ public:
         foreground_info_ = (mode_ == OverlayMode::ColorPicker) ? WindowInfo{} : foreground_window_info();
         const bool snap_cursor = (mode_ == OverlayMode::Screenshot) ? include_cursor : false;
         auto cap = capture_virtual_screen(snap_cursor, sh_.gfx.d3d());
-        if (!cap || cap->monitors.empty()) return false;
+        if (!cap || cap->monitors.empty()) {
+            if (sh_.on_visibility_changed) sh_.on_visibility_changed();
+            return false;
+        }
         if (mode_ == OverlayMode::RecordMonitor) {
             std::ranges::sort(cap->monitors, [](const MonitorInfo& a, const MonitorInfo& b) noexcept {
                 if (a.rect.left != b.rect.left) return a.rect.left < b.rect.left;
@@ -339,12 +394,16 @@ public:
         tooltip_.clear(nullptr, 0, false);
         tooltip_hwnd_ = nullptr;
         monitors_.clear();
+        monitors_.shrink_to_fit();
         capture_.reset();
         snaps_ = {};
         foreground_info_ = {};
         annotations_.clear();
+        annotations_.shrink_to_fit();
         redo_stack_.clear();
+        redo_stack_.shrink_to_fit();
         active_annotation_.reset();
+        active_ann_prev_vrect_.reset();
         round_stroke_.reset();
         picker_sv_bmp_.reset();
         picker_hue_bmp_.reset();
@@ -356,8 +415,22 @@ public:
         drag_kind_ = DragKind::None;
         open_dropdown_ = AudioDropdown::None;
         desktop_devices_.clear();
+        desktop_devices_.shrink_to_fit();
         mic_devices_.clear();
+        mic_devices_.shrink_to_fit();
         if (was_active && on_closed) on_closed();
+        else if (sh_.on_visibility_changed) sh_.on_visibility_changed();
+    }
+
+    void reset_gpu() noexcept {
+        round_stroke_.reset();
+        picker_sv_bmp_.reset();
+        picker_hue_bmp_.reset();
+        picker_bmp_dc_ = nullptr;
+        picker_sv_bmp_h_ = -1.0f;
+        if (active()) {
+            cancel();
+        }
     }
 
 private:
@@ -412,6 +485,13 @@ private:
         WindowTarget target;
         wil::com_ptr<ID2D1Bitmap1> frozen_bmp;
         std::vector<Hit> hits;
+        std::vector<Hit> scratch_hits;
+        bool full_dirty = true;
+        std::vector<D2D1_RECT_F> pending_dirty;
+        std::optional<D2D1_RECT_F> last_reticle_dirty;
+        std::optional<D2D1_RECT_F> last_loupe_dirty;
+        std::optional<D2D1_RECT_F> last_hint_dirty;
+        std::optional<D2D1_RECT_F> last_tooltip_dirty;
     };
 
     static constexpr std::array<uint32_t, 8> PALETTE = {
@@ -478,18 +558,140 @@ private:
         return 0;
     }
 
-    void render_all() {
-        for (auto& m : monitors_) render_monitor(*m);
+    struct LoupeRects {
+        std::optional<D2D1_RECT_F> reticle;
+        std::optional<D2D1_RECT_F> card;
+        std::optional<D2D1_RECT_F> hint;
+    };
+
+    [[nodiscard]] LoupeRects compute_loupe_rects(const MonitorWindow& mw) const noexcept {
+        LoupeRects out;
+        const bool is_cp = (mode_ == OverlayMode::ColorPicker);
+        const bool is_drop = (mode_ == OverlayMode::Screenshot && annotation_dropper_active_ &&
+                              drag_kind_ == DragKind::None && hover_id_ == IdNone);
+        if ((!is_cp && !is_drop) || !rect_contains_pt(mw.info.rect, cursor_vpt_)) return out;
+
+        const D2D1_SIZE_F sz = mw.target.size();
+        const float inv_s = 1.0f / mw.target.scale();
+        const float cx = (static_cast<float>(cursor_vpt_.x) - static_cast<float>(mw.info.rect.left)) * inv_s;
+        const float cy = (static_cast<float>(cursor_vpt_.y) - static_cast<float>(mw.info.rect.top)) * inv_s;
+        const float px_dip = std::max(1.0f, inv_s);
+        out.reticle = D2D1::RectF(cx - px_dip - 3.0f, cy - px_dip - 3.0f, cx + (px_dip * 2.0f) + 3.0f, cy + (px_dip * 2.0f) + 3.0f);
+
+        constexpr float card_w = 189.0f;
+        constexpr float card_h = 231.0f;
+        float lx = cx + 22.0f;
+        float ly = cy + 22.0f;
+        if (lx + card_w > sz.width - 10.0f) lx = cx - card_w - 22.0f;
+        if (ly + card_h > sz.height - 10.0f) ly = cy - card_h - 22.0f;
+        lx = std::clamp(lx, 10.0f, std::max(10.0f, sz.width - card_w - 10.0f));
+        ly = std::clamp(ly, 10.0f, std::max(10.0f, sz.height - card_h - 10.0f));
+        out.card = D2D1::RectF(lx - 10.0f, ly - 5.0f, lx + card_w + 10.0f, ly + card_h + 15.0f);
+
+        if (is_cp) {
+            const float hy = (cy < 96.0f) ? (sz.height - 50.0f) : 16.0f;
+            out.hint = D2D1::RectF(0.0f, hy - 6.0f, sz.width, hy + 46.0f);
+        }
+        return out;
     }
 
-    void render_monitor(MonitorWindow& mw) {
+    void queue_hit_dirty(const MonitorWindow& mw, int id, int idx, std::vector<D2D1_RECT_F>& out) const {
+        if (id == IdNone) return;
+        for (const Hit& h : mw.hits) {
+            if (h.id == id && h.index == idx) {
+                out.push_back(D2D1::RectF(h.r.left - 4.0f, h.r.top - 4.0f, h.r.right + 4.0f, h.r.bottom + 4.0f));
+            }
+        }
+    }
+
+    void render_all() {
+        for (auto& m : monitors_) {
+            m->full_dirty = true;
+            m->pending_dirty.clear();
+            render_monitor(*m, true);
+        }
+    }
+
+    void render_loupe_monitors() {
+        for (auto& m : monitors_) {
+            const LoupeRects lr = compute_loupe_rects(*m);
+            const bool had_any = m->last_reticle_dirty.has_value() || m->last_loupe_dirty.has_value() || m->last_hint_dirty.has_value();
+            const bool has_any = lr.reticle.has_value() || lr.card.has_value() || lr.hint.has_value();
+            if (!had_any && !has_any && m->pending_dirty.empty() && !m->full_dirty) continue;
+
+            if (!m->full_dirty) {
+                if (m->last_reticle_dirty) m->pending_dirty.push_back(*m->last_reticle_dirty);
+                if (m->last_loupe_dirty) m->pending_dirty.push_back(*m->last_loupe_dirty);
+                if (lr.reticle) m->pending_dirty.push_back(*lr.reticle);
+                if (lr.card) m->pending_dirty.push_back(*lr.card);
+                const bool hint_changed = (lr.hint.has_value() != m->last_hint_dirty.has_value()) ||
+                                          (lr.hint && m->last_hint_dirty && !rect_equal(*lr.hint, *m->last_hint_dirty));
+                if (hint_changed) {
+                    if (m->last_hint_dirty) m->pending_dirty.push_back(*m->last_hint_dirty);
+                    if (lr.hint) m->pending_dirty.push_back(*lr.hint);
+                }
+            }
+            render_monitor(*m, false);
+        }
+    }
+
+    void render_vrect_dirty(const RECT& vrect) {
+        const RECT clipped = rect_intersect(vrect, selection_);
+        if (!rect_valid(clipped)) return;
+        for (auto& m : monitors_) {
+            const RECT mr = rect_intersect(clipped, m->info.rect);
+            if (!rect_valid(mr)) continue;
+            const float inv_s = 1.0f / m->target.scale();
+            const float mon_x = static_cast<float>(m->info.rect.left);
+            const float mon_y = static_cast<float>(m->info.rect.top);
+            m->pending_dirty.push_back(D2D1::RectF(
+                (static_cast<float>(mr.left) - mon_x) * inv_s,
+                (static_cast<float>(mr.top) - mon_y) * inv_s,
+                (static_cast<float>(mr.right) - mon_x) * inv_s,
+                (static_cast<float>(mr.bottom) - mon_y) * inv_s));
+            render_monitor(*m, false);
+        }
+    }
+
+    void render_monitor(MonitorWindow& mw, bool force_full = false) {
         if (!mw.target.ready()) return;
         const bool show_toolbar = has_selection_ && (drag_kind_ != DragKind::Creating) && (mw.index == toolbar_monitor_index());
-        (void)mw.target.render_frame(true, {}, WindowTarget::PresentMode::Immediate, [&](std::optional<D2D1_RECT_F> clip, bool) {
-            mw.hits.clear();
-            Canvas cv{mw.target, sh_.fonts, mw.hits, default_theme(), clip};
+        const bool request_full = force_full || mw.full_dirty;
+
+        std::optional<D2D1_RECT_F> curr_tip_dirty;
+        if (mw.hwnd == tooltip_hwnd_ && open_dropdown_ == AudioDropdown::None &&
+            !color_picker_open_ && drag_kind_ == DragKind::None && tooltip_.visible()) {
+            const TooltipLayout tl = measure_tooltip_layout(sh_.fonts, mw.target.size(), tooltip_.anchor, tooltip_.title, tooltip_.subtitle);
+            if (tl.valid) curr_tip_dirty = tl.dirty;
+        }
+        if (!request_full) {
+            if (curr_tip_dirty && (tooltip_.alpha.active() || !mw.last_tooltip_dirty || !rect_equal(*mw.last_tooltip_dirty, *curr_tip_dirty))) {
+                mw.pending_dirty.push_back(*curr_tip_dirty);
+            }
+            if (mw.last_tooltip_dirty && (!curr_tip_dirty || !rect_equal(*mw.last_tooltip_dirty, *curr_tip_dirty))) {
+                mw.pending_dirty.push_back(*mw.last_tooltip_dirty);
+            }
+            if (mw.pending_dirty.empty()) return;
+        } else {
+            mw.pending_dirty.clear();
+        }
+
+        const bool ok = mw.target.render_frame(request_full, mw.pending_dirty, WindowTarget::PresentMode::Immediate,
+                                               [&](std::optional<D2D1_RECT_F> clip, bool full_frame) {
+            std::vector<Hit>& target_hits = full_frame ? mw.hits : mw.scratch_hits;
+            target_hits.clear();
+            Canvas cv{mw.target, sh_.fonts, target_hits, default_theme(), clip};
             draw_monitor(mw, cv, show_toolbar);
         });
+        if (ok) {
+            mw.full_dirty = false;
+            mw.pending_dirty.clear();
+            mw.last_tooltip_dirty = curr_tip_dirty;
+            const LoupeRects lr = compute_loupe_rects(mw);
+            mw.last_reticle_dirty = lr.reticle;
+            mw.last_loupe_dirty = lr.card;
+            mw.last_hint_dirty = lr.hint;
+        }
     }
 
     void draw_monitor(MonitorWindow& mw, Canvas& cv, bool show_toolbar) {
@@ -499,9 +701,20 @@ private:
         const float mon_x = static_cast<float>(mw.info.rect.left);
         const float mon_y = static_cast<float>(mw.info.rect.top);
 
-        // 1. Frozen desktop background (1:1 crisp pixels)
+        // 1. Frozen desktop background (1:1 crisp pixels; sub-rect blit on partial dirty frames)
         if (mw.frozen_bmp) {
-            cv.dc()->DrawBitmap(mw.frozen_bmp.get(), D2D1::RectF(0.0f, 0.0f, sz.width, sz.height), 1.0f, D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR);
+            if (const auto clip = cv.dirty_clip()) {
+                const D2D1_RECT_F sub = D2D1::RectF(
+                    std::clamp(clip->left, 0.0f, sz.width),
+                    std::clamp(clip->top, 0.0f, sz.height),
+                    std::clamp(clip->right, 0.0f, sz.width),
+                    std::clamp(clip->bottom, 0.0f, sz.height));
+                if (sub.right > sub.left && sub.bottom > sub.top) {
+                    cv.dc()->DrawBitmap(mw.frozen_bmp.get(), &sub, 1.0f, D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR, &sub);
+                }
+            } else {
+                cv.dc()->DrawBitmap(mw.frozen_bmp.get(), D2D1::RectF(0.0f, 0.0f, sz.width, sz.height), 1.0f, D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR);
+            }
         }
 
         if (mode_ == OverlayMode::ColorPicker) {
@@ -614,16 +827,21 @@ private:
 
             // 3. Vector annotations clipped inside the selection
             if (has_selection_ && mode_ == OverlayMode::Screenshot && cl.right > cl.left && cl.bottom > cl.top) {
-                cv.push_clip(cl);
-                ID2D1SolidColorBrush* br = mw.target.solid_brush();
-                ID2D1Factory* fac = sh_.gfx.d2d_factory();
-                for (const Annotation& a : annotations_) {
-                    render_annotation(cv.dc(), fac, br, round_stroke_.get(), a, mon_x, mon_y, s);
+                if (!cv.has_dirty_clip() || cv.intersects_clip(cl, 2.0f)) {
+                    cv.push_clip(cl);
+                    ID2D1SolidColorBrush* br = mw.target.solid_brush();
+                    ID2D1Factory* fac = sh_.gfx.d2d_factory();
+                    for (const Annotation& a : annotations_) {
+                        if (cv.has_dirty_clip() && !cv.intersects_clip(annotation_bounds_dip(a, mon_x, mon_y, inv_s), 2.0f)) continue;
+                        render_annotation(cv.dc(), fac, br, round_stroke_.get(), a, mon_x, mon_y, s);
+                    }
+                    if (active_annotation_) {
+                        if (!cv.has_dirty_clip() || cv.intersects_clip(annotation_bounds_dip(*active_annotation_, mon_x, mon_y, inv_s), 2.0f)) {
+                            render_annotation(cv.dc(), fac, br, round_stroke_.get(), *active_annotation_, mon_x, mon_y, s);
+                        }
+                    }
+                    cv.pop_clip();
                 }
-                if (active_annotation_) {
-                    render_annotation(cv.dc(), fac, br, round_stroke_.get(), *active_annotation_, mon_x, mon_y, s);
-                }
-                cv.pop_clip();
             }
 
             // 4. Crisp border & resize handles
@@ -1364,7 +1582,7 @@ private:
         const LONG ny = std::clamp<LONG>(cursor_vpt_.y + dy, capture_->bounds.top, capture_->bounds.bottom - 1);
         cursor_vpt_ = {.x = nx, .y = ny};
         SetCursorPos(nx, ny);
-        render_all();
+        render_loupe_monitors();
     }
 
     // ------------------------------------------------------------------------------------------
@@ -1665,14 +1883,18 @@ private:
                 drag_kind_ = DragKind::PickingSV;
                 SetCapture(mw.hwnd);
                 update_picker_sv(dip);
-                render_all();
+                mw.pending_dirty.push_back(inset(picker_panel_rect_, -14.0f, -14.0f));
+                mw.pending_dirty.push_back(inset(color_picker_anchor_, -4.0f, -4.0f));
+                render_monitor(mw, false);
                 return;
             }
             if (h->id == IdPickerHue) {
                 drag_kind_ = DragKind::PickingHue;
                 SetCapture(mw.hwnd);
                 update_picker_hue(dip);
-                render_all();
+                mw.pending_dirty.push_back(inset(picker_panel_rect_, -14.0f, -14.0f));
+                mw.pending_dirty.push_back(inset(color_picker_anchor_, -4.0f, -4.0f));
+                render_monitor(mw, false);
                 return;
             }
             on_toolbar_click(h->id, h->index);
@@ -1708,7 +1930,9 @@ private:
             a.thickness = THICKNESSES[thick_idx_] * mw.target.scale();
             a.points.push_back(D2D1::Point2F(static_cast<float>(vpt.x), static_cast<float>(vpt.y)));
             active_annotation_ = std::move(a);
-            render_all();
+            const RECT b = annotation_bounds_vpx(*active_annotation_);
+            active_ann_prev_vrect_ = b;
+            render_vrect_dirty(b);
             return;
         }
 
@@ -1740,14 +1964,16 @@ private:
         if (mode_ == OverlayMode::RecordMonitor) {
             update_cursor(mw, vpt, nullptr);
             if (hovered_monitor_idx_ != mw.index) {
+                const size_t prev_idx = hovered_monitor_idx_;
                 hovered_monitor_idx_ = mw.index;
-                render_all();
+                if (prev_idx < monitors_.size()) render_monitor(*monitors_[prev_idx], true);
+                render_monitor(mw, true);
             }
             return;
         }
         if (mode_ == OverlayMode::ColorPicker) {
             update_cursor(mw, vpt, nullptr);
-            render_all();
+            render_loupe_monitors();
             return;
         }
         const bool snap_on = (GetKeyState(VK_MENU) >= 0); // hold Alt to bypass magnetic snap
@@ -1755,12 +1981,16 @@ private:
 
         if (drag_kind_ == DragKind::PickingSV) {
             update_picker_sv(to_local_dip(mw, lp));
-            render_all();
+            mw.pending_dirty.push_back(inset(picker_panel_rect_, -14.0f, -14.0f));
+            mw.pending_dirty.push_back(inset(color_picker_anchor_, -4.0f, -4.0f));
+            render_monitor(mw, false);
             return;
         }
         if (drag_kind_ == DragKind::PickingHue) {
             update_picker_hue(to_local_dip(mw, lp));
-            render_all();
+            mw.pending_dirty.push_back(inset(picker_panel_rect_, -14.0f, -14.0f));
+            mw.pending_dirty.push_back(inset(color_picker_anchor_, -4.0f, -4.0f));
+            render_monitor(mw, false);
             return;
         }
 
@@ -1769,14 +1999,19 @@ private:
             const Hit* h = hit_test(mw.hits, dip);
             const int nid = h ? h->id : IdNone;
             const int nidx = h ? h->index : 0;
+            const int old_id = hover_id_;
+            const int old_idx = hover_idx_;
+            const bool hover_changed = (nid != old_id || nidx != old_idx);
             const bool mon_changed = (tooltip_hwnd_ != mw.hwnd);
-            bool need_render = (nid != hover_id_ || nidx != hover_idx_) || annotation_dropper_active_;
-            if (need_render || (mon_changed && nid != IdNone)) {
+            MonitorWindow* prev_tip_mw = nullptr;
+            if (hover_changed || (mon_changed && nid != IdNone)) {
                 if (mon_changed && tooltip_hwnd_) {
+                    for (auto& m : monitors_) {
+                        if (m->hwnd == tooltip_hwnd_) { prev_tip_mw = m.get(); break; }
+                    }
                     KillTimer(tooltip_hwnd_, TIMER_TOOLTIP);
                     KillTimer(tooltip_hwnd_, TIMER_TOOLTIP_ANIM);
                     tooltip_.clear(nullptr, 0, false);
-                    need_render = true;
                 }
                 tooltip_hwnd_ = mw.hwnd;
                 tooltip_.on_hover_changed(mw.hwnd, TIMER_TOOLTIP, h, has_tooltip(nid, nidx), true);
@@ -1784,20 +2019,36 @@ private:
             }
             hover_id_ = nid;
             hover_idx_ = nidx;
+            bool snap_changed = false;
             if (!has_selection_) {
                 const auto next_snap = snap_on ? hit_snap_rect(snaps_, vpt) : std::nullopt;
-                const bool changed = (next_snap.has_value() != hover_snap_.has_value()) ||
-                                     (next_snap && hover_snap_ && (next_snap->left != hover_snap_->left || next_snap->top != hover_snap_->top ||
-                                                                    next_snap->right != hover_snap_->right || next_snap->bottom != hover_snap_->bottom));
-                if (changed) {
+                snap_changed = (next_snap.has_value() != hover_snap_.has_value()) ||
+                               (next_snap && hover_snap_ && (next_snap->left != hover_snap_->left || next_snap->top != hover_snap_->top ||
+                                                             next_snap->right != hover_snap_->right || next_snap->bottom != hover_snap_->bottom));
+                if (snap_changed) {
                     hover_snap_ = next_snap;
-                    need_render = true;
                 }
             }
             update_cursor(mw, vpt, h);
             TRACKMOUSEEVENT tme{.cbSize = sizeof(tme), .dwFlags = TME_LEAVE, .hwndTrack = mw.hwnd};
             TrackMouseEvent(&tme);
-            if (need_render) render_all();
+            if (snap_changed) {
+                render_all();
+            } else {
+                if (hover_changed) {
+                    queue_hit_dirty(mw, old_id, old_idx, mw.pending_dirty);
+                    queue_hit_dirty(mw, nid, nidx, mw.pending_dirty);
+                }
+                if (prev_tip_mw && prev_tip_mw != &mw) {
+                    queue_hit_dirty(*prev_tip_mw, old_id, old_idx, prev_tip_mw->pending_dirty);
+                    render_monitor(*prev_tip_mw, false);
+                }
+                if (annotation_dropper_active_) {
+                    render_loupe_monitors();
+                } else if (hover_changed || mon_changed) {
+                    render_monitor(mw, false);
+                }
+            }
             return;
         }
 
@@ -1809,13 +2060,36 @@ private:
             if (active_annotation_->tool == DrawTool::Pen || active_annotation_->tool == DrawTool::Highlighter) {
                 const D2D1_POINT_2F prev = active_annotation_->points.back();
                 if (std::hypot(pt.x - prev.x, pt.y - prev.y) >= 1.5f) {
+                    const size_t n_before = active_annotation_->points.size();
+                    const D2D1_POINT_2F p_anchor = (n_before >= 2) ? active_annotation_->points[n_before - 2] : prev;
                     active_annotation_->points.push_back(pt);
+                    const float w = std::max(1.0f, active_annotation_->thickness);
+                    const float pad = (active_annotation_->tool == DrawTool::Highlighter) ? ((w * 1.8f) + 8.0f) : ((w * 0.5f) + 8.0f);
+                    const float min_x = std::min({p_anchor.x, prev.x, pt.x}) - pad;
+                    const float max_x = std::max({p_anchor.x, prev.x, pt.x}) + pad;
+                    const float min_y = std::min({p_anchor.y, prev.y, pt.y}) - pad;
+                    const float max_y = std::max({p_anchor.y, prev.y, pt.y}) + pad;
+                    render_vrect_dirty(RECT{
+                        .left = static_cast<LONG>(std::floor(min_x)),
+                        .top = static_cast<LONG>(std::floor(min_y)),
+                        .right = static_cast<LONG>(std::ceil(max_x)),
+                        .bottom = static_cast<LONG>(std::ceil(max_y)),
+                    });
                 }
             } else {
                 if (active_annotation_->points.size() < 2) active_annotation_->points.push_back(pt);
                 else active_annotation_->points.back() = pt;
+                const RECT cur_b = annotation_bounds_vpx(*active_annotation_);
+                RECT dirty = cur_b;
+                if (active_ann_prev_vrect_) {
+                    dirty.left = std::min(dirty.left, active_ann_prev_vrect_->left);
+                    dirty.top = std::min(dirty.top, active_ann_prev_vrect_->top);
+                    dirty.right = std::max(dirty.right, active_ann_prev_vrect_->right);
+                    dirty.bottom = std::max(dirty.bottom, active_ann_prev_vrect_->bottom);
+                }
+                active_ann_prev_vrect_ = cur_b;
+                render_vrect_dirty(dirty);
             }
-            render_all();
             return;
         }
 
@@ -1897,13 +2171,21 @@ private:
         snap_guide_y_.reset();
 
         if (drag_kind_ == DragKind::Drawing) {
+            std::optional<RECT> final_b;
             if (active_annotation_) {
+                final_b = annotation_bounds_vpx(*active_annotation_);
                 annotations_.push_back(std::move(*active_annotation_));
                 active_annotation_.reset();
                 redo_stack_.clear();
             }
+            active_ann_prev_vrect_.reset();
             drag_kind_ = DragKind::None;
-            render_all();
+            if (final_b) render_vrect_dirty(*final_b);
+            return;
+        }
+
+        if (drag_kind_ == DragKind::PickingSV || drag_kind_ == DragKind::PickingHue) {
+            drag_kind_ = DragKind::None;
             return;
         }
 
@@ -2031,7 +2313,7 @@ private:
         switch (msg) {
             case WM_ERASEBKGND: return 1;
             case WM_PAINT:
-                render_monitor(mw);
+                render_monitor(mw, true);
                 ValidateRect(hwnd, nullptr);
                 return 0;
             case WM_LBUTTONDOWN:
@@ -2048,11 +2330,14 @@ private:
                 return 0;
             case WM_MOUSELEAVE:
                 if (tooltip_hwnd_ == hwnd) {
+                    const int old_id = hover_id_;
+                    const int old_idx = hover_idx_;
                     hover_id_ = IdNone;
                     hover_idx_ = 0;
                     tooltip_.clear(hwnd, TIMER_TOOLTIP, true);
                     if (tooltip_.alpha.active()) start_tooltip_anim(hwnd);
-                    render_monitor(mw);
+                    queue_hit_dirty(mw, old_id, old_idx, mw.pending_dirty);
+                    render_monitor(mw, false);
                 }
                 return 0;
             case WM_TIMER:
@@ -2181,6 +2466,7 @@ private:
     std::vector<Annotation> annotations_;
     std::vector<Annotation> redo_stack_;
     std::optional<Annotation> active_annotation_;
+    std::optional<RECT> active_ann_prev_vrect_;
 
     int hover_id_ = IdNone;
     int hover_idx_ = 0;

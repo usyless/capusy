@@ -12,6 +12,11 @@
 
 #include "resource.h"
 
+#if defined(CAPUSY_USE_MIMALLOC) && __has_include(<mimalloc.h>)
+#include <mimalloc.h>
+#define CAPUSY_HAS_MIMALLOC_HEADER 1
+#endif
+
 #include <shellapi.h>
 
 #include <condition_variable>
@@ -131,6 +136,7 @@ public:
         if (toast_win_) toast_win_->hide_immediate();
         if (history_win_) history_win_->hide();
         if (settings_win_) settings_win_->hide();
+        (void)OleFlushClipboard();
         sh_.history.close();
         if (tray_hwnd_) {
             MSG leftover;
@@ -150,6 +156,8 @@ private:
             if (history_win_) history_win_->reset_gpu();
             if (settings_win_) settings_win_->reset_gpu();
             if (toast_win_) toast_win_->reset_gpu();
+            if (region_overlay_) region_overlay_->reset_gpu();
+            if (rec_overlay_) rec_overlay_->reset_gpu();
         };
 
         sh_.on_capture_full = [this] { trigger_full_screenshot(); };
@@ -315,6 +323,7 @@ private:
         if (!recorder_.start(region, out, std::move(cfg))) {
             balloon_opens_about_ = false;
             show_balloon(force_tray_only ? L"Failed to start full-screen recording." : L"Failed to start region recording.", NIIF_ERROR);
+            schedule_idle_trim();
             return;
         }
         pending_record_window_ = std::move(win_info);
@@ -366,6 +375,7 @@ private:
     }
 
     void on_recording_finished(RecordingResult&& res) {
+        recorder_.stop_sync();
         sh_.recording_active = false;
         recording_stopping_ = false;
         rec_overlay_->hide();
@@ -649,9 +659,14 @@ private:
     void perform_idle_trim() noexcept {
         if (any_ui_active()) return;
         sh_.thumbs.clear();
+        sh_.thumbs.stop();
         sh_.previews.clear();
+        sh_.previews.stop();
         sh_.fonts.clear_caches();
         sh_.gfx.release_device();
+#ifdef CAPUSY_HAS_MIMALLOC_HEADER
+        mi_collect(true);
+#endif
         SetProcessWorkingSetSize(GetCurrentProcess(), static_cast<SIZE_T>(-1), static_cast<SIZE_T>(-1));
     }
 
@@ -677,7 +692,7 @@ private:
         bi.bmiHeader.biCompression = BI_RGB;
 
         void* bits = nullptr;
-        const wil::unique_hdc screen_dc{GetDC(nullptr)};
+        const wil::unique_hdc_window screen_dc{GetDC(nullptr)};
         const wil::unique_hdc mem_dc{CreateCompatibleDC(screen_dc.get())};
         if (!mem_dc) return {};
         const wil::unique_hbitmap color_bmp{CreateDIBSection(mem_dc.get(), &bi, DIB_RGB_COLORS, &bits, nullptr, 0)};
