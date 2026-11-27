@@ -104,8 +104,11 @@ public:
         apply_dark_window(hwnd_, DWMSBT_MAINWINDOW, true);
         cloak_window(hwnd_, false);
         minimized_ = false;
-        if (IsIconic(hwnd_)) ShowWindow(hwnd_, SW_RESTORE);
-        else ShowWindow(hwnd_, SW_SHOWNORMAL);
+        if (IsIconic(hwnd_)) {
+            ShowWindow(hwnd_, SW_RESTORE);
+        } else {
+            ShowWindow(hwnd_, SW_SHOWNORMAL);
+        }
         SetForegroundWindow(hwnd_);
         SetFocus(hwnd_);
         window_active_ = true;
@@ -203,7 +206,7 @@ private:
     static constexpr UINT WM_APP_RECORDED_KEY = WM_APP + 30;
     static constexpr UINT_PTR TIMER_TOOLTIP = 1;
 
-    enum HitId : int {
+    enum HitId : uint8_t {
         IdNone = 0,
         IdTab0,
         IdTab1,
@@ -495,7 +498,7 @@ private:
             GetForegroundWindow() == record_hook_target_->hwnd_) {
             const auto* kb = reinterpret_cast<const KBDLLHOOKSTRUCT*>(lp);
             if (kb->vkCode == VK_SNAPSHOT) {
-                const auto read_mods = [&]() noexcept -> uint32_t {
+                const auto read_mods = [&] noexcept -> uint32_t {
                     uint32_t mods = 0;
                     if (GetAsyncKeyState(VK_CONTROL) < 0) mods |= MOD_CONTROL;
                     if ((kb->flags & LLKHF_ALTDOWN) != 0 || GetAsyncKeyState(VK_MENU) < 0) mods |= MOD_ALT;
@@ -646,9 +649,13 @@ private:
         const float cx = std::round((sz.width - cw) * 0.5f);
         float y = view.top + PAD - scroll_;
 
-        if (tab_ == 0) y = draw_tab_general(cv, cx, y, cw);
-        else if (tab_ == 1) y = draw_tab_toast_recording(cv, cx, y, cw);
-        else y = draw_tab_about(cv, cx, y, cw);
+        if (tab_ == 0) {
+            y = draw_tab_general(cv, cx, y, cw);
+        } else if (tab_ == 1) {
+            y = draw_tab_toast_recording(cv, cx, y, cw);
+        } else {
+            y = draw_tab_about(cv, cx, y, cw);
+        }
 
         content_h_ = (y + scroll_ - view.top) + PAD;
         cv.pop_clip();
@@ -910,8 +917,11 @@ private:
         const bool was_vis = tooltip_.visible();
         tooltip_.clear(hwnd_, TIMER_TOOLTIP, false);
         if (was_vis) {
-            if (last_tooltip_dirty_) invalidate_rect(*last_tooltip_dirty_);
-            else invalidate();
+            if (last_tooltip_dirty_) {
+                invalidate_rect(*last_tooltip_dirty_);
+            } else {
+                invalidate();
+            }
         }
     }
 
@@ -924,7 +934,7 @@ private:
             {.g = glyph::keyboard, .label = L"General & Hotkeys", .id = IdTab0},
             {.g = glyph::video, .label = L"Toast & Recording", .id = IdTab1},
             {.g = glyph::info, .label = L"About", .id = IdTab2},
-        }};
+        },};
 
         std::array<D2D1_RECT_F, 3> rects{};
         float x = PAD;
@@ -1030,8 +1040,11 @@ private:
             const D2D1_RECT_F side = draw_header(cv, lx, y, rw, hd);
             draw_switch(cv, hover_.alpha(IdToggleHotkey, static_cast<int>(i)), sw_hotkeys_[i].value, side.right, side.top + 12.0f, IdToggleHotkey, static_cast<int>(i));
             keys.draw(lx, keys_y, rw);
-            if (warn_h > 0.0f) draw_error_row(cv, warn_msg, lx, note_y, rw, warn_h);
-            else if (info_h > 0.0f) cv.text_wrap(info_msg, rect(lx, note_y, rw, info_h), Font::Caption, cv.theme().on_surface_variant);
+            if (warn_h > 0.0f) {
+                draw_error_row(cv, warn_msg, lx, note_y, rw, warn_h);
+            } else if (info_h > 0.0f) {
+                cv.text_wrap(info_msg, rect(lx, note_y, rw, info_h), Font::Caption, cv.theme().on_surface_variant);
+            }
             y = next_y;
         }
 
@@ -1361,7 +1374,7 @@ private:
                     }();
                     gif_row.add(92.0f, 32.0f, [&, c, clbl](D2D1_RECT_F r) {
                         draw_button(cv, hover_.alpha(IdRecGifColors, c), r, 0, clbl, IdRecGifColors, c,
-                                    sh_.settings.record_gif_colors == static_cast<uint32_t>(c) ? 1 : 0);
+                                    std::cmp_equal(sh_.settings.record_gif_colors, c) ? 1 : 0);
                     });
                 }
             }
@@ -1374,7 +1387,7 @@ private:
                 flbl.append(L" FPS");
                 fps_row.add(78.0f, 32.0f, [&, fp, flbl](D2D1_RECT_F r) {
                     draw_button(cv, hover_.alpha(IdRecFpsPreset, fp), r, 0, flbl, IdRecFpsPreset, fp,
-                                eff_fps == static_cast<uint32_t>(fp) ? 1 : 0);
+                                std::cmp_equal(eff_fps, fp) ? 1 : 0);
                 });
             }
 
@@ -1385,7 +1398,7 @@ private:
                 const float sw = (sc == 100) ? 118.0f : 68.0f;
                 scale_row.add(sw, 32.0f, [&, sc, slbl](D2D1_RECT_F r) {
                     draw_button(cv, hover_.alpha(IdRecScalePreset, sc), r, 0, slbl, IdRecScalePreset, sc,
-                                sh_.settings.record_scale_pct == static_cast<uint32_t>(sc) ? 1 : 0);
+                                std::cmp_equal(sh_.settings.record_scale_pct, sc) ? 1 : 0);
                 });
             }
 
@@ -1411,7 +1424,7 @@ private:
                         blbl.append(L" Mbps");
                         br_row.add(78.0f, 32.0f, [&, mb, blbl](D2D1_RECT_F r) {
                             draw_button(cv, hover_.alpha(IdRecBitratePreset, mb), r, 0, blbl, IdRecBitratePreset, mb,
-                                        sh_.settings.record_bitrate_mbps == static_cast<uint32_t>(mb) ? 1 : 0);
+                                        std::cmp_equal(sh_.settings.record_bitrate_mbps, mb) ? 1 : 0);
                         });
                     }
                 }
@@ -1422,7 +1435,7 @@ private:
                     klbl.append(L" s");
                     kf_row.add(64.0f, 32.0f, [&, ks, klbl](D2D1_RECT_F r) {
                         draw_button(cv, hover_.alpha(IdRecKeyframe, ks), r, 0, klbl, IdRecKeyframe, ks,
-                                    sh_.settings.record_keyframe_s == static_cast<uint32_t>(ks) ? 1 : 0);
+                                    std::cmp_equal(sh_.settings.record_keyframe_s, ks) ? 1 : 0);
                     });
                 }
             }
@@ -1547,7 +1560,7 @@ private:
                 if (is_gif && sh_.settings.record_fps > RECORD_GIF_FPS_MAX) fps_lbl.append(L" (GIF max)");
                 cv.text(fps_lbl, rect(lx, fps_slider_y, 180.0f, 32.0f), Font::Body, cv.theme().on_surface);
                 slider_rec_fps_r_ = rect(lx + 190.0f, fps_slider_y, std::max(100.0f, rw - 190.0f), 32.0f);
-                const float max_fps_f = static_cast<float>(is_gif ? RECORD_GIF_FPS_MAX : RECORD_FPS_MAX);
+                const auto max_fps_f = static_cast<float>(is_gif ? RECORD_GIF_FPS_MAX : RECORD_FPS_MAX);
                 const float fps_ratio = std::clamp(
                     (static_cast<float>(eff_fps) - static_cast<float>(RECORD_FPS_MIN)) / (max_fps_f - static_cast<float>(RECORD_FPS_MIN)),
                     0.0f, 1.0f);
@@ -1640,7 +1653,7 @@ private:
                     klbl.append(L" kbps");
                     abr_row.add(84.0f, 32.0f, [&, kb, klbl](D2D1_RECT_F r) {
                         draw_button(cv, hover_.alpha(IdRecAudioBitrate, kb), r, 0, klbl, IdRecAudioBitrate, kb,
-                                    sh_.settings.record_audio_bitrate_kbps == static_cast<uint32_t>(kb) ? 1 : 0);
+                                    std::cmp_equal(sh_.settings.record_audio_bitrate_kbps, kb) ? 1 : 0);
                     });
                 }
 
@@ -1752,8 +1765,11 @@ private:
         const float next_y = card_begin(cv, x, y, w, card_h, CARD_GAP);
 
         const D2D1_RECT_F icon_r = cv.snap(rect(x + ((w - icon_sz) * 0.5f), icon_y, icon_sz, icon_sz));
-        if (ID2D1Bitmap1* bmp = ensure_app_icon(cv)) cv.bitmap(bmp, icon_r);
-        else cv.icon(glyph::camera, icon_r, cv.theme().primary, Font::IconLarge);
+        if (ID2D1Bitmap1* bmp = ensure_app_icon(cv)) {
+            cv.bitmap(bmp, icon_r);
+        } else {
+            cv.icon(glyph::camera, icon_r, cv.theme().primary, Font::IconLarge);
+        }
 
         cv.text(APP_NAME, rect(lx, name_y, rw, 26.0f), Font::Title, cv.theme().on_surface, Align::Center);
         cv.text(ver, rect(lx, ver_y, rw, 22.0f), Font::Body, cv.theme().on_surface_variant, Align::Center);
@@ -2043,7 +2059,7 @@ private:
             const fs::path parent = fs::path{sharex_path_w_}.parent_path();
             if (!parent.empty() && fs::is_directory(parent, ec) && !ec) return parent.wstring();
         }
-        const std::wstring docs = known_folder(FOLDERID_Documents);
+        std::wstring docs = known_folder(FOLDERID_Documents);
         if (!docs.empty()) {
             const fs::path sx_dir = fs::path{docs} / L"ShareX";
             if (fs::is_directory(sx_dir, ec) && !ec) return sx_dir.wstring();
@@ -2054,11 +2070,11 @@ private:
 
     bool browse_sharex_history_file() {
         static constexpr std::array<COMDLG_FILTERSPEC, 4> kFilters = {{
-            {L"ShareX History (*.db; *.json)", L"*.db;*.sqlite;*.sqlite3;*.json"},
-            {L"ShareX SQLite Database (*.db)", L"*.db;*.sqlite;*.sqlite3"},
-            {L"ShareX Legacy JSON (*.json)", L"*.json"},
-            {L"All Files (*.*)", L"*.*"},
-        }};
+            {.pszName = L"ShareX History (*.db; *.json)", .pszSpec = L"*.db;*.sqlite;*.sqlite3;*.json"},
+            {.pszName = L"ShareX SQLite Database (*.db)", .pszSpec = L"*.db;*.sqlite;*.sqlite3"},
+            {.pszName = L"ShareX Legacy JSON (*.json)", .pszSpec = L"*.json"},
+            {.pszName = L"All Files (*.*)", .pszSpec = L"*.*"},
+        },};
         if (auto picked = browse_file_dialog(hwnd_, L"Select ShareX History.db or History.json", sharex_browse_initial_dir(), kFilters)) {
             sharex_path_w_ = std::move(*picked);
             {
@@ -2079,8 +2095,8 @@ private:
             sharex_job_.thread.request_stop();
             return;
         }
-        if (sharex_path_w_.empty()) {
-            if (!browse_sharex_history_file()) return;
+        if (sharex_path_w_.empty() && !browse_sharex_history_file()) {
+            return;
         }
         if (sharex_job_.thread.joinable()) sharex_job_.thread.join();
 
@@ -2098,7 +2114,7 @@ private:
         ++sh_.background_jobs;
         invalidate();
 
-        sharex_job_.thread = std::jthread([this, src_path, filename, opts](const std::stop_token& stop) {
+        sharex_job_.thread = std::jthread([this, src_path, filename, opts](const std::stop_token& stop) { // NOLINT(bugprone-exception-escape)
             ShareXImportResult res{};
             std::string err;
             bool ok = false;
@@ -2116,9 +2132,12 @@ private:
             } catch (const std::exception& e) {
                 ok = false;
                 err = e.what();
+            } catch (...) {
+                ok = false;
+                err = "Unexpected error during ShareX history import.";
             }
 
-            sh_.call([this, ok, res, filename, err = std::move(err)] {
+            sh_.call([this, ok, res, filename, err = std::move(err)] { // NOLINT(bugprone-exception-escape)
                 if (sharex_job_.thread.joinable()) sharex_job_.thread.join();
                 sharex_job_.busy = false;
                 if (sh_.background_jobs > 0) --sh_.background_jobs;
@@ -2180,27 +2199,27 @@ private:
                 break;
             case IdSliderRecFps: {
                 const bool is_gif = (sh_.settings.resolved_record_format() == RecordFormat::Gif);
-                const float hi = static_cast<float>(is_gif ? RECORD_GIF_FPS_MAX : RECORD_FPS_MAX);
-                const float lo = static_cast<float>(RECORD_FPS_MIN);
+                const auto hi = static_cast<float>(is_gif ? RECORD_GIF_FPS_MAX : RECORD_FPS_MAX);
+                const auto lo = static_cast<float>(RECORD_FPS_MIN);
                 sh_.settings.record_fps = clamp_record_fps(static_cast<uint32_t>(std::lround(lo + (k * (hi - lo)))));
                 break;
             }
             case IdSliderRecScale: {
-                const float lo = static_cast<float>(RECORD_SCALE_MIN_PCT);
-                const float span = static_cast<float>(RECORD_SCALE_MAX_PCT - RECORD_SCALE_MIN_PCT);
+                const auto lo = static_cast<float>(RECORD_SCALE_MIN_PCT);
+                const auto span = static_cast<float>(RECORD_SCALE_MAX_PCT - RECORD_SCALE_MIN_PCT);
                 const auto stepped = static_cast<uint32_t>(std::lround((lo + (k * span)) / 5.0f)) * 5u;
                 sh_.settings.record_scale_pct = clamp_record_scale_pct(stepped);
                 break;
             }
             case IdSliderRecBitrate: {
-                const float lo = static_cast<float>(RECORD_BITRATE_MIN_MBPS);
-                const float span = static_cast<float>(RECORD_BITRATE_MAX_MBPS - RECORD_BITRATE_MIN_MBPS);
+                const auto lo = static_cast<float>(RECORD_BITRATE_MIN_MBPS);
+                const auto span = static_cast<float>(RECORD_BITRATE_MAX_MBPS - RECORD_BITRATE_MIN_MBPS);
                 sh_.settings.record_bitrate_mbps = clamp_record_bitrate_mbps(static_cast<uint32_t>(std::lround(lo + (k * span))));
                 break;
             }
             case IdSliderRecQuality: {
-                const float lo = static_cast<float>(RECORD_QUALITY_MIN);
-                const float span = static_cast<float>(RECORD_QUALITY_MAX - RECORD_QUALITY_MIN);
+                const auto lo = static_cast<float>(RECORD_QUALITY_MIN);
+                const auto span = static_cast<float>(RECORD_QUALITY_MAX - RECORD_QUALITY_MIN);
                 const auto stepped = static_cast<uint32_t>(std::lround((lo + (k * span)) / 5.0f)) * 5u;
                 sh_.settings.record_quality = clamp_record_quality(stepped);
                 break;
@@ -2489,8 +2508,9 @@ private:
                 return;
             case IdRecAudioDropItem:
                 if (open_audio_drop_ == AudioDropdown::Desktop) {
-                    if (h->index < 0) sh_.settings.record_desktop_device_id.clear();
-                    else if (std::cmp_less(h->index, desktop_devices_.size())) {
+                    if (h->index < 0) {
+                        sh_.settings.record_desktop_device_id.clear();
+                    } else if (std::cmp_less(h->index, desktop_devices_.size())) {
                         sh_.settings.record_desktop_device_id = desktop_devices_[static_cast<size_t>(h->index)].id;
                     }
                     sh_.settings.record_desktop_audio = true;
@@ -2498,8 +2518,9 @@ private:
                     sync_state(true);
                     start_anim();
                 } else if (open_audio_drop_ == AudioDropdown::Mic) {
-                    if (h->index < 0) sh_.settings.record_mic_device_id.clear();
-                    else if (std::cmp_less(h->index, mic_devices_.size())) {
+                    if (h->index < 0) {
+                        sh_.settings.record_mic_device_id.clear();
+                    } else if (std::cmp_less(h->index, mic_devices_.size())) {
                         sh_.settings.record_mic_device_id = mic_devices_[static_cast<size_t>(h->index)].id;
                     }
                     sh_.settings.record_mic_audio = true;

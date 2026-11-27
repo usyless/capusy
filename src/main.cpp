@@ -36,7 +36,7 @@ constexpr int HOTKEY_BASE_ID = 100;
 constexpr UINT_PTR TIMER_IDLE_TRIM = 50;
 constexpr UINT_PTR TIMER_REC_TRAY = 51;
 
-enum TrayMenuId : UINT {
+enum TrayMenuId : uint8_t {
     IdTrayFull = 200,
     IdTrayRegion,
     IdTrayFullRecord,
@@ -113,7 +113,7 @@ public:
         return true;
     }
 
-    int run() {
+    static int run() {
         MSG msg;
         while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
             TranslateMessage(&msg);
@@ -175,8 +175,11 @@ private:
         };
         sh_.on_reload_hotkeys = [this] { register_hotkeys(false); };
         sh_.on_suspend_hotkeys = [this](bool suspend) {
-            if (suspend) unregister_hotkeys();
-            else register_hotkeys(false);
+            if (suspend) {
+                unregister_hotkeys();
+            } else {
+                register_hotkeys(false);
+            }
         };
         sh_.on_test_toast = [this] {
             if (auto cap = capture_virtual_screen(false, sh_.gfx.d3d())) {
@@ -374,7 +377,7 @@ private:
         update_tray_recording_visuals(false);
     }
 
-    void on_recording_finished(RecordingResult&& res) {
+    void on_recording_finished(RecordingResult res) {
         recorder_.stop_sync();
         sh_.recording_active = false;
         recording_stopping_ = false;
@@ -409,7 +412,7 @@ private:
         entry.duration_ms = res.duration_ms;
         entry.window_title = std::move(win_info.title);
         entry.process_name = std::move(win_info.process_name);
-        entry.format = res.format_label.empty() ? "MP4" : res.format_label;
+        entry.format = res.format_label.empty() ? "MP4" : std::move(res.format_label);
         (void)sh_.history.insert(entry);
 
         bool copied = false;
@@ -470,7 +473,7 @@ private:
                           clip = std::move(clip), auto_copy = job.auto_copy] mutable {
                     bool copied = false;
                     if (auto_copy && !clip.paths.empty()) {
-                        if (auto obj = clipboard_data_object(clip)) {
+                        if (const auto obj = clipboard_data_object(clip)) {
                             copied = SUCCEEDED(OleSetClipboard(obj.get()));
                         }
                     }
@@ -538,7 +541,7 @@ private:
                         if (slot.active && slot.mods == mods) {
                             snapshot_hook_target_->snapshot_hook_down_ = true;
                             PostMessageW(snapshot_hook_target_->tray_hwnd_, WM_HOTKEY,
-                                         static_cast<WPARAM>(HOTKEY_BASE_ID + static_cast<int>(i)), 0);
+                                         static_cast<WPARAM>(HOTKEY_BASE_ID) + i, 0);
                             return 1;
                         }
                     }
@@ -656,7 +659,7 @@ private:
         }
     }
 
-    void perform_idle_trim() noexcept {
+    void perform_idle_trim() {
         if (any_ui_active()) return;
         sh_.thumbs.clear();
         sh_.thumbs.stop();
@@ -706,8 +709,8 @@ private:
 
         // Composite an anti-aliased red REC badge with a dark outer ring in the bottom-right corner
         auto* px = static_cast<uint8_t*>(bits);
-        const float fw = static_cast<float>(w);
-        const float fh = static_cast<float>(h);
+        const auto fw = static_cast<float>(w);
+        const auto fh = static_cast<float>(h);
         const float cx = fw * 0.72f;
         const float cy = fh * 0.72f;
         const float r_dot = std::max(2.5f, fw * 0.25f);
@@ -732,7 +735,7 @@ private:
             for (int x = 0; x < w; ++x) {
                 const float d = std::hypot((static_cast<float>(x) + 0.5f) - cx, (static_cast<float>(y) + 0.5f) - cy);
                 if (d > r_ring + 0.75f) continue;
-                uint8_t* p = px + ((static_cast<size_t>(y) * static_cast<size_t>(w) + static_cast<size_t>(x)) * 4u);
+                uint8_t* p = px + (((static_cast<size_t>(y) * static_cast<size_t>(w)) + static_cast<size_t>(x)) * 4u);
                 const float ring_a = std::clamp((r_ring + 0.5f) - d, 0.0f, 1.0f);
                 blend_px(p, 0.08f, 0.07f, 0.09f, ring_a * 0.92f);
                 const float dot_a = std::clamp((r_dot + 0.5f) - d, 0.0f, 1.0f);
@@ -918,12 +921,19 @@ private:
         switch (msg) {
             case WM_HOTKEY: {
                 const int idx = static_cast<int>(wp) - HOTKEY_BASE_ID;
-                if (idx == static_cast<int>(HotkeyAction::FullScreenshot)) trigger_full_screenshot();
-                else if (idx == static_cast<int>(HotkeyAction::RegionScreenshot)) trigger_region_screenshot();
-                else if (idx == static_cast<int>(HotkeyAction::RegionRecord)) trigger_toggle_recording();
-                else if (idx == static_cast<int>(HotkeyAction::FullRecord)) trigger_full_recording();
-                else if (idx == static_cast<int>(HotkeyAction::OpenHistory)) history_win_->show();
-                else if (idx == static_cast<int>(HotkeyAction::ColorPicker)) trigger_color_picker();
+                if (idx == static_cast<int>(HotkeyAction::FullScreenshot)) {
+                    trigger_full_screenshot();
+                } else if (idx == static_cast<int>(HotkeyAction::RegionScreenshot)) {
+                    trigger_region_screenshot();
+                } else if (idx == static_cast<int>(HotkeyAction::RegionRecord)) {
+                    trigger_toggle_recording();
+                } else if (idx == static_cast<int>(HotkeyAction::FullRecord)) {
+                    trigger_full_recording();
+                } else if (idx == static_cast<int>(HotkeyAction::OpenHistory)) {
+                    history_win_->show();
+                } else if (idx == static_cast<int>(HotkeyAction::ColorPicker)) {
+                    trigger_color_picker();
+                }
                 return 0;
             }
             case WM_APP_CALL:
@@ -1186,7 +1196,7 @@ int WINAPI wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE, _In_ LPWSTR, _
 
     const auto app = std::make_unique<CapusyApp>();
     if (!app->init(hInstance, open_about)) return 1;
-    const int code = app->run();
+    const int code = CapusyApp::run();
     app->shutdown();
     return code;
 }

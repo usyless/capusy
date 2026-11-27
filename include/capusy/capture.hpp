@@ -100,9 +100,11 @@ inline void rebuild_snap_guides(SnapTargets& targets) {
         for (const RECT& c : targets.windows[i].children) add_rect(c);
     }
     std::ranges::sort(targets.x_guides);
-    targets.x_guides.erase(std::unique(targets.x_guides.begin(), targets.x_guides.end()), targets.x_guides.end());
+    auto [ux_first, ux_last] = std::ranges::unique(targets.x_guides);
+    targets.x_guides.erase(ux_first, ux_last);
     std::ranges::sort(targets.y_guides);
-    targets.y_guides.erase(std::unique(targets.y_guides.begin(), targets.y_guides.end()), targets.y_guides.end());
+    auto [uy_first, uy_last] = std::ranges::unique(targets.y_guides);
+    targets.y_guides.erase(uy_first, uy_last);
 }
 
 /// Returns the best hover-snap rectangle under `pt`, respecting Z-order occlusion.
@@ -153,7 +155,7 @@ inline void rebuild_snap_guides(SnapTargets& targets) {
 [[nodiscard]] inline LONG snap_coordinate(LONG val, std::span<const LONG> sorted_guides, LONG threshold, std::optional<LONG>& snapped_guide) noexcept {
     snapped_guide.reset();
     if (sorted_guides.empty() || threshold <= 0) return val;
-    const auto it = std::lower_bound(sorted_guides.begin(), sorted_guides.end(), val);
+    const auto it = std::ranges::lower_bound(sorted_guides, val);
     LONG best = val;
     LONG best_dist = threshold + 1;
     if (it != sorted_guides.end()) {
@@ -249,8 +251,8 @@ inline SnapTargets enumerate_snap_targets(const std::vector<MonitorInfo>& monito
         if ((outer.right - outer.left) < 12 || (outer.bottom - outer.top) < 12) return TRUE;
 
         // Skip layered fully transparent windows
-        const LONG_PTR ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
-        if (ex & WS_EX_LAYERED) {
+        const auto ex = static_cast<ULONG_PTR>(GetWindowLongPtrW(hwnd, GWL_EXSTYLE));
+        if ((ex & WS_EX_LAYERED) != 0u) {
             BYTE alpha = 255;
             DWORD flags = 0;
             if (GetLayeredWindowAttributes(hwnd, nullptr, &alpha, &flags) && (flags & LWA_ALPHA) && alpha == 0) {
@@ -282,7 +284,7 @@ inline SnapTargets enumerate_snap_targets(const std::vector<MonitorInfo>& monito
             };
             ChildCtx cctx{.sw = &sw, .clip = outer};
             EnumChildWindows(hwnd, [](HWND ch, LPARAM clp) -> BOOL {
-                auto* cc = reinterpret_cast<ChildCtx*>(clp);
+                const auto* cc = reinterpret_cast<const ChildCtx*>(clp);
                 if (cc->sw->children.size() >= 48u) return FALSE;
                 if (!IsWindowVisible(ch)) return TRUE;
                 RECT r{};
@@ -478,7 +480,7 @@ inline bool save_raster_image(const ui::Raster& raster, const fs::path& path, Im
     if (FAILED(frame->Initialize(props.get()))) return false;
     if (FAILED(frame->SetSize(raster.w, raster.h))) return false;
 
-    WICPixelFormatGUID desired = (format == ImageFormat::Jpeg) ? GUID_WICPixelFormat24bppBGR : GUID_WICPixelFormat32bppBGRA;
+    const WICPixelFormatGUID desired = (format == ImageFormat::Jpeg) ? GUID_WICPixelFormat24bppBGR : GUID_WICPixelFormat32bppBGRA;
     WICPixelFormatGUID negotiated = desired;
     if (FAILED(frame->SetPixelFormat(&negotiated))) return false;
 

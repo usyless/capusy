@@ -192,11 +192,12 @@ inline void parse_tags_json(std::string_view tags_json, std::string& out_title, 
 }
 
 [[nodiscard]] inline bool read_file_bytes(const std::filesystem::path& path, std::string& out, std::string* error) {
-    std::ifstream in(path, std::ios::binary | std::ios::ate);
+    std::ifstream in(path, std::ios::binary);
     if (!in) {
         if (error) *error = "Could not open ShareX history file.";
         return false;
     }
+    in.seekg(0, std::ios::end);
     const std::streampos end_pos = in.tellg();
     if (end_pos < 0) {
         if (error) *error = "Could not determine ShareX history file size.";
@@ -396,8 +397,8 @@ inline void parse_tags_json(std::string_view tags_json, std::string& out_title, 
         std::array<char, 64> hdr{};
         in.read(hdr.data(), static_cast<std::streamsize>(hdr.size()));
         const auto n = static_cast<size_t>(in.gcount());
-        static constexpr char kSqliteMagic[16] = {'S', 'Q', 'L', 'i', 't', 'e', ' ', 'f', 'o', 'r', 'm', 'a', 't', ' ', '3', '\0'};
-        if (n >= 16 && std::memcmp(hdr.data(), kSqliteMagic, 16) == 0) {
+        static constexpr std::array<char, 16> kSqliteMagic = {'S', 'Q', 'L', 'i', 't', 'e', ' ', 'f', 'o', 'r', 'm', 'a', 't', ' ', '3', '\0'};
+        if (n >= 16 && std::memcmp(hdr.data(), kSqliteMagic.data(), 16) == 0) {
             return ShareXHistoryFormat::Sqlite;
         }
         size_t pos = 0;
@@ -545,10 +546,16 @@ inline bool import_sharex_sqlite(
     }
     struct DbGuard {
         sqlite3* db = nullptr;
+        explicit DbGuard(sqlite3* d) noexcept : db(d) {}
+        DbGuard(const DbGuard&) = delete;
+        DbGuard& operator=(const DbGuard&) = delete;
+        DbGuard(DbGuard&&) = delete;
+        DbGuard& operator=(DbGuard&&) = delete;
         ~DbGuard() {
             if (db) sqlite3_close(db);
         }
-    } db_guard{raw};
+    };
+    const DbGuard db_guard{raw};
     sqlite3_busy_timeout(raw, 5000);
 
     // Inspect History table columns to validate schema and support older/newer ShareX schemas.
@@ -566,10 +573,15 @@ inline bool import_sharex_sqlite(
             const auto* col = reinterpret_cast<const char*>(sqlite3_column_text(info, 1));
             if (!col) continue;
             const std::string_view name{col};
-            if (iequals_ascii(name, "FilePath")) has_filepath = true;
-            else if (iequals_ascii(name, "DateTime")) has_datetime = true;
-            else if (iequals_ascii(name, "Type")) has_type = true;
-            else if (iequals_ascii(name, "Tags")) has_tags = true;
+            if (iequals_ascii(name, "FilePath")) {
+                has_filepath = true;
+            } else if (iequals_ascii(name, "DateTime")) {
+                has_datetime = true;
+            } else if (iequals_ascii(name, "Type")) {
+                has_type = true;
+            } else if (iequals_ascii(name, "Tags")) {
+                has_tags = true;
+            }
         }
         sqlite3_finalize(info);
     }
@@ -603,10 +615,16 @@ inline bool import_sharex_sqlite(
     }
     struct StmtGuard {
         sqlite3_stmt* s = nullptr;
+        explicit StmtGuard(sqlite3_stmt* st_in) noexcept : s(st_in) {}
+        StmtGuard(const StmtGuard&) = delete;
+        StmtGuard& operator=(const StmtGuard&) = delete;
+        StmtGuard(StmtGuard&&) = delete;
+        StmtGuard& operator=(StmtGuard&&) = delete;
         ~StmtGuard() {
             if (s) sqlite3_finalize(s);
         }
-    } st_guard{st};
+    };
+    const StmtGuard st_guard{st};
 
     const auto col_sv = [](sqlite3_stmt* s, int col) noexcept -> std::string_view {
         const auto* txt = reinterpret_cast<const char*>(sqlite3_column_text(s, col));
@@ -648,8 +666,8 @@ inline bool import_sharex_sqlite(
         build_entry_from_raw(fp, dt, typ, title_buf, proc_buf, opts, result, batch);
         ++processed;
 
-        if (batch.size() >= kBatchSize) {
-            if (!flush_import_batch(store, batch, result, error)) return false;
+        if (batch.size() >= kBatchSize && !flush_import_batch(store, batch, result, error)) {
+            return false;
         }
         if (on_progress && (processed % 250u == 0u || processed == total_rows)) {
             on_progress(processed, total_rows);
@@ -730,8 +748,8 @@ inline bool import_sharex_json(
         build_entry_from_raw(fp, dt, typ, title, proc, opts, result, batch);
         ++processed;
 
-        if (batch.size() >= kBatchSize) {
-            if (!flush_import_batch(store, batch, result, error)) return false;
+        if (batch.size() >= kBatchSize && !flush_import_batch(store, batch, result, error)) {
+            return false;
         }
         if (on_progress && (processed % 250u == 0u || processed == total)) {
             on_progress(processed, total);

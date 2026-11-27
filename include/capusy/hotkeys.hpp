@@ -20,7 +20,7 @@
 
 namespace capusy {
 
-enum class HotkeyAction : size_t {
+enum class HotkeyAction : uint8_t {
     FullScreenshot = 0,
     RegionScreenshot = 1,
     RegionRecord = 2,
@@ -138,10 +138,7 @@ inline constexpr uint32_t VK_PRINTSCREEN_CODE = 0x2Cu;
 }
 
 [[nodiscard]] constexpr bool any_printscreen_hotkey(std::span<const HotkeyBinding> bindings) noexcept {
-    for (const HotkeyBinding& hb : bindings) {
-        if (is_printscreen_hotkey(hb)) return true;
-    }
-    return false;
+    return std::ranges::any_of(bindings, is_printscreen_hotkey);
 }
 
 /// True for PrintScreen bindings that Windows itself reserves by default (bare PrintScreen for
@@ -257,7 +254,7 @@ inline usylibpp::strings::FixedWString<96> format_hotkey(uint32_t mods, uint32_t
 
     std::array<wchar_t, 64> name; // NOLINT(cppcoreguidelines-pro-type-member-init)
     const UINT scan = MapVirtualKeyW(vk, MAPVK_VK_TO_VSC);
-    const LONG key_lp = static_cast<LONG>(scan << 16u);
+    const LONG key_lp = static_cast<LONG>(static_cast<DWORD>(scan) << 16u);
     if (scan == 0 || GetKeyNameTextW(key_lp, name.data(), static_cast<int>(name.size())) == 0) {
         t.append(L"Key ");
         t.append(usylibpp::strings::to_fixed_wstr<16>(vk));

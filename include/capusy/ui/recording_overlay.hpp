@@ -123,10 +123,8 @@ public:
         pill_target_.release();
         if (border_hwnd_) { DestroyWindow(border_hwnd_); border_hwnd_ = nullptr; }
         if (pill_hwnd_) { DestroyWindow(pill_hwnd_); pill_hwnd_ = nullptr; }
-        pill_hits_.clear();
-        pill_hits_.shrink_to_fit();
-        pill_scratch_hits_.clear();
-        pill_scratch_hits_.shrink_to_fit();
+        decltype(pill_hits_){}.swap(pill_hits_);
+        decltype(pill_scratch_hits_){}.swap(pill_scratch_hits_);
         recorder_ = nullptr;
         hover_stop_ = false;
         pill_full_dirty_ = true;

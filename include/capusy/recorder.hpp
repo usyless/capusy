@@ -86,8 +86,8 @@ struct RecordingResult {
     out_info.guidMajorType = MFMediaType_Video;
     out_info.guidSubtype = MFVideoFormat_HEVC;
 
-    DWORD flags = MFT_ENUM_FLAG_SYNCMFT | MFT_ENUM_FLAG_ASYNCMFT | MFT_ENUM_FLAG_SORTANDFILTER;
-    if (allow_hw) flags |= MFT_ENUM_FLAG_HARDWARE;
+    DWORD flags = static_cast<DWORD>(MFT_ENUM_FLAG_SYNCMFT) | static_cast<DWORD>(MFT_ENUM_FLAG_ASYNCMFT) | static_cast<DWORD>(MFT_ENUM_FLAG_SORTANDFILTER);
+    if (allow_hw) flags |= static_cast<DWORD>(MFT_ENUM_FLAG_HARDWARE);
 
     IMFActivate** activates = nullptr;
     UINT32 count = 0;
@@ -96,7 +96,7 @@ struct RecordingResult {
         for (UINT32 i = 0; i < count; ++i) {
             if (activates[i]) activates[i]->Release();
         }
-        CoTaskMemFree(activates);
+        CoTaskMemFree(static_cast<void*>(activates));
     }
     return SUCCEEDED(hr) && count > 0;
 }
@@ -147,8 +147,8 @@ public:
             src_w &= ~1u;
             src_h &= ~1u;
         }
-        if (src_w < 16u) src_w = 16u;
-        if (src_h < 16u) src_h = 16u;
+        src_w = std::max(src_w, 16u);
+        src_h = std::max(src_h, 16u);
 
         region_ = RECT{
             .left = region.left,
@@ -166,10 +166,16 @@ public:
         active_.store(true, std::memory_order_release);
         start_time_ = std::chrono::steady_clock::now();
 
-        worker_ = std::jthread([this, r = region_, src_w, src_h, out_w, out_h, output_path, cfg = std::move(cfg)] {
-            RecordingResult res = (cfg.format == RecordFormat::Gif)
-                ? run_gif_worker(r, src_w, src_h, out_w, out_h, output_path, cfg)
-                : run_mf_worker(r, src_w, src_h, out_w, out_h, output_path, cfg);
+        worker_ = std::jthread([this, r = region_, src_w, src_h, out_w, out_h, output_path, cfg = std::move(cfg)] { // NOLINT(bugprone-exception-escape)
+            RecordingResult res;
+            try {
+                res = (cfg.format == RecordFormat::Gif)
+                    ? run_gif_worker(r, src_w, src_h, out_w, out_h, output_path, cfg)
+                    : run_mf_worker(r, src_w, src_h, out_w, out_h, output_path, cfg);
+            } catch (...) {
+                res.ok = false;
+                res.error = "Recording worker failed unexpectedly";
+            }
             desktop_audio_active_.store(false, std::memory_order_release);
             mic_audio_active_.store(false, std::memory_order_release);
             active_.store(false, std::memory_order_release);
@@ -197,7 +203,7 @@ public:
 
 private:
     static std::vector<WgcMonitorRect> enumerate_wgc_monitors() {
-        auto mons = enumerate_monitors();
+        const auto mons = enumerate_monitors();
         std::vector<WgcMonitorRect> out;
         out.reserve(mons.size());
         for (const MonitorInfo& m : mons) {
@@ -367,11 +373,12 @@ private:
     static bool configure_wma_audio_stream(IMFSinkWriter* writer, uint32_t bitrate_kbps, uint32_t sample_rate,
                                            uint32_t channels, DWORD& out_stream_idx,
                                            uint32_t& actual_sample_rate, uint32_t& actual_channels) {
-        const DWORD flags = (MFT_ENUM_FLAG_ALL & ~MFT_ENUM_FLAG_FIELDOFUSE) | MFT_ENUM_FLAG_SORTANDFILTER;
+        const DWORD flags = (static_cast<DWORD>(MFT_ENUM_FLAG_ALL) & ~static_cast<DWORD>(MFT_ENUM_FLAG_FIELDOFUSE)) |
+                            static_cast<DWORD>(MFT_ENUM_FLAG_SORTANDFILTER);
         const uint32_t target_bps = (bitrate_kbps * 1000u) / 8u;
 
         wil::com_ptr<IMFMediaType> best_type;
-        uint64_t best_score = (std::numeric_limits<uint64_t>::max)();
+        uint64_t best_score = std::numeric_limits<uint64_t>::max();
         uint32_t best_sr = sample_rate;
         uint32_t best_ch = channels;
 
@@ -443,7 +450,7 @@ private:
     static bool write_audio_chunk(IMFSinkWriter* writer, std::mutex& writer_mx, DWORD audio_stream_idx,
                                   const int16_t* pcm16, uint32_t frames, uint32_t sample_rate, uint32_t channels,
                                   uint64_t sample_offset_frames) {
-        const DWORD bytes = frames * channels * sizeof(int16_t);
+        const auto bytes = static_cast<DWORD>(static_cast<size_t>(frames) * static_cast<size_t>(channels) * sizeof(int16_t));
         wil::com_ptr<IMFMediaBuffer> buf;
         wil::com_ptr<IMFSample> sample;
         if (FAILED(MFCreateMemoryBuffer(bytes, &buf)) || !buf ||
@@ -457,8 +464,8 @@ private:
         buf->SetCurrentLength(bytes);
         sample->AddBuffer(buf.get());
 
-        const LONGLONG ts_100ns = static_cast<LONGLONG>((sample_offset_frames * 10'000'000ull) / sample_rate);
-        const LONGLONG dur_100ns = static_cast<LONGLONG>((static_cast<uint64_t>(frames) * 10'000'000ull) / sample_rate);
+        const auto ts_100ns = static_cast<LONGLONG>((sample_offset_frames * 10'000'000ull) / sample_rate);
+        const auto dur_100ns = static_cast<LONGLONG>((static_cast<uint64_t>(frames) * 10'000'000ull) / sample_rate);
         sample->SetSampleTime(ts_100ns);
         sample->SetSampleDuration(dur_100ns);
 
@@ -564,7 +571,7 @@ private:
             return true;
         };
 
-        auto init_with_fallbacks = [&](bool with_audio) -> bool {
+        const auto init_with_fallbacks = [&](bool with_audio) -> bool {
             if (dxgi_nv12_ready && try_init_writer(cfg.codec, true, true, with_audio)) return true;
             if (try_init_writer(cfg.codec, cfg.hw_accel, false, with_audio)) return true;
             if (cfg.hw_accel && try_init_writer(cfg.codec, false, false, with_audio)) return true;
@@ -735,7 +742,7 @@ private:
                 if (!res.first_frame) {
                     res.first_frame = surface.copy_first_frame();
                 }
-                if (auto nv12_tex = surface.render_nv12_frame()) {
+                if (const auto nv12_tex = surface.render_nv12_frame()) {
                     if (SUCCEEDED(MFCreateDXGISurfaceBuffer(__uuidof(ID3D11Texture2D), nv12_tex.get(), 0, FALSE, &buf)) && buf &&
                         SUCCEEDED(MFCreateSample(&sample)) && sample) {
                         DWORD contig_len = (w * h * 3u) / 2u;
@@ -873,13 +880,13 @@ private:
         if (SUCCEEDED(encoder->GetMetadataQueryWriter(&global_meta)) && global_meta) {
             std::array<BYTE, 11> app_id{'N', 'E', 'T', 'S', 'C', 'A', 'P', 'E', '2', '.', '0'};
             PROPVARIANT pv_app{};
-            pv_app.vt = VT_UI1 | VT_VECTOR;
+            pv_app.vt = static_cast<VARTYPE>(static_cast<unsigned>(VT_UI1) | static_cast<unsigned>(VT_VECTOR));
             pv_app.caub.cElems = static_cast<ULONG>(app_id.size());
             pv_app.caub.pElems = app_id.data();
 
             std::array<BYTE, 4> loop_data{3, 1, 0, 0}; // 0 = loop infinitely
             PROPVARIANT pv_data{};
-            pv_data.vt = VT_UI1 | VT_VECTOR;
+            pv_data.vt = static_cast<VARTYPE>(static_cast<unsigned>(VT_UI1) | static_cast<unsigned>(VT_VECTOR));
             pv_data.caub.cElems = static_cast<ULONG>(loop_data.size());
             pv_data.caub.pElems = loop_data.data();
 
@@ -916,8 +923,11 @@ private:
             if (!surface.readback_cpu_bgra()) {
                 next_tick += frame_period;
                 const auto after = std::chrono::steady_clock::now();
-                if (next_tick > after) std::this_thread::sleep_until(next_tick);
-                else next_tick = after;
+                if (next_tick > after) {
+                    std::this_thread::sleep_until(next_tick);
+                } else {
+                    next_tick = after;
+                }
                 continue;
             }
             if (!res.first_frame) {

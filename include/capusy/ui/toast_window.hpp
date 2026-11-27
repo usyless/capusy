@@ -65,7 +65,7 @@ public:
         meta_h_ = cap_h;
 
         // Position on the PRIMARY monitor's bottom-right work area
-        const HMONITOR primary = MonitorFromPoint(POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY);
+        const HMONITOR primary = MonitorFromPoint(POINT{.x = 0, .y = 0}, MONITOR_DEFAULTTOPRIMARY);
         MONITORINFO mi{.cbSize = sizeof(mi)};
         GetMonitorInfoW(primary, &mi);
         UINT dx = 96;
@@ -97,7 +97,7 @@ public:
         // Upload thumbnail bitmap (downscaled if huge so VRAM footprint stays tiny)
         thumb_bmp_.reset();
         if (raster && raster->w > 0 && raster->h > 0 && raster->pixels.size() >= static_cast<size_t>(raster->w) * raster->h * 4u) {
-            const uint32_t max_side = static_cast<uint32_t>(std::max<int>(px_w, px_h));
+            const auto max_side = static_cast<uint32_t>(std::max<int>(px_w, px_h));
             if (raster->w <= max_side * 2u && raster->h <= max_side * 2u) {
                 const auto props = D2D1::BitmapProperties1(
                     D2D1_BITMAP_OPTIONS_NONE,
@@ -108,11 +108,11 @@ public:
                 const auto [sw, sh_px] = fit_scaled_size(raster->w, raster->h, std::max<uint32_t>(max_side, 512u));
                 std::vector<uint8_t> small_px(static_cast<size_t>(sw) * sh_px * 4u);
                 for (uint32_t yy = 0; yy < sh_px; ++yy) {
-                    const uint32_t sy = static_cast<uint32_t>((static_cast<uint64_t>(yy) * raster->h) / sh_px);
+                    const auto sy = static_cast<uint32_t>((static_cast<uint64_t>(yy) * raster->h) / sh_px);
                     const uint8_t* srow = raster->pixels.data() + (static_cast<size_t>(sy) * raster->w * 4u);
                     uint8_t* drow = small_px.data() + (static_cast<size_t>(yy) * sw * 4u);
                     for (uint32_t xx = 0; xx < sw; ++xx) {
-                        const uint32_t sx = static_cast<uint32_t>((static_cast<uint64_t>(xx) * raster->w) / sw);
+                        const auto sx = static_cast<uint32_t>((static_cast<uint64_t>(xx) * raster->w) / sw);
                         std::memcpy(drow + (static_cast<size_t>(xx) * 4u), srow + (static_cast<size_t>(sx) * 4u), 4u);
                     }
                 }
@@ -156,7 +156,7 @@ public:
         copied_ = copied;
         thumb_bmp_.reset();
 
-        const HMONITOR primary = MonitorFromPoint(POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY);
+        const HMONITOR primary = MonitorFromPoint(POINT{.x = 0, .y = 0}, MONITOR_DEFAULTTOPRIMARY);
         MONITORINFO mi{.cbSize = sizeof(mi)};
         GetMonitorInfoW(primary, &mi);
         UINT dx = 96;
@@ -213,8 +213,7 @@ public:
         full_dirty_ = true;
         last_drawn_alpha_ = -1.0f;
         last_drawn_bar_w_ = -1.0f;
-        path_.clear();
-        path_.shrink_to_fit();
+        std::wstring{}.swap(path_);
         thumb_bmp_.reset();
         target_.release();
         cloak_window(hwnd_, true);

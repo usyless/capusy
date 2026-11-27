@@ -118,7 +118,7 @@ public:
             {.f = Font::Icon, .family = &icon, .size = 16.0f, .weight = DWRITE_FONT_WEIGHT_NORMAL, .wrap = false, .is_icon = true},
             {.f = Font::IconSmall, .family = &icon, .size = 12.0f, .weight = DWRITE_FONT_WEIGHT_NORMAL, .wrap = false, .is_icon = true},
             {.f = Font::IconLarge, .family = &icon, .size = 20.0f, .weight = DWRITE_FONT_WEIGHT_NORMAL, .wrap = false, .is_icon = true},
-        }};
+        },};
         for (const auto& d : defs) {
             wil::com_ptr<IDWriteTextFormat> fmt;
             if (FAILED(dw->CreateTextFormat(d.family->c_str(), nullptr, d.weight, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, d.size, L"en-us", &fmt))) return false;

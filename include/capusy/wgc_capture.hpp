@@ -59,16 +59,15 @@ struct RoScope {
     [[nodiscard]] bool ok() const noexcept { return SUCCEEDED(hr); }
 };
 
-template <size_t N>
-inline HRESULT make_hstring_ref(const wchar_t (&lit)[N], HSTRING_HEADER& hdr, HSTRING& out) noexcept {
-    return WindowsCreateStringReference(lit, static_cast<UINT32>(N - 1), &hdr, &out);
+inline HRESULT make_hstring_ref(std::wstring_view lit, HSTRING_HEADER& hdr, HSTRING& out) noexcept {
+    return WindowsCreateStringReference(lit.data(), static_cast<UINT32>(lit.size()), &hdr, &out);
 }
 
-template <typename TInterface, size_t N>
-inline HRESULT get_activation_factory(const wchar_t (&class_name)[N], wil::com_ptr<TInterface>& out) noexcept {
+template <typename TInterface>
+inline HRESULT get_activation_factory(std::wstring_view class_name, wil::com_ptr<TInterface>& out) noexcept {
     HSTRING_HEADER hdr{};
     HSTRING hstr = nullptr;
-    HRESULT hr = make_hstring_ref(class_name, hdr, hstr);
+    const HRESULT hr = make_hstring_ref(class_name, hdr, hstr);
     if (FAILED(hr)) return hr;
     return RoGetActivationFactory(hstr, IID_PPV_ARGS(&out));
 }
@@ -93,6 +92,8 @@ public:
     }
     FrameArrivedHandler(const FrameArrivedHandler&) = delete;
     FrameArrivedHandler& operator=(const FrameArrivedHandler&) = delete;
+    FrameArrivedHandler(FrameArrivedHandler&&) = delete;
+    FrameArrivedHandler& operator=(FrameArrivedHandler&&) = delete;
 
     [[nodiscard]] HANDLE event_handle() const noexcept { return event_.get(); }
 
@@ -175,12 +176,12 @@ struct WgcDevice {
         } else {
             owns_d3d = true;
             static constexpr std::array<D3D_FEATURE_LEVEL, 4> levels = {
-                D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_1, D3D_FEATURE_LEVEL_10_0};
+                D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_1, D3D_FEATURE_LEVEL_10_0,};
             const UINT base_flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
             HRESULT hr = E_FAIL;
             if (need_video) {
                 hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr,
-                                       base_flags | D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
+                                       base_flags | static_cast<UINT>(D3D11_CREATE_DEVICE_VIDEO_SUPPORT),
                                        levels.data(), static_cast<UINT>(levels.size()),
                                        D3D11_SDK_VERSION, &d3d, nullptr, &ctx);
             }
@@ -277,7 +278,7 @@ public:
             return false;
         }
 
-        handler_.attach(new FrameArrivedHandler());
+        handler_.attach(new (std::nothrow) FrameArrivedHandler());
         if (!handler_ || !handler_->event_handle()) {
             stop();
             return false;
@@ -406,8 +407,8 @@ inline void gpu_copy_clamped(ID3D11DeviceContext* ctx, ID3D11Texture2D* dst_tex,
     const UINT avail_h = (content_sz.Height > 0) ? std::min<UINT>(td.Height, static_cast<UINT>(content_sz.Height)) : td.Height;
     if (src_x >= avail_w || src_y >= avail_h) return;
 
-    const UINT cw = std::min<UINT>(desired_w, std::min<UINT>(avail_w - src_x, dst_w - dst_x));
-    const UINT ch = std::min<UINT>(desired_h, std::min<UINT>(avail_h - src_y, dst_h - dst_y));
+    const UINT cw = std::min<UINT>({desired_w, avail_w - src_x, dst_w - dst_x});
+    const UINT ch = std::min<UINT>({desired_h, avail_h - src_y, dst_h - dst_y});
     if (cw == 0 || ch == 0) return;
 
     const D3D11_BOX box{
@@ -455,8 +456,8 @@ inline void cpu_scale_bgra_bilinear(const uint8_t* src, UINT src_w, UINT src_h, 
 
             uint8_t* o = out_row + (static_cast<size_t>(x) * 4u);
             for (int c = 0; c < 3; ++c) {
-                const float top = (p00[c] * wx0) + (p10[c] * wx);
-                const float bot = (p01[c] * wx0) + (p11[c] * wx);
+                const float top = (static_cast<float>(p00[c]) * wx0) + (static_cast<float>(p10[c]) * wx);
+                const float bot = (static_cast<float>(p01[c]) * wx0) + (static_cast<float>(p11[c]) * wx);
                 const int val = static_cast<int>(std::lround((top * wy0) + (bot * wy)));
                 o[c] = static_cast<uint8_t>(std::clamp(val, 0, 255));
             }
@@ -597,7 +598,7 @@ inline std::optional<ui::Raster> wgc_capture_monitors_to_raster(
         (void)WaitForMultipleObjects(count, wait_handles.data(), FALSE, wait_ms);
     }
 
-    for (auto& s : slots) s->session.stop();
+    for (const auto& s : slots) s->session.stop();
     slots.clear();
     staging.reset();
     dev.reset();
@@ -641,7 +642,7 @@ public:
         src_desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
         src_desc.SampleDesc.Count = 1;
         src_desc.Usage = D3D11_USAGE_DEFAULT;
-        src_desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+        src_desc.BindFlags = static_cast<UINT>(D3D11_BIND_RENDER_TARGET) | static_cast<UINT>(D3D11_BIND_SHADER_RESOURCE);
         if (FAILED(dev_.d3d->CreateTexture2D(&src_desc, nullptr, &src_tex_)) || !src_tex_) {
             err = "Failed to create WGC composite source texture";
             return false;
@@ -691,7 +692,7 @@ public:
     }
 
     void shutdown() noexcept {
-        for (auto& st : streams_) st->session.stop();
+        for (const auto& st : streams_) st->session.stop();
         streams_.clear();
         nv12_pool_.clear();
         vp_nv12_.reset();
@@ -706,8 +707,7 @@ public:
         video_ctx_.reset();
         video_dev_.reset();
         src_tex_.reset();
-        cpu_buf_.clear();
-        cpu_buf_.shrink_to_fit();
+        std::vector<uint8_t>{}.swap(cpu_buf_);
         dev_.reset();
     }
 
@@ -716,14 +716,14 @@ public:
     [[nodiscard]] const void* cpu_bits() const noexcept { return cpu_buf_.data(); }
 
     /// Waits briefly for each intersecting monitor to deliver its initial desktop frame so frame 0 is never black.
-    void wait_initial_frames(const std::atomic<bool>& stop_requested, DWORD timeout_ms = 600u) noexcept {
+    void wait_initial_frames(const std::atomic<bool>& stop_requested, DWORD timeout_ms = 600u) {
         const ULONGLONG deadline = GetTickCount64() + timeout_ms;
         std::vector<HANDLE> handles;
         handles.reserve(streams_.size());
 
         while (!stop_requested.load(std::memory_order_acquire)) {
             size_t ready_count = 0;
-            for (auto& st : streams_) {
+            for (const auto& st : streams_) {
                 if (drain_stream(*st)) st->has_first_frame = true;
                 if (st->has_first_frame) ++ready_count;
             }
@@ -748,13 +748,13 @@ public:
 
     /// Drains any newly arrived frames from all monitor capture sessions onto `src_tex_` on the GPU.
     void update_from_monitors() noexcept {
-        for (auto& st : streams_) {
+        for (const auto& st : streams_) {
             (void)drain_stream(*st);
         }
     }
 
     /// Initializes the single-pass GPU BGRA -> NV12 + scaling VideoProcessor pipeline for zero-copy HW MF encoding.
-    bool init_nv12_pipeline() noexcept {
+    bool init_nv12_pipeline() {
         if (vp_nv12_) return true;
         if (!ensure_video_interfaces()) return false;
 
@@ -772,10 +772,10 @@ public:
     }
 
     /// Runs GPU BGRA -> NV12 (plus scaling if `scale_pct < 100`) and returns a free pooled `ID3D11Texture2D`.
-    [[nodiscard]] wil::com_ptr<ID3D11Texture2D> render_nv12_frame() noexcept {
+    [[nodiscard]] wil::com_ptr<ID3D11Texture2D> render_nv12_frame() {
         if (!vp_nv12_ || !video_ctx_ || !vp_nv12_in_view_) return nullptr;
 
-        Nv12Slot* slot = acquire_free_nv12_slot();
+        const Nv12Slot* slot = acquire_free_nv12_slot();
         if (!slot) return nullptr;
 
         D3D11_VIDEO_PROCESSOR_STREAM stream{};
@@ -999,9 +999,9 @@ private:
         UINT in_sup = 0;
         UINT out_sup = 0;
         if (FAILED(out_enum->CheckVideoProcessorFormat(DXGI_FORMAT_B8G8R8A8_UNORM, &in_sup)) ||
-            (in_sup & D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_INPUT) == 0 ||
+            (in_sup & static_cast<UINT>(D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_INPUT)) == 0u ||
             FAILED(out_enum->CheckVideoProcessorFormat(out_fmt, &out_sup)) ||
-            (out_sup & D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_OUTPUT) == 0) {
+            (out_sup & static_cast<UINT>(D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_OUTPUT)) == 0u) {
             out_enum.reset();
             return false;
         }
@@ -1051,7 +1051,7 @@ private:
         return true;
     }
 
-    bool add_nv12_pool_slot() noexcept {
+    bool add_nv12_pool_slot() {
         if (!vp_nv12_enum_ || !video_dev_) return false;
         D3D11_TEXTURE2D_DESC td{};
         td.Width = out_w_;
@@ -1076,7 +1076,7 @@ private:
         return true;
     }
 
-    Nv12Slot* acquire_free_nv12_slot() noexcept {
+    Nv12Slot* acquire_free_nv12_slot() {
         const size_t n = nv12_pool_.size();
         for (size_t attempt = 0; attempt < n; ++attempt) {
             const size_t idx = (nv12_cursor_ + attempt) % n;

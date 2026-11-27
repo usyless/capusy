@@ -297,7 +297,7 @@ inline WindowInfo query_window_info(HWND hwnd) {
         std::array<wchar_t, 512> exe_buf; // NOLINT(cppcoreguidelines-pro-type-member-init)
         auto len = static_cast<DWORD>(exe_buf.size());
         if (QueryFullProcessImageNameW(proc.get(), 0, exe_buf.data(), &len) && len > 0) {
-            std::wstring_view full{exe_buf.data(), len};
+            const std::wstring_view full{exe_buf.data(), len};
             const size_t slash = full.find_last_of(L"\\/");
             const std::wstring_view base = (slash != std::wstring_view::npos) ? full.substr(slash + 1) : full;
             if (!base.empty()) info.process_name = to_utf8(base);
@@ -315,7 +315,7 @@ inline WindowInfo foreground_window_info() {
 }
 
 inline fs::path default_captures_dir() {
-    std::wstring pics = known_folder(FOLDERID_Pictures);
+    const std::wstring pics = known_folder(FOLDERID_Pictures);
     fs::path d = pics.empty() ? (data_dir() / L"captures") : (fs::path{pics} / L"capusy");
     std::error_code ec;
     fs::create_directories(d, ec);

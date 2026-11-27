@@ -74,9 +74,10 @@ struct StereoFrame {
             return static_cast<float>(v) * (1.0f / 32768.0f);
         }
         case AudioSampleFormat::Pcm24: {
-            const int32_t raw = (static_cast<int32_t>(p[0]) << 8) |
-                                (static_cast<int32_t>(p[1]) << 16) |
-                                (static_cast<int32_t>(p[2]) << 24);
+            const uint32_t u = (static_cast<uint32_t>(p[0]) << 8u) |
+                               (static_cast<uint32_t>(p[1]) << 16u) |
+                               (static_cast<uint32_t>(p[2]) << 24u);
+            const auto raw = static_cast<int32_t>(u);
             return static_cast<float>(raw) * (1.0f / 2147483648.0f);
         }
         case AudioSampleFormat::Pcm32: {
@@ -114,19 +115,19 @@ struct StereoFrame {
     if (n == 4) {
         // Quad: FL, FR, BL, BR
         return {.l = (ch[0] + (ch[2] * kInvSqrt2)) * 0.707f,
-                .r = (ch[1] + (ch[3] * kInvSqrt2)) * 0.707f};
+                .r = (ch[1] + (ch[3] * kInvSqrt2)) * 0.707f,};
     }
     if (n == 6) {
         // 5.1: FL, FR, FC, LFE, BL, BR
         const float center = ch[2] * kInvSqrt2;
         return {.l = (ch[0] + center + (ch[4] * kInvSqrt2)) * 0.65f,
-                .r = (ch[1] + center + (ch[5] * kInvSqrt2)) * 0.65f};
+                .r = (ch[1] + center + (ch[5] * kInvSqrt2)) * 0.65f,};
     }
     if (n >= 8) {
         // 7.1: FL, FR, FC, LFE, BL, BR, SL, SR
         const float center = ch[2] * kInvSqrt2;
         return {.l = (ch[0] + center + ((ch[4] + ch[6]) * kInvSqrt2 * 0.7f)) * 0.60f,
-                .r = (ch[1] + center + ((ch[5] + ch[7]) * kInvSqrt2 * 0.7f)) * 0.60f};
+                .r = (ch[1] + center + ((ch[5] + ch[7]) * kInvSqrt2 * 0.7f)) * 0.60f,};
     }
     return {.l = ch[0], .r = ch[1]};
 }
@@ -209,7 +210,7 @@ private:
         } else if (read_idx_ >= 16384u && read_idx_ * 2u >= buf_.size()) {
             const size_t rem = buf_.size() - read_idx_;
             std::memmove(buf_.data(), buf_.data() + read_idx_, rem * sizeof(float));
-            buf_.resize(rem);
+            while (buf_.size() > rem) buf_.pop_back();
             read_idx_ = 0;
         }
     }
@@ -248,14 +249,14 @@ public:
 
         const auto sample_at = [&](int64_t idx) noexcept -> StereoFrame {
             if (idx < 0) return prev_;
-            if (static_cast<size_t>(idx) >= n) return in[n - 1];
+            if (std::cmp_greater_equal(idx, n)) return in[n - 1];
             return in[static_cast<size_t>(idx)];
         };
 
-        const double limit = static_cast<double>(n - 1);
+        const auto limit = static_cast<double>(n - 1);
         while (phase_ <= limit) {
             const auto i0 = static_cast<int64_t>(std::floor(phase_));
-            const float frac = static_cast<float>(phase_ - static_cast<double>(i0));
+            const auto frac = static_cast<float>(phase_ - static_cast<double>(i0));
             const StereoFrame a = sample_at(i0);
             const StereoFrame b = sample_at(i0 + 1);
             out.push_frame(a.l + ((b.l - a.l) * frac), a.r + ((b.r - a.r) * frac));
@@ -271,7 +272,7 @@ public:
             out.push_silence(src_frames);
             return;
         }
-        const double limit = static_cast<double>(src_frames - 1);
+        const auto limit = static_cast<double>(src_frames - 1);
         size_t emitted = 0;
         while (phase_ <= limit) {
             ++emitted;
@@ -348,18 +349,18 @@ namespace detail {
 
 // PKEY_Device_FriendlyName = {a45c254e-df1c-4efd-8020-67d146a850e0}, 14
 inline constexpr PROPERTYKEY kPkeyDeviceFriendlyName = {
-    {0xa45c254e, 0xdf1c, 0x4efd, {0x80, 0x20, 0x67, 0xd1, 0x46, 0xa8, 0x50, 0xe0}},
-    14,
+    .fmtid = {.Data1 = 0xa45c254e, .Data2 = 0xdf1c, .Data3 = 0x4efd, .Data4 = {0x80, 0x20, 0x67, 0xd1, 0x46, 0xa8, 0x50, 0xe0}},
+    .pid = 14,
 };
 
 // KSDATAFORMAT_SUBTYPE_PCM = {00000001-0000-0010-8000-00aa00389b71}
 inline constexpr GUID kSubformatPcm = {
-    0x00000001, 0x0000, 0x0010, {0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71},
+    .Data1 = 0x00000001, .Data2 = 0x0000, .Data3 = 0x0010, .Data4 = {0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71},
 };
 
 // KSDATAFORMAT_SUBTYPE_IEEE_FLOAT = {00000003-0000-0010-8000-00aa00389b71}
 inline constexpr GUID kSubformatIeeeFloat = {
-    0x00000003, 0x0000, 0x0010, {0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71},
+    .Data1 = 0x00000003, .Data2 = 0x0000, .Data3 = 0x0010, .Data4 = {0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71},
 };
 
 [[nodiscard]] inline AudioSampleFormat detect_wave_format(const WAVEFORMATEX* wf) noexcept {
@@ -588,7 +589,7 @@ public:
 
             if (frames > 0) {
                 received = true;
-                if ((flags & AUDCLNT_BUFFERFLAGS_SILENT) != 0 || data == nullptr) {
+                if ((flags & static_cast<DWORD>(AUDCLNT_BUFFERFLAGS_SILENT)) != 0u || data == nullptr) {
                     resampler_.push_silence(frames, out_fifo);
                 } else {
                     scratch_.resize(frames);

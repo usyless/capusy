@@ -43,7 +43,7 @@ struct Shared {
     UpdateState update_state;
     bool update_checking = false;
 
-    [[nodiscard]] bool has_update_available() const noexcept {
+    [[nodiscard]] bool has_update_available() const {
         return !update_state.latest_version.empty() && is_newer_version(update_state.latest_version, to_utf8(APP_VERSION));
     }
 
@@ -70,7 +70,7 @@ struct Shared {
         if (!PostMessageW(hwnd, WM_APP_CALL, 0, reinterpret_cast<LPARAM>(raw))) delete raw;
     }
 
-    void save() {
+    void save() const {
         (void)save_settings(settings);
     }
 };
@@ -165,7 +165,7 @@ inline bool reveal_in_explorer(std::span<const std::wstring> paths) {
 
     std::vector<PCUITEMID_CHILD> children;
     children.reserve(pidls.size());
-    for (auto* id : pidls) {
+    for (const auto* id : pidls) {
         PIDLIST_ABSOLUTE pp = ILCloneFull(id);
         if (!pp) continue;
         ILRemoveLastID(pp);
@@ -224,7 +224,7 @@ inline std::optional<std::wstring> browse_folder_dialog(HWND owner, const wchar_
     }
     DWORD opts = 0;
     if (SUCCEEDED(dlg->GetOptions(&opts))) {
-        dlg->SetOptions(opts | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST);
+        dlg->SetOptions(opts | static_cast<DWORD>(FOS_PICKFOLDERS) | static_cast<DWORD>(FOS_FORCEFILESYSTEM) | static_cast<DWORD>(FOS_PATHMUSTEXIST));
     }
     if (title) dlg->SetTitle(title);
     if (!initial.empty()) {
@@ -251,7 +251,7 @@ inline std::optional<std::wstring> browse_file_dialog(HWND owner, const wchar_t*
     }
     DWORD opts = 0;
     if (SUCCEEDED(dlg->GetOptions(&opts))) {
-        dlg->SetOptions(opts | FOS_FORCEFILESYSTEM | FOS_FILEMUSTEXIST | FOS_PATHMUSTEXIST);
+        dlg->SetOptions(opts | static_cast<DWORD>(FOS_FORCEFILESYSTEM) | static_cast<DWORD>(FOS_FILEMUSTEXIST) | static_cast<DWORD>(FOS_PATHMUSTEXIST));
     }
     if (title) dlg->SetTitle(title);
     if (!filters.empty()) {
@@ -502,9 +502,9 @@ inline bool copy_captures_to_clipboard(std::span<const std::wstring> paths, bool
             decoded = decode_image(paths[0], 0, false);
             if (decoded) raster = &*decoded;
         }
-        populate_clipboard_payload(payload, raster, &paths[0]);
+        populate_clipboard_payload(payload, raster, paths.data());
     }
-    auto obj = clipboard_data_object(payload);
+    const auto obj = clipboard_data_object(payload);
     if (!obj) return false;
     return SUCCEEDED(OleSetClipboard(obj.get()));
 }

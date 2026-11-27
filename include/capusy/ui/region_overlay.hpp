@@ -89,8 +89,11 @@ struct Annotation {
     }
     const float w = std::max(1.0f, a.thickness);
     float pad = (w * 0.5f) + 8.0f;
-    if (a.tool == DrawTool::Highlighter) pad = (w * 1.8f) + 8.0f;
-    else if (a.tool == DrawTool::Arrow) pad = std::max(14.0f, w * 4.0f) + 8.0f;
+    if (a.tool == DrawTool::Highlighter) {
+        pad = (w * 1.8f) + 8.0f;
+    } else if (a.tool == DrawTool::Arrow) {
+        pad = std::max(14.0f, w * 4.0f) + 8.0f;
+    }
     return RECT{
         .left = static_cast<LONG>(std::floor(min_x - pad)),
         .top = static_cast<LONG>(std::floor(min_y - pad)),
@@ -316,9 +319,13 @@ public:
 
         // 2. Create one native-DPI overlay HWND per physical monitor!
         HWND primary_or_cursor_hwnd = nullptr;
-        monitors_.reserve(capture_->monitors.size());
-        for (size_t i = 0; i < capture_->monitors.size(); ++i) {
-            const MonitorInfo& mi = capture_->monitors[i];
+        if (!capture_) {
+            cancel();
+            return false;
+        }
+        const auto& cap_monitors = capture_->monitors;
+        monitors_.reserve(cap_monitors.size());
+        for (const MonitorInfo& mi : cap_monitors) {
             const int mw = mi.rect.right - mi.rect.left;
             const int mh = mi.rect.bottom - mi.rect.top;
             if (mw <= 0 || mh <= 0) continue;
@@ -355,7 +362,7 @@ public:
 
         // Render initial frozen frame before revealing so there is zero flash!
         render_all();
-        for (auto& m : monitors_) {
+        for (const auto& m : monitors_) {
             ShowWindow(m->hwnd, SW_SHOWNA);
             SetWindowPos(m->hwnd, HWND_TOPMOST, m->info.rect.left, m->info.rect.top,
                          m->info.rect.right - m->info.rect.left, m->info.rect.bottom - m->info.rect.top,
@@ -379,7 +386,7 @@ public:
                 }
             }
         }
-        for (auto& m : monitors_) {
+        for (const auto& m : monitors_) {
             if (m->hwnd) {
                 KillTimer(m->hwnd, TIMER_TOOLTIP);
                 KillTimer(m->hwnd, TIMER_TOOLTIP_ANIM);
@@ -393,15 +400,12 @@ public:
         }
         tooltip_.clear(nullptr, 0, false);
         tooltip_hwnd_ = nullptr;
-        monitors_.clear();
-        monitors_.shrink_to_fit();
+        decltype(monitors_){}.swap(monitors_);
         capture_.reset();
         snaps_ = {};
         foreground_info_ = {};
-        annotations_.clear();
-        annotations_.shrink_to_fit();
-        redo_stack_.clear();
-        redo_stack_.shrink_to_fit();
+        decltype(annotations_){}.swap(annotations_);
+        decltype(redo_stack_){}.swap(redo_stack_);
         active_annotation_.reset();
         active_ann_prev_vrect_.reset();
         round_stroke_.reset();
@@ -414,12 +418,17 @@ public:
         has_selection_ = false;
         drag_kind_ = DragKind::None;
         open_dropdown_ = AudioDropdown::None;
-        desktop_devices_.clear();
-        desktop_devices_.shrink_to_fit();
-        mic_devices_.clear();
-        mic_devices_.shrink_to_fit();
-        if (was_active && on_closed) on_closed();
-        else if (sh_.on_visibility_changed) sh_.on_visibility_changed();
+        decltype(desktop_devices_){}.swap(desktop_devices_);
+        decltype(mic_devices_){}.swap(mic_devices_);
+        try {
+            if (was_active && on_closed) {
+                on_closed();
+            } else if (sh_.on_visibility_changed) {
+                sh_.on_visibility_changed();
+            }
+        } catch (...) {
+            OutputDebugStringW(L"capusy: exception in RegionOverlay::cancel callback\n");
+        }
     }
 
     void reset_gpu() noexcept {
@@ -437,7 +446,7 @@ private:
     static constexpr UINT_PTR TIMER_TOOLTIP = 1;
     static constexpr UINT_PTR TIMER_TOOLTIP_ANIM = 2;
 
-    enum HitId : int {
+    enum HitId : uint8_t {
         IdNone = 0,
         IdTool,
         IdColor,
@@ -508,7 +517,7 @@ private:
 
     void ensure_stroke_style() noexcept {
         if (round_stroke_ || !sh_.gfx.d2d_factory()) return;
-        D2D1_STROKE_STYLE_PROPERTIES1 props = D2D1::StrokeStyleProperties1(
+        const D2D1_STROKE_STYLE_PROPERTIES1 props = D2D1::StrokeStyleProperties1(
             D2D1_CAP_STYLE_ROUND, D2D1_CAP_STYLE_ROUND, D2D1_CAP_STYLE_ROUND,
             D2D1_LINE_JOIN_ROUND, 10.0f, D2D1_DASH_STYLE_SOLID, 0.0f,
             D2D1_STROKE_TRANSFORM_TYPE_NORMAL);
@@ -595,7 +604,7 @@ private:
         return out;
     }
 
-    void queue_hit_dirty(const MonitorWindow& mw, int id, int idx, std::vector<D2D1_RECT_F>& out) const {
+    static void queue_hit_dirty(const MonitorWindow& mw, int id, int idx, std::vector<D2D1_RECT_F>& out) {
         if (id == IdNone) return;
         for (const Hit& h : mw.hits) {
             if (h.id == id && h.index == idx) {
@@ -605,7 +614,7 @@ private:
     }
 
     void render_all() {
-        for (auto& m : monitors_) {
+        for (const auto& m : monitors_) {
             m->full_dirty = true;
             m->pending_dirty.clear();
             render_monitor(*m, true);
@@ -613,7 +622,7 @@ private:
     }
 
     void render_loupe_monitors() {
-        for (auto& m : monitors_) {
+        for (const auto& m : monitors_) {
             const LoupeRects lr = compute_loupe_rects(*m);
             const bool had_any = m->last_reticle_dirty.has_value() || m->last_loupe_dirty.has_value() || m->last_hint_dirty.has_value();
             const bool has_any = lr.reticle.has_value() || lr.card.has_value() || lr.hint.has_value();
@@ -638,12 +647,12 @@ private:
     void render_vrect_dirty(const RECT& vrect) {
         const RECT clipped = rect_intersect(vrect, selection_);
         if (!rect_valid(clipped)) return;
-        for (auto& m : monitors_) {
+        for (const auto& m : monitors_) {
             const RECT mr = rect_intersect(clipped, m->info.rect);
             if (!rect_valid(mr)) continue;
             const float inv_s = 1.0f / m->target.scale();
-            const float mon_x = static_cast<float>(m->info.rect.left);
-            const float mon_y = static_cast<float>(m->info.rect.top);
+            const auto mon_x = static_cast<float>(m->info.rect.left);
+            const auto mon_y = static_cast<float>(m->info.rect.top);
             m->pending_dirty.push_back(D2D1::RectF(
                 (static_cast<float>(mr.left) - mon_x) * inv_s,
                 (static_cast<float>(mr.top) - mon_y) * inv_s,
@@ -698,8 +707,8 @@ private:
         const D2D1_SIZE_F sz = mw.target.size();
         const float s = mw.target.scale();
         const float inv_s = 1.0f / s;
-        const float mon_x = static_cast<float>(mw.info.rect.left);
-        const float mon_y = static_cast<float>(mw.info.rect.top);
+        const auto mon_x = static_cast<float>(mw.info.rect.left);
+        const auto mon_y = static_cast<float>(mw.info.rect.top);
 
         // 1. Frozen desktop background (1:1 crisp pixels; sub-rect blit on partial dirty frames)
         if (mw.frozen_bmp) {
@@ -769,7 +778,7 @@ private:
 
             const int mw_px = mw.info.rect.right - mw.info.rect.left;
             const int mh_px = mw.info.rect.bottom - mw.info.rect.top;
-            const uint32_t scale_pct = static_cast<uint32_t>(std::lround((static_cast<double>(mw.info.dpi) * 100.0) / 96.0));
+            const auto scale_pct = static_cast<uint32_t>(std::lround((static_cast<double>(mw.info.dpi) * 100.0) / 96.0));
             FixedWString<64> res;
             res.assign(to_fixed_wstr<16>(mw_px));
             res.append(L" × ");
@@ -826,22 +835,20 @@ private:
             }
 
             // 3. Vector annotations clipped inside the selection
-            if (has_selection_ && mode_ == OverlayMode::Screenshot && cl.right > cl.left && cl.bottom > cl.top) {
-                if (!cv.has_dirty_clip() || cv.intersects_clip(cl, 2.0f)) {
-                    cv.push_clip(cl);
-                    ID2D1SolidColorBrush* br = mw.target.solid_brush();
-                    ID2D1Factory* fac = sh_.gfx.d2d_factory();
-                    for (const Annotation& a : annotations_) {
-                        if (cv.has_dirty_clip() && !cv.intersects_clip(annotation_bounds_dip(a, mon_x, mon_y, inv_s), 2.0f)) continue;
-                        render_annotation(cv.dc(), fac, br, round_stroke_.get(), a, mon_x, mon_y, s);
-                    }
-                    if (active_annotation_) {
-                        if (!cv.has_dirty_clip() || cv.intersects_clip(annotation_bounds_dip(*active_annotation_, mon_x, mon_y, inv_s), 2.0f)) {
-                            render_annotation(cv.dc(), fac, br, round_stroke_.get(), *active_annotation_, mon_x, mon_y, s);
-                        }
-                    }
-                    cv.pop_clip();
+            if (has_selection_ && mode_ == OverlayMode::Screenshot && cl.right > cl.left && cl.bottom > cl.top &&
+                (!cv.has_dirty_clip() || cv.intersects_clip(cl, 2.0f))) {
+                cv.push_clip(cl);
+                ID2D1SolidColorBrush* br = mw.target.solid_brush();
+                ID2D1Factory* fac = sh_.gfx.d2d_factory();
+                for (const Annotation& a : annotations_) {
+                    if (cv.has_dirty_clip() && !cv.intersects_clip(annotation_bounds_dip(a, mon_x, mon_y, inv_s), 2.0f)) continue;
+                    render_annotation(cv.dc(), fac, br, round_stroke_.get(), a, mon_x, mon_y, s);
                 }
+                if (active_annotation_ &&
+                    (!cv.has_dirty_clip() || cv.intersects_clip(annotation_bounds_dip(*active_annotation_, mon_x, mon_y, inv_s), 2.0f))) {
+                    render_annotation(cv.dc(), fac, br, round_stroke_.get(), *active_annotation_, mon_x, mon_y, s);
+                }
+                cv.pop_clip();
             }
 
             // 4. Crisp border & resize handles
@@ -1068,9 +1075,13 @@ private:
                 subtitle = resolve_audio_device_label(sh_.settings.record_mic_device_id, mic_devices_, L"Default Mic");
                 return true;
             case IdRecFmtQuick:
-                if (idx == 0) title = L"Record as MP4 (H.264/HEVC + AAC)";
-                else if (idx == 1) title = L"Record as WMV (WMV9 + WMA)";
-                else title = L"Record as animated GIF (no audio)";
+                if (idx == 0) {
+                    title = L"Record as MP4 (H.264/HEVC + AAC)";
+                } else if (idx == 1) {
+                    title = L"Record as WMV (WMV9 + WMA)";
+                } else {
+                    title = L"Record as animated GIF (no audio)";
+                }
                 return true;
             default:
                 return false;
@@ -1093,13 +1104,13 @@ private:
         return was_vis;
     }
 
-    void draw_resize_handles(Canvas& cv, D2D1_RECT_F sr, D2D1_COLOR_F accent) const noexcept {
+    static void draw_resize_handles(Canvas& cv, D2D1_RECT_F sr, D2D1_COLOR_F accent) noexcept {
         const float mx = (sr.left + sr.right) * 0.5f;
         const float my = (sr.top + sr.bottom) * 0.5f;
         const std::array<D2D1_POINT_2F, 8> pts = {{
-            {sr.left, sr.top}, {mx, sr.top}, {sr.right, sr.top}, {sr.right, my},
-            {sr.right, sr.bottom}, {mx, sr.bottom}, {sr.left, sr.bottom}, {sr.left, my},
-        }};
+            {.x = sr.left, .y = sr.top}, {.x = mx, .y = sr.top}, {.x = sr.right, .y = sr.top}, {.x = sr.right, .y = my},
+            {.x = sr.right, .y = sr.bottom}, {.x = mx, .y = sr.bottom}, {.x = sr.left, .y = sr.bottom}, {.x = sr.left, .y = my},
+        },};
         for (const D2D1_POINT_2F p : pts) {
             cv.fill_circle(p, 4.5f, cv.theme().surface_lowest);
             cv.stroke_circle(p, 4.5f, accent, 1.8f);
@@ -1241,7 +1252,7 @@ private:
             {.tool = DrawTool::Ellipse, .icon = 0, .label = L"Oval"},
             {.tool = DrawTool::Line, .icon = 0, .label = L"Line"},
             {.tool = DrawTool::Arrow, .icon = 0, .label = L"Arrow"},
-        }};
+        },};
 
         const bool show_style_row = (tool_ != DrawTool::Select);
         const float cap_w = button_width(cv, L"Capture", true, 96.0f);
@@ -1268,7 +1279,7 @@ private:
             const auto& tb = tools[i];
             const float bw = tb.label[0] ? 48.0f : 34.0f;
             const bool active = (tool_ == tb.tool);
-            const float ha = (hover_id_ == IdTool && hover_idx_ == static_cast<int>(i)) ? 1.0f : 0.0f;
+            const float ha = (hover_id_ == IdTool && std::cmp_equal(hover_idx_, i)) ? 1.0f : 0.0f;
             draw_button(cv, ha, rect(x, y1, bw, 32.0f), tb.icon, tb.label, IdTool, static_cast<int>(i), active ? 1 : 3);
             x += bw + 4.0f;
         }
@@ -1332,7 +1343,7 @@ private:
                 const D2D1_RECT_F tr = rect(cx, y2 + 2.0f, 30.0f, 28.0f);
                 const bool sel = (thick_idx_ == i);
                 if (sel) cv.fill_round(tr, 8.0f, cv.theme().primary_container);
-                const float r = std::clamp(THICKNESSES[i] * 0.55f + 1.5f, 2.5f, 8.5f);
+                const float r = std::clamp((THICKNESSES[i] * 0.55f) + 1.5f, 2.5f, 8.5f);
                 cv.fill_circle({.x = cx + 15.0f, .y = y2 + 16.0f}, r, sel ? cv.theme().on_primary_container : cv.theme().on_surface);
                 cv.hit(tr, IdThick, static_cast<int>(i));
                 cx += 34.0f;
@@ -1383,28 +1394,28 @@ private:
             D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_IGNORE), 96.0f, 96.0f);
 
         if (!picker_hue_bmp_) {
-            constexpr uint32_t hw = 256;
+            constexpr size_t hw = 256;
             std::array<uint8_t, hw * 4u> buf; // NOLINT(cppcoreguidelines-pro-type-member-init)
-            for (uint32_t x = 0; x < hw; ++x) {
+            for (size_t x = 0; x < hw; ++x) {
                 const Rgb8 c = hsv_to_rgb((static_cast<float>(x) / static_cast<float>(hw - 1)) * 360.0f, 1.0f, 1.0f);
-                buf[x * 4u + 0u] = c.b;
-                buf[x * 4u + 1u] = c.g;
-                buf[x * 4u + 2u] = c.r;
-                buf[x * 4u + 3u] = 255;
+                buf[(x * 4u) + 0u] = c.b;
+                buf[(x * 4u) + 1u] = c.g;
+                buf[(x * 4u) + 2u] = c.r;
+                buf[(x * 4u) + 3u] = 255;
             }
-            (void)dc->CreateBitmap(D2D1::SizeU(hw, 1), buf.data(), hw * 4u, &props, &picker_hue_bmp_);
+            (void)dc->CreateBitmap(D2D1::SizeU(static_cast<UINT32>(hw), 1), buf.data(), static_cast<UINT32>(hw * 4u), &props, &picker_hue_bmp_);
         }
 
         if (!picker_sv_bmp_ || std::abs(picker_sv_bmp_h_ - picker_h_) > 0.05f) {
-            constexpr uint32_t sw = 64;
-            constexpr uint32_t sh = 64;
+            constexpr size_t sw = 64;
+            constexpr size_t sh = 64;
             std::array<uint8_t, sw * sh * 4u> buf; // NOLINT(cppcoreguidelines-pro-type-member-init)
-            for (uint32_t y = 0; y < sh; ++y) {
+            for (size_t y = 0; y < sh; ++y) {
                 const float v = 1.0f - (static_cast<float>(y) / static_cast<float>(sh - 1));
-                for (uint32_t x = 0; x < sw; ++x) {
+                for (size_t x = 0; x < sw; ++x) {
                     const float s = static_cast<float>(x) / static_cast<float>(sw - 1);
                     const Rgb8 c = hsv_to_rgb(picker_h_, s, v);
-                    const size_t idx = (static_cast<size_t>(y) * sw + x) * 4u;
+                    const size_t idx = ((y * sw) + x) * 4u;
                     buf[idx + 0u] = c.b;
                     buf[idx + 1u] = c.g;
                     buf[idx + 2u] = c.r;
@@ -1412,7 +1423,7 @@ private:
                 }
             }
             picker_sv_bmp_.reset();
-            if (SUCCEEDED(dc->CreateBitmap(D2D1::SizeU(sw, sh), buf.data(), sw * 4u, &props, &picker_sv_bmp_))) {
+            if (SUCCEEDED(dc->CreateBitmap(D2D1::SizeU(static_cast<UINT32>(sw), static_cast<UINT32>(sh)), buf.data(), static_cast<UINT32>(sw * 4u), &props, &picker_sv_bmp_))) {
                 picker_sv_bmp_h_ = picker_h_;
             }
         }
@@ -1619,8 +1630,8 @@ private:
         dc->SetDpi(96.0f, 96.0f);
         dc->BeginDraw();
         dc->DrawBitmap(src_bmp.get(), D2D1::RectF(0.0f, 0.0f, static_cast<float>(base->w), static_cast<float>(base->h)));
-        const float ox = static_cast<float>(selection_.left);
-        const float oy = static_cast<float>(selection_.top);
+        const auto ox = static_cast<float>(selection_.left);
+        const auto oy = static_cast<float>(selection_.top);
         ID2D1Factory* fac = sh_.gfx.d2d_factory();
         for (const Annotation& a : annotations_) {
             render_annotation(dc.get(), fac, brush.get(), round_stroke_.get(), a, ox, oy, 1.0f);
@@ -1655,13 +1666,13 @@ private:
         WindowInfo win_info = window_info_for_rect(snaps_, selection_, foreground_info_);
         if (mode_ == OverlayMode::RecordRegion) {
             const RECT r = selection_;
-            auto cb = on_record_region_selected;
+            const auto cb = on_record_region_selected;
             cancel();
             if (cb) cb(r, std::move(win_info));
             return;
         }
         auto raster = compose_final_raster();
-        auto cb = on_screenshot_captured;
+        const auto cb = on_screenshot_captured;
         cancel();
         if (raster && cb) cb(std::move(*raster), std::move(win_info));
     }
@@ -1670,14 +1681,14 @@ private:
     // Input handling (global virtual-screen coordinates)
     // ------------------------------------------------------------------------------------------
 
-    [[nodiscard]] POINT to_virtual_px(const MonitorWindow& mw, LPARAM lp) const noexcept {
+    [[nodiscard]] static POINT to_virtual_px(const MonitorWindow& mw, LPARAM lp) noexcept {
         return {
             .x = mw.info.rect.left + GET_X_LPARAM(lp),
             .y = mw.info.rect.top + GET_Y_LPARAM(lp),
         };
     }
 
-    [[nodiscard]] D2D1_POINT_2F to_local_dip(const MonitorWindow& mw, LPARAM lp) const noexcept {
+    [[nodiscard]] static D2D1_POINT_2F to_local_dip(const MonitorWindow& mw, LPARAM lp) noexcept {
         const float inv_s = 1.0f / mw.target.scale();
         return {.x = static_cast<float>(GET_X_LPARAM(lp)) * inv_s, .y = static_cast<float>(GET_Y_LPARAM(lp)) * inv_s};
     }
@@ -1706,29 +1717,31 @@ private:
         HCURSOR cur = cursor_cross_;
         if (mode_ == OverlayMode::RecordMonitor) {
             cur = cursor_hand_;
-        } else if (mode_ == OverlayMode::ColorPicker) {
-            cur = cursor_cross_;
-        } else if (h) {
-            if (h->id == IdPickerSV) cur = cursor_cross_;
-            else if (h->id == IdPickerPanel) cur = cursor_arrow_;
-            else cur = cursor_hand_;
-        } else if (annotation_dropper_active_) {
-            cur = cursor_cross_;
-        } else if (has_selection_) {
-            if (tool_ != DrawTool::Select && rect_contains_pt(selection_, vpt)) {
-                cur = cursor_cross_;
-            } else if (tool_ == DrawTool::Select) {
-                switch (hit_selection_handle(vpt, mw.target.scale())) {
-                    case DragKind::ResizeNW:
-                    case DragKind::ResizeSE: cur = cursor_nwse_; break;
-                    case DragKind::ResizeNE:
-                    case DragKind::ResizeSW: cur = cursor_nesw_; break;
-                    case DragKind::ResizeN:
-                    case DragKind::ResizeS: cur = cursor_ns_; break;
-                    case DragKind::ResizeW:
-                    case DragKind::ResizeE: cur = cursor_we_; break;
-                    case DragKind::Moving: cur = cursor_move_; break;
-                    default: cur = cursor_cross_; break;
+        } else if (mode_ != OverlayMode::ColorPicker) {
+            if (h) {
+                if (h->id == IdPickerSV) {
+                    cur = cursor_cross_;
+                } else if (h->id == IdPickerPanel) {
+                    cur = cursor_arrow_;
+                } else {
+                    cur = cursor_hand_;
+                }
+            } else if (!annotation_dropper_active_ && has_selection_) {
+                if (tool_ != DrawTool::Select && rect_contains_pt(selection_, vpt)) {
+                    cur = cursor_cross_;
+                } else if (tool_ == DrawTool::Select) {
+                    switch (hit_selection_handle(vpt, mw.target.scale())) {
+                        case DragKind::ResizeNW:
+                        case DragKind::ResizeSE: cur = cursor_nwse_; break;
+                        case DragKind::ResizeNE:
+                        case DragKind::ResizeSW: cur = cursor_nesw_; break;
+                        case DragKind::ResizeN:
+                        case DragKind::ResizeS: cur = cursor_ns_; break;
+                        case DragKind::ResizeW:
+                        case DragKind::ResizeE: cur = cursor_we_; break;
+                        case DragKind::Moving: cur = cursor_move_; break;
+                        default: cur = cursor_cross_; break;
+                    }
                 }
             }
         }
@@ -1812,14 +1825,20 @@ private:
                 break;
             case IdRecDropdownItem:
                 if (open_dropdown_ == AudioDropdown::Desktop) {
-                    if (idx < 0) sh_.settings.record_desktop_device_id.clear();
-                    else if (std::cmp_less(idx, desktop_devices_.size())) sh_.settings.record_desktop_device_id = desktop_devices_[static_cast<size_t>(idx)].id;
+                    if (idx < 0) {
+                        sh_.settings.record_desktop_device_id.clear();
+                    } else if (std::cmp_less(idx, desktop_devices_.size())) {
+                        sh_.settings.record_desktop_device_id = desktop_devices_[static_cast<size_t>(idx)].id;
+                    }
                     sh_.settings.record_desktop_audio = true;
                     sh_.save();
                     if (sh_.on_redraw_all) sh_.on_redraw_all();
                 } else if (open_dropdown_ == AudioDropdown::Mic) {
-                    if (idx < 0) sh_.settings.record_mic_device_id.clear();
-                    else if (std::cmp_less(idx, mic_devices_.size())) sh_.settings.record_mic_device_id = mic_devices_[static_cast<size_t>(idx)].id;
+                    if (idx < 0) {
+                        sh_.settings.record_mic_device_id.clear();
+                    } else if (std::cmp_less(idx, mic_devices_.size())) {
+                        sh_.settings.record_mic_device_id = mic_devices_[static_cast<size_t>(idx)].id;
+                    }
                     sh_.settings.record_mic_audio = true;
                     sh_.save();
                     if (sh_.on_redraw_all) sh_.on_redraw_all();
@@ -1828,9 +1847,13 @@ private:
                 break;
             case IdRecFmtQuick:
                 open_dropdown_ = AudioDropdown::None;
-                if (idx == 0) sh_.settings.record_format = "mp4";
-                else if (idx == 1) sh_.settings.record_format = "wmv";
-                else if (idx == 2) sh_.settings.record_format = "gif";
+                if (idx == 0) {
+                    sh_.settings.record_format = "mp4";
+                } else if (idx == 1) {
+                    sh_.settings.record_format = "wmv";
+                } else if (idx == 2) {
+                    sh_.settings.record_format = "gif";
+                }
                 sh_.save();
                 if (sh_.on_redraw_all) sh_.on_redraw_all();
                 break;
@@ -1852,14 +1875,14 @@ private:
         if (mon_idx >= monitors_.size()) return;
         const RECT r = monitors_[mon_idx]->info.rect;
         WindowInfo win_info = foreground_info_;
-        auto cb = on_record_monitor_selected;
+        const auto cb = on_record_monitor_selected;
         cancel();
         if (cb) cb(r, std::move(win_info));
     }
 
     void confirm_screen_color(POINT vpt) {
         const Rgb8 rgb = sample_screen_rgb(vpt);
-        auto cb = on_color_picked;
+        const auto cb = on_color_picked;
         cancel();
         if (cb) cb(rgb);
     }
@@ -2006,7 +2029,7 @@ private:
             MonitorWindow* prev_tip_mw = nullptr;
             if (hover_changed || (mon_changed && nid != IdNone)) {
                 if (mon_changed && tooltip_hwnd_) {
-                    for (auto& m : monitors_) {
+                    for (const auto& m : monitors_) {
                         if (m->hwnd == tooltip_hwnd_) { prev_tip_mw = m.get(); break; }
                     }
                     KillTimer(tooltip_hwnd_, TIMER_TOOLTIP);
@@ -2077,8 +2100,11 @@ private:
                     });
                 }
             } else {
-                if (active_annotation_->points.size() < 2) active_annotation_->points.push_back(pt);
-                else active_annotation_->points.back() = pt;
+                if (active_annotation_->points.size() < 2) {
+                    active_annotation_->points.push_back(pt);
+                } else {
+                    active_annotation_->points.back() = pt;
+                }
                 const RECT cur_b = annotation_bounds_vpx(*active_annotation_);
                 RECT dirty = cur_b;
                 if (active_ann_prev_vrect_) {
@@ -2223,12 +2249,12 @@ private:
                 return;
             }
             if (vk >= '1' && vk <= '9') {
-                const size_t idx = static_cast<size_t>(vk - '1');
+                const auto idx = static_cast<size_t>(vk - '1');
                 if (idx < monitors_.size()) confirm_record_monitor(idx);
                 return;
             }
             if (vk >= VK_NUMPAD1 && vk <= VK_NUMPAD9) {
-                const size_t idx = static_cast<size_t>(vk - VK_NUMPAD1);
+                const auto idx = static_cast<size_t>(vk - VK_NUMPAD1);
                 if (idx < monitors_.size()) confirm_record_monitor(idx);
                 return;
             }
@@ -2372,7 +2398,9 @@ private:
                 dismiss_tooltip();
                 if (mode_ == OverlayMode::ColorPicker || mode_ == OverlayMode::RecordMonitor) {
                     cancel();
-                } else if (color_picker_open_) {
+                    return 0;
+                }
+                if (color_picker_open_) {
                     color_picker_open_ = false;
                     render_all();
                 } else if (annotation_dropper_active_) {
@@ -2395,8 +2423,11 @@ private:
                 const bool tip_vis = dismiss_tooltip();
                 if (has_selection_ && tool_ != DrawTool::Select) {
                     const int delta = GET_WHEEL_DELTA_WPARAM(wp);
-                    if (delta > 0 && thick_idx_ + 1 < THICKNESSES.size()) ++thick_idx_;
-                    else if (delta < 0 && thick_idx_ > 0) --thick_idx_;
+                    if (delta > 0 && thick_idx_ + 1 < THICKNESSES.size()) {
+                        ++thick_idx_;
+                    } else if (delta < 0 && thick_idx_ > 0) {
+                        --thick_idx_;
+                    }
                     render_all();
                 } else if (tip_vis) {
                     render_monitor(mw);

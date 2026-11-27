@@ -30,8 +30,11 @@ inline bool set_clipboard_text(HWND hwnd, std::wstring_view s) noexcept {
             std::memcpy(p, s.data(), s.size() * sizeof(wchar_t));
             p[s.size()] = 0;
             GlobalUnlock(h);
-            if (SetClipboardData(CF_UNICODETEXT, h)) ok = true;
-            else GlobalFree(h);
+            if (SetClipboardData(CF_UNICODETEXT, h)) {
+                ok = true;
+            } else {
+                GlobalFree(h);
+            }
         } else {
             GlobalFree(h);
         }
@@ -55,10 +58,8 @@ public:
         cached_layout_.reset();
         cached_dwrite_ = nullptr;
         cached_h_ = 0.0f;
-        cached_text_.clear();
-        cached_text_.shrink_to_fit();
-        sel_ranges_.clear();
-        sel_ranges_.shrink_to_fit();
+        std::wstring{}.swap(cached_text_);
+        decltype(sel_ranges_){}.swap(sel_ranges_);
     }
 
     bool on_key(HWND hwnd, UINT vk, bool& handled) {

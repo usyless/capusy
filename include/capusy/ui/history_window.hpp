@@ -89,8 +89,11 @@ public:
         apply_dark_window(hwnd_, DWMSBT_MAINWINDOW, true);
         cloak_window(hwnd_, false);
         minimized_ = false;
-        if (IsIconic(hwnd_)) ShowWindow(hwnd_, SW_RESTORE);
-        else ShowWindow(hwnd_, SW_SHOWNORMAL);
+        if (IsIconic(hwnd_)) {
+            ShowWindow(hwnd_, SW_RESTORE);
+        } else {
+            ShowWindow(hwnd_, SW_SHOWNORMAL);
+        }
         SetForegroundWindow(hwnd_);
         SetFocus(hwnd_);
         window_active_ = true;
@@ -215,7 +218,7 @@ public:
         }
     }
 
-    void reset_gpu() noexcept {
+    void reset_gpu() {
         video_.reset_gpu();
         target_.release();
         full_dirty_ = true;
@@ -276,7 +279,7 @@ private:
 
     enum class Filter : uint8_t { All = 0, Images, Videos };
 
-    enum HitId : int {
+    enum HitId : uint8_t {
         IdNone = 0,
         IdBtnFull,
         IdBtnRegion,
@@ -302,7 +305,7 @@ private:
         IdFooterInfo,
     };
 
-    enum CtxCmd : UINT {
+    enum CtxCmd : uint16_t {
         CmdOpen = 1001,
         CmdCopy,
         CmdCopyPath,
@@ -651,9 +654,7 @@ private:
         if (selection_.focus < 0 && !selection_.ids.empty()) {
             selection_.focus = find_index_of_id(*selection_.ids.begin());
         }
-        if (selection_.focus < 0) {
-            selection_.focus = 0;
-        }
+        selection_.focus = std::max(selection_.focus, 0);
         if (selection_.ids.empty()) {
             if (const auto fid = id_at(selection_.focus)) selection_.ids.insert(*fid);
         }
@@ -725,14 +726,14 @@ private:
     }
 
     void sync_preview_media() {
-        const CaptureEntry* e = selected_entry();
-        if (!e) {
+        if (!focused_row_) {
             video_.close();
             if (hwnd_) KillTimer(hwnd_, TIMER_VIDEO);
             return;
         }
+        const CaptureEntry& e = focused_row_->entry;
         const std::wstring& wpath = focused_row_->cache.wpath;
-        if (is_playable_video(*e)) {
+        if (is_playable_video(e)) {
             if (visible() && sh_.gfx.d3d()) {
                 video_.open(wpath, sh_.gfx.d3d(), sh_.gfx.epoch(), true);
                 SetTimer(hwnd_, TIMER_VIDEO, 16, nullptr);
@@ -740,13 +741,13 @@ private:
         } else {
             video_.close();
             if (hwnd_) KillTimer(hwnd_, TIMER_VIDEO);
-            sh_.previews.request(static_cast<uint64_t>(e->id), wpath, 2048);
+            sh_.previews.request(static_cast<uint64_t>(e.id), wpath, 2048);
         }
     }
 
     [[nodiscard]] double max_scroll() const noexcept {
         const double list_h = std::max(0.0, static_cast<double>(target_.size().height) - HEADER_H - SIDEBAR_TOP_H);
-        const double total_h = (total_count_ <= 0) ? 0.0 : (static_cast<double>(total_count_) * (ROW_H + ROW_GAP) + 12.0);
+        const double total_h = (total_count_ <= 0) ? 0.0 : ((static_cast<double>(total_count_) * (ROW_H + ROW_GAP)) + 12.0);
         return std::max(0.0, total_h - list_h);
     }
 
@@ -761,8 +762,11 @@ private:
         const double list_h = std::max(1.0, static_cast<double>(target_.size().height) - HEADER_H - SIDEBAR_TOP_H);
         const double top = 6.0 + (static_cast<double>(idx) * (ROW_H + ROW_GAP));
         const double bot = top + ROW_H;
-        if (top < target_scroll_) target_scroll_ = top - 6.0;
-        else if (bot > target_scroll_ + list_h) target_scroll_ = bot - list_h + 6.0;
+        if (top < target_scroll_) {
+            target_scroll_ = top - 6.0;
+        } else if (bot > target_scroll_ + list_h) {
+            target_scroll_ = bot - list_h + 6.0;
+        }
         clamp_scroll();
         start_anim();
     }
@@ -783,8 +787,11 @@ private:
         if (search_field_.focused == focus) return;
         search_field_.focused = focus;
         sync_caret_timer();
-        if (search_box_rect_.right > search_box_rect_.left) invalidate_rect(inset(search_box_rect_, -3.0f, -3.0f));
-        else invalidate();
+        if (search_box_rect_.right > search_box_rect_.left) {
+            invalidate_rect(inset(search_box_rect_, -3.0f, -3.0f));
+        } else {
+            invalidate();
+        }
     }
 
     void reset_caret_blink() noexcept {
@@ -854,17 +861,14 @@ private:
             full_dirty_ = true;
         }
 
-        if (video_.needs_recover() && sh_.gfx.d3d()) {
-            if (video_.recover_if_needed(sh_.gfx.d3d(), sh_.gfx.epoch())) {
-                SetTimer(hwnd_, TIMER_VIDEO, 16, nullptr);
-                full_dirty_ = true;
-            }
+        if (video_.needs_recover() && sh_.gfx.d3d() && video_.recover_if_needed(sh_.gfx.d3d(), sh_.gfx.epoch())) {
+            SetTimer(hwnd_, TIMER_VIDEO, 16, nullptr);
+            full_dirty_ = true;
         }
-        if (video_.active() && target_.dc()) {
-            if (video_.tick(sh_.gfx.d3d(), sh_.gfx.epoch(), target_.dc()) == MediaTickStatus::FrameReady && !full_dirty_) {
-                if (preview_rect_.right > preview_rect_.left) pending_dirty_.push_back(preview_rect_);
-                if (video_bar_rect_.right > video_bar_rect_.left) pending_dirty_.push_back(video_bar_rect_);
-            }
+        if (video_.active() && target_.dc() &&
+            video_.tick(sh_.gfx.d3d(), sh_.gfx.epoch(), target_.dc()) == MediaTickStatus::FrameReady && !full_dirty_) {
+            if (preview_rect_.right > preview_rect_.left) pending_dirty_.push_back(preview_rect_);
+            if (video_bar_rect_.right > video_bar_rect_.left) pending_dirty_.push_back(video_bar_rect_);
         }
 
         dirty_dips_scratch_.clear();
@@ -1090,8 +1094,11 @@ private:
         const bool was_vis = tooltip_.visible();
         tooltip_.clear(hwnd_, TIMER_TOOLTIP, false);
         if (was_vis) {
-            if (last_tooltip_dirty_) invalidate_rect(*last_tooltip_dirty_);
-            else invalidate();
+            if (last_tooltip_dirty_) {
+                invalidate_rect(*last_tooltip_dirty_);
+            } else {
+                invalidate();
+            }
         }
     }
 
@@ -1168,7 +1175,7 @@ private:
         if (sel_n > 1) {
             cnt.assign(format_count(sel_n));
             cnt.append(L" selected");
-        } else if (search_active_ && static_cast<uint64_t>(total_count_) != unfiltered_count_) {
+        } else if (search_active_ && std::cmp_not_equal(total_count_, unfiltered_count_)) {
             cnt.assign(format_count(static_cast<uint64_t>(total_count_)));
             cnt.append(L" / ");
             cnt.append(format_count(unfiltered_count_));
@@ -1196,7 +1203,7 @@ private:
             return;
         }
 
-        const double step = static_cast<double>(ROW_H + ROW_GAP);
+        const auto step = static_cast<double>(ROW_H + ROW_GAP);
         const int first = std::max(0, static_cast<int>(std::floor((scroll_ - 6.0) / step)));
         const int last = std::min(total_count_ - 1, static_cast<int>(std::ceil((scroll_ + static_cast<double>(height(list_r))) / step)));
         const UINT thumb_px = static_cast<UINT>(std::lround(112.0f * target_.scale()));
@@ -1225,7 +1232,7 @@ private:
             // Thumbnail box
             const D2D1_RECT_F tr = rect(rr.left + 8.0f, rr.top + 8.0f, 84.0f, ROW_H - 16.0f);
             cv.fill_round(tr, 7.0f, cv.theme().surface_lowest);
-            const uint64_t tid = static_cast<uint64_t>(e.id);
+            const auto tid = static_cast<uint64_t>(e.id);
             if (ID2D1Bitmap1* bmp = sh_.thumbs.get(tid)) {
                 cv.fill_bitmap_round(bmp, tr, 7.0f, ThumbFit::Crop);
             } else {
@@ -1331,10 +1338,10 @@ private:
             }
         } else {
             video_bar_rect_ = {};
-            const uint64_t tid = static_cast<uint64_t>(e->id);
+            const auto tid = static_cast<uint64_t>(e->id);
             ID2D1Bitmap1* bmp = sh_.previews.get(tid);
             if (!bmp) {
-                sh_.previews.request(tid, focused_row_->cache.wpath, 2048);
+                if (focused_row_) sh_.previews.request(tid, focused_row_->cache.wpath, 2048);
                 bmp = sh_.thumbs.get(tid);
             }
             if (bmp) {
@@ -1395,7 +1402,7 @@ private:
                 append_to(sub, format_size(sum.total_bytes).view(), L" total");
             }
             cv.text(sub, rect(foot.left + 12.0f, foot.top + 28.0f, info_w, 18.0f), Font::Caption, cv.theme().on_surface_variant);
-        } else {
+        } else if (focused_row_) {
             const RowCache& sel_rc = focused_row_->cache;
             std::wstring top_line;
             if (!sel_rc.window_title.empty()) {
@@ -1628,8 +1635,11 @@ private:
         const float r = std::max(l + 4.0f, scrub_rect_.right - pad);
         const float ratio = std::clamp((x - l) / (r - l), 0.0f, 1.0f);
         video_.seek(static_cast<double>(ratio) * video_.duration());
-        if (video_bar_rect_.right > video_bar_rect_.left) invalidate_rect(video_bar_rect_);
-        else invalidate();
+        if (video_bar_rect_.right > video_bar_rect_.left) {
+            invalidate_rect(video_bar_rect_);
+        } else {
+            invalidate();
+        }
     }
 
     void on_lbutton_down(LPARAM lp) {
@@ -1682,16 +1692,22 @@ private:
                 } else {
                     video_.toggle_play();
                     if (video_.needs_timer()) SetTimer(hwnd_, TIMER_VIDEO, 16, nullptr);
-                    if (video_bar_rect_.right > video_bar_rect_.left) invalidate_rect(video_bar_rect_);
-                    else invalidate();
+                    if (video_bar_rect_.right > video_bar_rect_.left) {
+                        invalidate_rect(video_bar_rect_);
+                    } else {
+                        invalidate();
+                    }
                 }
                 return;
             case IdVideoMute:
                 video_.toggle_mute();
                 sh_.settings.video_muted = video_.is_muted();
                 sh_.save();
-                if (video_bar_rect_.right > video_bar_rect_.left) invalidate_rect(video_bar_rect_);
-                else invalidate();
+                if (video_bar_rect_.right > video_bar_rect_.left) {
+                    invalidate_rect(video_bar_rect_);
+                } else {
+                    invalidate();
+                }
                 return;
             case IdVideoScrub:
                 scrubbing_video_ = true;
@@ -1717,7 +1733,7 @@ private:
                 if (!ctrl && !shift && h->index >= 0 && h->index < total_count_) {
                     drag_pending_ = true;
                     drag_idx_ = h->index;
-                    drag_start_px_ = {GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+                    drag_start_px_ = {.x = GET_X_LPARAM(lp), .y = GET_Y_LPARAM(lp)};
                     SetCapture(hwnd_);
                 }
                 invalidate();
@@ -1727,7 +1743,7 @@ private:
                 if (selection_.focus >= 0) {
                     drag_pending_ = true;
                     drag_idx_ = selection_.focus;
-                    drag_start_px_ = {GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+                    drag_start_px_ = {.x = GET_X_LPARAM(lp), .y = GET_Y_LPARAM(lp)};
                     SetCapture(hwnd_);
                 }
                 return;
@@ -1799,8 +1815,11 @@ private:
             tooltip_.on_hover_changed(hwnd_, TIMER_TOOLTIP, h, has_tooltip(nid, nidx), true);
             if (vis_changed || tooltip_.alpha.active()) start_anim();
         }
-        if (h && h->id == IdSearchBox) SetCursor(cursor_ibeam_);
-        else SetCursor((h && h->id != IdPreviewArea && h->id != IdFooterInfo) ? cursor_hand_ : cursor_arrow_);
+        if (h && h->id == IdSearchBox) {
+            SetCursor(cursor_ibeam_);
+        } else {
+            SetCursor((h && h->id != IdPreviewArea && h->id != IdFooterInfo) ? cursor_hand_ : cursor_arrow_);
+        }
         TRACKMOUSEEVENT tme{.cbSize = sizeof(tme), .dwFlags = TME_LEAVE, .hwndTrack = hwnd_};
         TrackMouseEvent(&tme);
     }
@@ -1875,8 +1894,11 @@ private:
             const bool changed = search_field_.on_key(hwnd_, vk, handled);
             if (handled) {
                 reset_caret_blink();
-                if (changed) schedule_search_update();
-                else invalidate();
+                if (changed) {
+                    schedule_search_update();
+                } else {
+                    invalidate();
+                }
                 return;
             }
             return;
@@ -1993,8 +2015,8 @@ private:
                         if (st == MediaTickStatus::FrameReady) {
                             if (preview_rect_.right > preview_rect_.left) invalidate_rect(preview_rect_);
                             if (video_bar_rect_.right > video_bar_rect_.left) invalidate_rect(video_bar_rect_);
-                        } else if (video_.is_playing()) {
-                            if (video_bar_rect_.right > video_bar_rect_.left) invalidate_rect(video_bar_rect_);
+                        } else if (video_.is_playing() && video_bar_rect_.right > video_bar_rect_.left) {
+                            invalidate_rect(video_bar_rect_);
                         }
                         if (!video_.needs_timer()) KillTimer(hwnd, TIMER_VIDEO);
                     }
@@ -2013,8 +2035,11 @@ private:
                 } else if (wp == TIMER_CARET) {
                     if (search_field_.focused && window_can_render_live(visible(), minimized_) && window_active_) {
                         search_field_.caret_on = !search_field_.caret_on;
-                        if (search_box_rect_.right > search_box_rect_.left) invalidate_rect(inset(search_box_rect_, -2.0f, -2.0f));
-                        else invalidate();
+                        if (search_box_rect_.right > search_box_rect_.left) {
+                            invalidate_rect(inset(search_box_rect_, -2.0f, -2.0f));
+                        } else {
+                            invalidate();
+                        }
                     } else {
                         KillTimer(hwnd, TIMER_CARET);
                     }

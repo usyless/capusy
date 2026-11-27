@@ -235,8 +235,8 @@ inline constexpr uint32_t RECORD_KEYFRAME_MAX_S = 10u;
         w &= ~1u;
         h &= ~1u;
     }
-    if (w < 16u) w = 16u;
-    if (h < 16u) h = 16u;
+    w = std::max(w, 16u);
+    h = std::max(h, 16u);
     return {w, h};
 }
 

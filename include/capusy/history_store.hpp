@@ -32,12 +32,12 @@
 
 namespace capusy {
 
-enum class CaptureKind : int32_t {
+enum class CaptureKind : uint8_t {
     Image = 0,
     Video = 1,
 };
 
-enum class CaptureMode : int32_t {
+enum class CaptureMode : uint8_t {
     Full = 0,
     Region = 1,
     Recording = 2,
@@ -70,7 +70,7 @@ struct CaptureEntry {
         const size_t start = pos;
         while (pos < query_lower.size() && query_lower[pos] != L' ' && query_lower[pos] != L'\t') ++pos;
         const std::wstring_view token = query_lower.substr(start, pos - start);
-        if (!token.empty() && haystack_lower.find(token) == std::wstring_view::npos) {
+        if (!token.empty() && !haystack_lower.contains(token)) {
             return false;
         }
     }
@@ -105,10 +105,9 @@ namespace detail {
 }
 
 [[nodiscard]] constexpr bool hs_is_ascii(std::string_view s) noexcept {
-    for (const char c : s) {
-        if (static_cast<unsigned char>(c) >= 0x80u) return false;
-    }
-    return true;
+    return std::ranges::all_of(s, [](char c) noexcept {
+        return static_cast<unsigned char>(c) < 0x80u;
+    });
 }
 
 /// Case-insensitive substring check for an already-lowercased ASCII needle against arbitrary UTF-8 haystack.
@@ -164,7 +163,7 @@ namespace detail {
     second = static_cast<unsigned>(rem % 60);
 #endif
     static constexpr std::array<const char*, 12> kMonths = {
-        "jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"
+        "jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec",
     };
     size_t p = 0;
     const auto push2 = [&](unsigned v) noexcept {
@@ -222,9 +221,9 @@ namespace detail {
     thread_local std::wstring whay;
     thread_local std::wstring wtok;
     if (!to_lower_w(hay, whay) || !to_lower_w(token_lower, wtok)) return false;
-    return whay.find(wtok) != std::wstring::npos;
+    return whay.contains(wtok);
 #else
-    return hay.find(token_lower) != std::string_view::npos;
+    return hay.contains(token_lower);
 #endif
 }
 
@@ -455,9 +454,7 @@ struct HistorySelection {
                 }
             }
         }
-        if (focus < 0) {
-            focus = 0;
-        }
+        focus = std::max(focus, 0);
         if (ids.empty()) {
             ids.insert(entries[static_cast<size_t>(focus)].id);
         }
@@ -668,8 +665,11 @@ public:
             }
             if (sqlite3_changes(db_) > 0) {
                 ++res.inserted;
-                if (entry.kind == CaptureKind::Video) ++res.inserted_videos;
-                else ++res.inserted_images;
+                if (entry.kind == CaptureKind::Video) {
+                    ++res.inserted_videos;
+                } else {
+                    ++res.inserted_images;
+                }
             } else {
                 ++res.duplicates;
             }
@@ -1125,9 +1125,13 @@ private:
             const auto* name = reinterpret_cast<const char*>(sqlite3_column_text(st.s, 1));
             if (!name) continue;
             const std::string_view col{name};
-            if (col == "window_title") has_window_title = true;
-            else if (col == "process_name") has_process_name = true;
-            else if (col == "format") has_format = true;
+            if (col == "window_title") {
+                has_window_title = true;
+            } else if (col == "process_name") {
+                has_process_name = true;
+            } else if (col == "format") {
+                has_format = true;
+            }
         }
         if (!has_window_title && !exec_locked("ALTER TABLE captures ADD COLUMN window_title TEXT NOT NULL DEFAULT '';", error)) return false;
         if (!has_process_name && !exec_locked("ALTER TABLE captures ADD COLUMN process_name TEXT NOT NULL DEFAULT '';", error)) return false;

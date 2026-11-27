@@ -102,11 +102,11 @@ struct Hsv {
     };
     FixedWString<16> out;
     out.push_back(L'#');
-    out.push_back(digits[(c.r >> 4u) & 0xFu]);
+    out.push_back(digits[(static_cast<unsigned>(c.r) >> 4u) & 0xFu]);
     out.push_back(digits[c.r & 0xFu]);
-    out.push_back(digits[(c.g >> 4u) & 0xFu]);
+    out.push_back(digits[(static_cast<unsigned>(c.g) >> 4u) & 0xFu]);
     out.push_back(digits[c.g & 0xFu]);
-    out.push_back(digits[(c.b >> 4u) & 0xFu]);
+    out.push_back(digits[(static_cast<unsigned>(c.b) >> 4u) & 0xFu]);
     out.push_back(digits[c.b & 0xFu]);
     return out;
 }
@@ -128,7 +128,7 @@ struct Hsv {
     const auto ux = static_cast<uint32_t>(x);
     const auto uy = static_cast<uint32_t>(y);
     if (ux >= w || uy >= h) return std::nullopt;
-    const size_t idx = (static_cast<size_t>(uy) * static_cast<size_t>(w) + static_cast<size_t>(ux)) * 4u;
+    const size_t idx = ((static_cast<size_t>(uy) * static_cast<size_t>(w)) + static_cast<size_t>(ux)) * 4u;
     if (idx + 3u >= pixels.size()) return std::nullopt;
     return Rgb8{.r = pixels[idx + 2u], .g = pixels[idx + 1u], .b = pixels[idx + 0u]};
 }
