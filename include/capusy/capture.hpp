@@ -223,9 +223,13 @@ inline SnapTargets enumerate_snap_targets(const std::vector<MonitorInfo>& monito
         auto* c = reinterpret_cast<EnumCtx*>(lp);
         if (!IsWindowVisible(hwnd) || IsIconic(hwnd)) return TRUE;
 
+        std::array<wchar_t, 64> cls{};
+        const int clen = GetClassNameW(hwnd, cls.data(), static_cast<int>(cls.size()));
+        const std::wstring_view sv = clen > 0 ? std::wstring_view{cls.data(), static_cast<size_t>(clen)} : std::wstring_view{};
+
         DWORD pid = 0;
         GetWindowThreadProcessId(hwnd, &pid);
-        if (pid == c->self_pid) return TRUE;
+        if (pid == c->self_pid && !is_capusy_user_window_class(sv)) return TRUE;
 
         DWORD cloaked = 0;
         if (SUCCEEDED(DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, &cloaked, sizeof(cloaked))) && cloaked != 0) {
@@ -233,14 +237,9 @@ inline SnapTargets enumerate_snap_targets(const std::vector<MonitorInfo>& monito
         }
 
         // Skip desktop wallpaper / invisible shell hosts
-        std::array<wchar_t, 64> cls{};
-        const int clen = GetClassNameW(hwnd, cls.data(), static_cast<int>(cls.size()));
-        if (clen > 0) {
-            const std::wstring_view sv{cls.data(), static_cast<size_t>(clen)};
-            if (sv == L"Progman" || sv == L"WorkerW" || sv == L"Windows.UI.Core.CoreWindow" ||
-                sv == L"ApplicationManager_ImmersiveShellWindow" || sv == L"EdgeUiInputTopWndClass") {
-                return TRUE;
-            }
+        if (sv == L"Progman" || sv == L"WorkerW" || sv == L"Windows.UI.Core.CoreWindow" ||
+            sv == L"ApplicationManager_ImmersiveShellWindow" || sv == L"EdgeUiInputTopWndClass") {
+            return TRUE;
         }
 
         RECT outer{};

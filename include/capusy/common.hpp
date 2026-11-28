@@ -276,13 +276,24 @@ struct WindowInfo {
     std::string process_name;
 };
 
-/// Reads the title and executable filename of `hwnd` (returns empty fields if invalid or owned by this process).
+[[nodiscard]] inline bool is_capusy_user_window_class(std::wstring_view cls) noexcept {
+    return cls == HISTORY_CLASS || cls == SETTINGS_CLASS;
+}
+
+/// Reads the title and executable filename of `hwnd` (returns empty fields if invalid or an internal capusy overlay/tray window).
 inline WindowInfo query_window_info(HWND hwnd) {
     WindowInfo info;
     if (!hwnd) return info;
     DWORD pid = 0;
     GetWindowThreadProcessId(hwnd, &pid);
-    if (pid == 0 || pid == GetCurrentProcessId()) return info;
+    if (pid == 0) return info;
+    if (pid == GetCurrentProcessId()) {
+        std::array<wchar_t, 64> cls{};
+        const int clen = GetClassNameW(hwnd, cls.data(), static_cast<int>(cls.size()));
+        if (clen <= 0 || !is_capusy_user_window_class(std::wstring_view{cls.data(), static_cast<size_t>(clen)})) {
+            return info;
+        }
+    }
 
     std::array<wchar_t, 512> title_buf; // NOLINT(cppcoreguidelines-pro-type-member-init)
     const int tlen = GetWindowTextW(hwnd, title_buf.data(), static_cast<int>(title_buf.size()));

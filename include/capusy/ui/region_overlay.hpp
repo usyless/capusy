@@ -305,6 +305,7 @@ public:
         active_annotation_.reset();
         hover_id_ = IdNone;
         hover_idx_ = 0;
+        visible_handles_mask_ = 0;
         color_picker_open_ = false;
         annotation_dropper_active_ = false;
         sync_picker_hsv_from_current();
@@ -315,7 +316,7 @@ public:
         GetCursorPos(&cur);
         cursor_vpt_ = cur;
         hovered_monitor_idx_ = monitor_index_at(cur);
-        hover_snap_ = need_snaps ? hit_snap_rect(snaps_, cur) : std::nullopt;
+        hover_snap_ = (need_snaps && is_snap_active()) ? hit_snap_rect(snaps_, cur) : std::nullopt;
 
         // 2. Create one native-DPI overlay HWND per physical monitor!
         HWND primary_or_cursor_hwnd = nullptr;
@@ -410,6 +411,7 @@ public:
         active_ann_prev_vrect_.reset();
         round_stroke_.reset();
         crosshair_dash_stroke_.reset();
+        thin_border_dash_stroke_.reset();
         picker_sv_bmp_.reset();
         picker_hue_bmp_.reset();
         picker_bmp_dc_ = nullptr;
@@ -417,6 +419,7 @@ public:
         color_picker_open_ = false;
         annotation_dropper_active_ = false;
         has_selection_ = false;
+        visible_handles_mask_ = 0;
         drag_kind_ = DragKind::None;
         open_dropdown_ = AudioDropdown::None;
         decltype(desktop_devices_){}.swap(desktop_devices_);
@@ -435,6 +438,7 @@ public:
     void reset_gpu() noexcept {
         round_stroke_.reset();
         crosshair_dash_stroke_.reset();
+        thin_border_dash_stroke_.reset();
         picker_sv_bmp_.reset();
         picker_hue_bmp_.reset();
         picker_bmp_dc_ = nullptr;
@@ -537,6 +541,14 @@ private:
                 D2D1_STROKE_TRANSFORM_TYPE_NORMAL);
             (void)sh_.gfx.d2d_factory()->CreateStrokeStyle(&props, dashes.data(), static_cast<UINT32>(dashes.size()), &crosshair_dash_stroke_);
         }
+        if (!thin_border_dash_stroke_) {
+            static constexpr std::array<float, 2> dashes = {6.0f, 4.0f};
+            const D2D1_STROKE_STYLE_PROPERTIES1 props = D2D1::StrokeStyleProperties1(
+                D2D1_CAP_STYLE_FLAT, D2D1_CAP_STYLE_FLAT, D2D1_CAP_STYLE_FLAT,
+                D2D1_LINE_JOIN_MITER, 10.0f, D2D1_DASH_STYLE_CUSTOM, 0.0f,
+                D2D1_STROKE_TRANSFORM_TYPE_NORMAL);
+            (void)sh_.gfx.d2d_factory()->CreateStrokeStyle(&props, dashes.data(), static_cast<UINT32>(dashes.size()), &thin_border_dash_stroke_);
+        }
     }
 
     bool upload_monitor_slice(MonitorWindow& mw) noexcept {
@@ -603,6 +615,80 @@ private:
                 return true;
             default:
                 return false;
+        }
+    }
+
+    [[nodiscard]] bool is_snap_active() const noexcept {
+        const bool shift_held = (GetKeyState(VK_SHIFT) < 0);
+        return sh_.settings.region_snap_enabled ? !shift_held : shift_held;
+    }
+
+    [[nodiscard]] static uint8_t resize_handle_bit(DragKind dk) noexcept {
+        switch (dk) {
+            case DragKind::ResizeNW: return 1u << 0u;
+            case DragKind::ResizeN:  return 1u << 1u;
+            case DragKind::ResizeNE: return 1u << 2u;
+            case DragKind::ResizeE:  return 1u << 3u;
+            case DragKind::ResizeSE: return 1u << 4u;
+            case DragKind::ResizeS:  return 1u << 5u;
+            case DragKind::ResizeSW: return 1u << 6u;
+            case DragKind::ResizeW:  return 1u << 7u;
+            default:                 return 0u;
+        }
+    }
+
+    [[nodiscard]] std::array<POINT, 8> selection_handle_points_vpx() const noexcept {
+        const LONG mx = (selection_.left + selection_.right) / 2;
+        const LONG my = (selection_.top + selection_.bottom) / 2;
+        return {{
+            {.x = selection_.left, .y = selection_.top},
+            {.x = mx, .y = selection_.top},
+            {.x = selection_.right, .y = selection_.top},
+            {.x = selection_.right, .y = my},
+            {.x = selection_.right, .y = selection_.bottom},
+            {.x = mx, .y = selection_.bottom},
+            {.x = selection_.left, .y = selection_.bottom},
+            {.x = selection_.left, .y = my},
+        },};
+    }
+
+    [[nodiscard]] uint8_t compute_visible_handles_mask() const noexcept {
+        if (!has_selection_ || !rect_valid(selection_) || tool_ != DrawTool::Select) return 0u;
+        if (mode_ == OverlayMode::Screenshot && instant_capture_) return 0u;
+        if (color_picker_open_ || open_dropdown_ != AudioDropdown::None || annotation_dropper_active_) return 0u;
+        if (is_resize_drag(drag_kind_)) return resize_handle_bit(drag_kind_);
+        if (drag_kind_ != DragKind::None) return 0u;
+        if (hover_id_ != IdNone) return 0u;
+
+        const MonitorWindow* cmw = cursor_monitor();
+        const float scale = cmw ? cmw->target.scale() : 1.0f;
+        uint8_t mask = resize_handle_bit(hit_selection_handle(cursor_vpt_, scale));
+        const float near_px = 32.0f * scale;
+        const float near_px2 = near_px * near_px;
+        const auto pts = selection_handle_points_vpx();
+        for (size_t i = 0; i < pts.size(); ++i) {
+            const auto dx = static_cast<float>(cursor_vpt_.x - pts[i].x);
+            const auto dy = static_cast<float>(cursor_vpt_.y - pts[i].y);
+            if (((dx * dx) + (dy * dy)) <= near_px2) {
+                mask = static_cast<uint8_t>(mask | (1u << i));
+            }
+        }
+        return mask;
+    }
+
+    void queue_handles_dirty(uint8_t changed_mask) {
+        if (changed_mask == 0u || !has_selection_ || !rect_valid(selection_)) return;
+        const auto pts = selection_handle_points_vpx();
+        for (const auto& m : monitors_) {
+            const float inv_s = 1.0f / m->target.scale();
+            const auto mon_x = static_cast<float>(m->info.rect.left);
+            const auto mon_y = static_cast<float>(m->info.rect.top);
+            for (size_t i = 0; i < pts.size(); ++i) {
+                if ((changed_mask & (1u << i)) == 0u) continue;
+                const float px = (static_cast<float>(pts[i].x) - mon_x) * inv_s;
+                const float py = (static_cast<float>(pts[i].y) - mon_y) * inv_s;
+                m->pending_dirty.push_back(D2D1::RectF(px - 8.0f, py - 8.0f, px + 8.0f, py + 8.0f));
+            }
         }
     }
 
@@ -695,6 +781,7 @@ private:
     }
 
     void render_all() {
+        visible_handles_mask_ = compute_visible_handles_mask();
         for (const auto& m : monitors_) {
             m->full_dirty = true;
             m->pending_dirty.clear();
@@ -842,8 +929,10 @@ private:
                 cv.fill(D2D1::RectF(0.0f, 0.0f, sz.width, sz.height), hex(0x09080c, 0.56f));
             } else {
                 cv.fill(D2D1::RectF(0.0f, 0.0f, sz.width, sz.height), hex(0xff5c5c, 0.04f));
-                const float border_w = sh_.settings.thin_selection_border ? inv_s : 4.0f;
-                cv.stroke(D2D1::RectF(0.0f, 0.0f, sz.width, sz.height), hex(0xff5c5c, 0.95f), border_w);
+                const bool thin = sh_.settings.thin_selection_border;
+                const float border_w = thin ? inv_s : 4.0f;
+                cv.stroke(D2D1::RectF(0.0f, 0.0f, sz.width, sz.height), hex(0xff5c5c, 0.95f), border_w,
+                          thin ? thin_border_dash_stroke_.get() : nullptr);
             }
 
             if (hovered || (hovered_monitor_idx_ >= monitors_.size() && mw.info.primary)) {
@@ -946,11 +1035,13 @@ private:
 
             // 4. Crisp border & resize handles
             const D2D1_COLOR_F accent = (mode_ == OverlayMode::RecordRegion) ? hex(0xff5c5c) : cv.theme().primary;
-            const float border_w = sh_.settings.thin_selection_border ? inv_s : (has_selection_ ? 2.0f : 1.5f);
-            cv.stroke(sr, accent, border_w);
+            const bool thin = sh_.settings.thin_selection_border;
+            const float border_w = thin ? inv_s : (has_selection_ ? 2.0f : 1.5f);
+            cv.stroke(sr, accent, border_w, thin ? thin_border_dash_stroke_.get() : nullptr);
 
-            if (has_selection_ && tool_ == DrawTool::Select) {
-                draw_resize_handles(cv, sr, accent, sh_.settings.thin_selection_border ? std::max(inv_s, 1.0f) : 1.8f);
+            const uint8_t handle_mask = compute_visible_handles_mask();
+            if (handle_mask != 0u) {
+                draw_resize_handles(cv, sr, accent, thin ? std::max(inv_s, 1.0f) : 1.8f, handle_mask);
             }
 
             // 5. Dimension badge above top-left of selection (on the monitor showing its top-left)
@@ -995,7 +1086,9 @@ private:
         // 7. Top hint banner before selection is made (on primary monitor)
         if (!has_selection_ && mw.info.primary) {
             if (mode_ == OverlayMode::RecordRegion) {
-                const std::wstring_view hint = L"Click a window/element or drag to select recording region  •  Hold Alt to disable snap  •  Esc to cancel";
+                const std::wstring_view hint = sh_.settings.region_snap_enabled
+                    ? L"Click a window/element or drag to select recording region  •  Hold Shift to disable snap  •  Esc to cancel"
+                    : L"Click a window/element or drag to select recording region  •  Hold Shift to enable snap  •  Esc to cancel";
                 const float hw = std::min(sz.width - 32.0f, cv.measure(hint, Font::SmallSemi) + 28.0f);
                 const D2D1_RECT_F hr = rect((sz.width - hw) * 0.5f, 16.0f, hw, 34.0f);
                 cv.shadow(hr, 17.0f, 8.0f, 0.35f);
@@ -1004,8 +1097,12 @@ private:
                 cv.text(hint, hr, Font::SmallSemi, cv.theme().on_surface, Align::Center);
             } else {
                 const std::wstring_view hint = instant_capture_
-                    ? L"Click a window or drag to capture  •  Hold Alt to disable snap  •  Esc to cancel"
-                    : L"Click a window or drag to select & edit  •  Hold Alt to disable snap  •  Esc to cancel";
+                    ? (sh_.settings.region_snap_enabled
+                           ? L"Click a window or drag to capture  •  Hold Shift to disable snap  •  Esc to cancel"
+                           : L"Click a window or drag to capture  •  Hold Shift to enable snap  •  Esc to cancel")
+                    : (sh_.settings.region_snap_enabled
+                           ? L"Click a window or drag to select & edit  •  Hold Shift to disable snap  •  Esc to cancel"
+                           : L"Click a window or drag to select & edit  •  Hold Shift to enable snap  •  Esc to cancel");
                 const wchar_t* mode_lbl = instant_capture_ ? L"Edit Mode (E)" : L"Instant Mode (E)";
                 const wchar_t mode_icon = instant_capture_ ? glyph::pen : glyph::camera;
                 const float btn_w = button_width(cv, mode_lbl, true, 114.0f);
@@ -1204,16 +1301,17 @@ private:
         return was_vis;
     }
 
-    static void draw_resize_handles(Canvas& cv, D2D1_RECT_F sr, D2D1_COLOR_F accent, float stroke_w = 1.8f) noexcept {
+    static void draw_resize_handles(Canvas& cv, D2D1_RECT_F sr, D2D1_COLOR_F accent, float stroke_w = 1.8f, uint8_t mask = 0xFFu) noexcept {
         const float mx = (sr.left + sr.right) * 0.5f;
         const float my = (sr.top + sr.bottom) * 0.5f;
         const std::array<D2D1_POINT_2F, 8> pts = {{
             {.x = sr.left, .y = sr.top}, {.x = mx, .y = sr.top}, {.x = sr.right, .y = sr.top}, {.x = sr.right, .y = my},
             {.x = sr.right, .y = sr.bottom}, {.x = mx, .y = sr.bottom}, {.x = sr.left, .y = sr.bottom}, {.x = sr.left, .y = my},
         },};
-        for (const D2D1_POINT_2F p : pts) {
-            cv.fill_circle(p, 4.5f, cv.theme().surface_lowest);
-            cv.stroke_circle(p, 4.5f, accent, stroke_w);
+        for (size_t i = 0; i < pts.size(); ++i) {
+            if ((mask & (1u << i)) == 0u) continue;
+            cv.fill_circle(pts[i], 4.5f, cv.theme().surface_lowest);
+            cv.stroke_circle(pts[i], 4.5f, accent, stroke_w);
         }
     }
 
@@ -2093,10 +2191,16 @@ private:
                 drag_kind_ = dk;
                 drag_start_ = vpt;
                 drag_orig_sel_ = selection_;
+                const uint8_t next_handles = compute_visible_handles_mask();
+                const auto changed_handles = static_cast<uint8_t>(next_handles ^ visible_handles_mask_);
+                visible_handles_mask_ = next_handles;
+                if (changed_handles != 0u) queue_handles_dirty(changed_handles);
                 if (sh_.settings.region_show_magnifier || sh_.settings.region_show_crosshairs) {
                     render_loupe_monitors();
-                } else if (tip_vis) {
-                    render_monitor(mw);
+                } else if (tip_vis || changed_handles != 0u) {
+                    for (const auto& m : monitors_) {
+                        if (!m->pending_dirty.empty() || (tip_vis && m.get() == &mw)) render_monitor(*m, false);
+                    }
                 }
                 return;
             }
@@ -2131,7 +2235,7 @@ private:
             render_loupe_monitors();
             return;
         }
-        const bool snap_on = (GetKeyState(VK_MENU) >= 0); // hold Alt to bypass magnetic snap
+        const bool snap_on = is_snap_active();
         const LONG snap_px = static_cast<LONG>(std::lround(10.0f * mw.target.scale()));
 
         if (drag_kind_ == DragKind::PickingSV) {
@@ -2190,6 +2294,9 @@ private:
                     hover_snap_ = next_snap;
                 }
             }
+            const uint8_t next_handles = compute_visible_handles_mask();
+            const auto changed_handles = static_cast<uint8_t>(next_handles ^ visible_handles_mask_);
+            visible_handles_mask_ = next_handles;
             update_cursor(mw, vpt, h);
             TRACKMOUSEEVENT tme{.cbSize = sizeof(tme), .dwFlags = TME_LEAVE, .hwndTrack = mw.hwnd};
             TrackMouseEvent(&tme);
@@ -2200,14 +2307,21 @@ private:
                     queue_hit_dirty(mw, old_id, old_idx, mw.pending_dirty);
                     queue_hit_dirty(mw, nid, nidx, mw.pending_dirty);
                 }
+                if (changed_handles != 0u) {
+                    queue_handles_dirty(changed_handles);
+                }
                 if (prev_tip_mw && prev_tip_mw != &mw) {
                     queue_hit_dirty(*prev_tip_mw, old_id, old_idx, prev_tip_mw->pending_dirty);
                     render_monitor(*prev_tip_mw, false);
                 }
                 if (annotation_dropper_active_ || sh_.settings.region_show_magnifier || sh_.settings.region_show_crosshairs) {
                     render_loupe_monitors();
-                } else if (hover_changed || mon_changed) {
-                    render_monitor(mw, false);
+                } else if (hover_changed || mon_changed || changed_handles != 0u) {
+                    for (const auto& m : monitors_) {
+                        if (!m->pending_dirty.empty() || ((hover_changed || mon_changed) && m.get() == &mw)) {
+                            render_monitor(*m, false);
+                        }
+                    }
                 }
             }
             return;
@@ -2257,6 +2371,10 @@ private:
             return;
         }
 
+        apply_selection_drag(vpt, snap_px, snap_on);
+    }
+
+    void apply_selection_drag(POINT vpt, LONG snap_px, bool snap_on) {
         if (drag_kind_ == DragKind::Creating) {
             if (std::abs(vpt.x - drag_start_.x) >= 4 || std::abs(vpt.y - drag_start_.y) >= 4) {
                 has_selection_ = true;
@@ -2329,6 +2447,30 @@ private:
         if (selection_.right - selection_.left < 8) selection_.right = selection_.left + 8;
         if (selection_.bottom - selection_.top < 8) selection_.bottom = selection_.top + 8;
         render_all();
+    }
+
+    void on_snap_modifier_changed() {
+        if (mode_ != OverlayMode::Screenshot && mode_ != OverlayMode::RecordRegion) return;
+        const bool snap_on = is_snap_active();
+        if (drag_kind_ == DragKind::None && !has_selection_) {
+            const auto next_snap = snap_on ? hit_snap_rect(snaps_, cursor_vpt_) : std::nullopt;
+            const bool snap_changed = (next_snap.has_value() != hover_snap_.has_value()) ||
+                                      (next_snap && hover_snap_ && (next_snap->left != hover_snap_->left || next_snap->top != hover_snap_->top ||
+                                                                    next_snap->right != hover_snap_->right || next_snap->bottom != hover_snap_->bottom));
+            if (snap_changed) {
+                hover_snap_ = next_snap;
+                render_all();
+            }
+            return;
+        }
+        if (drag_kind_ == DragKind::Creating || drag_kind_ == DragKind::Moving || is_resize_drag(drag_kind_)) {
+            snap_guide_x_.reset();
+            snap_guide_y_.reset();
+            const MonitorWindow* cmw = cursor_monitor();
+            const float scale = cmw ? cmw->target.scale() : (monitors_.empty() ? 1.0f : monitors_[0]->target.scale());
+            const LONG snap_px = static_cast<LONG>(std::lround(10.0f * scale));
+            apply_selection_drag(cursor_vpt_, snap_px, snap_on);
+        }
     }
 
     void on_lbutton_up(MonitorWindow& mw, LPARAM /*lp*/) {
@@ -2554,6 +2696,7 @@ private:
                     annotations_.clear();
                     redo_stack_.clear();
                     tool_ = DrawTool::Select;
+                    hover_snap_ = is_snap_active() ? hit_snap_rect(snaps_, cursor_vpt_) : std::nullopt;
                     render_all();
                 } else {
                     cancel();
@@ -2575,9 +2718,22 @@ private:
                 return 0;
             }
             case WM_KEYDOWN: {
+                if (wp == VK_SHIFT) {
+                    if ((static_cast<uint32_t>(lp) & (1u << 30u)) == 0u) {
+                        on_snap_modifier_changed();
+                    }
+                    return 0;
+                }
                 const bool tip_vis = dismiss_tooltip();
                 on_key_down(static_cast<UINT>(wp));
                 if (tip_vis && active()) render_monitor(mw);
+                return 0;
+            }
+            case WM_KEYUP: {
+                if (wp == VK_SHIFT) {
+                    on_snap_modifier_changed();
+                    return 0;
+                }
                 return 0;
             }
             case WM_SETCURSOR:
@@ -2601,9 +2757,11 @@ private:
     std::vector<std::unique_ptr<MonitorWindow>> monitors_;
     wil::com_ptr<ID2D1StrokeStyle1> round_stroke_;
     wil::com_ptr<ID2D1StrokeStyle1> crosshair_dash_stroke_;
+    wil::com_ptr<ID2D1StrokeStyle1> thin_border_dash_stroke_;
 
     bool has_selection_ = false;
     bool instant_capture_ = true;
+    uint8_t visible_handles_mask_ = 0u;
     AudioDropdown open_dropdown_ = AudioDropdown::None;
     std::vector<AudioDeviceInfo> desktop_devices_;
     std::vector<AudioDeviceInfo> mic_devices_;

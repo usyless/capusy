@@ -359,10 +359,10 @@ public:
         if (!intersects_clip(r, 1.0f)) return;
         dc_->FillRectangle(r, brush(c));
     }
-    void stroke(D2D1_RECT_F r, D2D1_COLOR_F c, float w = 1.0f) noexcept {
+    void stroke(D2D1_RECT_F r, D2D1_COLOR_F c, float w = 1.0f, ID2D1StrokeStyle* style = nullptr) noexcept {
         if (!intersects_clip(r, (w * 0.5f) + 1.0f)) return;
         const float h = w * 0.5f;
-        dc_->DrawRectangle(inset(r, h, h), brush(c), w);
+        dc_->DrawRectangle(inset(r, h, h), brush(c), w, style);
     }
     void fill_round(D2D1_RECT_F r, float radius, D2D1_COLOR_F c) noexcept {
         if (!intersects_clip(r, 1.0f)) return;

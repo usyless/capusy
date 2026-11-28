@@ -34,7 +34,8 @@ struct Settings {
     bool auto_copy_clipboard = true;
     bool capture_cursor = false;
     bool region_instant_capture = true; // Capture immediately on click/release instead of opening annotation toolbar
-    bool thin_selection_border = false; // Use crisp 1px borders during region selection and screen recording
+    bool region_snap_enabled = true;    // Snap to windows, controls, and edges by default during region selection (Shift toggles)
+    bool thin_selection_border = false; // Use crisp 1px dashed borders during region selection and screen recording
     bool region_show_magnifier = true;  // Show pixel magnifier loupe during region select and corner/edge resize
     bool region_show_crosshairs = false; // Show full-screen horizontal/vertical alignment lines from cursor
 

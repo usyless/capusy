@@ -51,6 +51,7 @@ public:
         if (!cursor_hand_) cursor_hand_ = LoadCursorW(nullptr, IDC_HAND);
 
         if (!sh_.gfx.ensure_device(nullptr)) return false;
+        ensure_stroke_style();
 
         // 1. Click-through border window wrapping the recorded region by 1px (thin) or 3px (default).
         // WS_EX_LAYERED | WS_EX_TRANSPARENT is required for true cross-process mouse click-through.
@@ -121,6 +122,7 @@ public:
         if (pill_hwnd_) KillTimer(pill_hwnd_, 1);
         border_target_.release();
         pill_target_.release();
+        dash_stroke_.reset();
         if (border_hwnd_) { DestroyWindow(border_hwnd_); border_hwnd_ = nullptr; }
         if (pill_hwnd_) { DestroyWindow(pill_hwnd_); pill_hwnd_ = nullptr; }
         decltype(pill_hits_){}.swap(pill_hits_);
@@ -134,6 +136,7 @@ public:
     void reset_gpu() noexcept {
         border_target_.release();
         pill_target_.release();
+        dash_stroke_.reset();
         pill_full_dirty_ = true;
         last_pill_sec_ = std::numeric_limits<uint64_t>::max();
     }
@@ -141,14 +144,25 @@ public:
     [[nodiscard]] bool visible() const noexcept { return pill_hwnd_ != nullptr; }
 
 private:
+    void ensure_stroke_style() noexcept {
+        if (!sh_.gfx.d2d_factory() || dash_stroke_) return;
+        static constexpr std::array<float, 2> dashes = {6.0f, 4.0f};
+        const D2D1_STROKE_STYLE_PROPERTIES1 props = D2D1::StrokeStyleProperties1(
+            D2D1_CAP_STYLE_FLAT, D2D1_CAP_STYLE_FLAT, D2D1_CAP_STYLE_FLAT,
+            D2D1_LINE_JOIN_MITER, 10.0f, D2D1_DASH_STYLE_CUSTOM, 0.0f,
+            D2D1_STROKE_TRANSFORM_TYPE_NORMAL);
+        (void)sh_.gfx.d2d_factory()->CreateStrokeStyle(&props, dashes.data(), static_cast<UINT32>(dashes.size()), &dash_stroke_);
+    }
+
     void render_border() {
         if (!border_target_.ready()) return;
         std::vector<Hit> unused;
         (void)border_target_.render_frame(true, {}, WindowTarget::PresentMode::Immediate, [&](std::optional<D2D1_RECT_F> clip, bool) {
             Canvas cv{border_target_, sh_.fonts, unused, default_theme(), clip};
             const D2D1_SIZE_F sz = border_target_.size();
-            const float stroke_w = sh_.settings.thin_selection_border ? (1.0f / border_target_.scale()) : 2.5f;
-            cv.stroke(D2D1::RectF(0.0f, 0.0f, sz.width, sz.height), hex(0xff4d4f, 0.92f), stroke_w);
+            const bool thin = sh_.settings.thin_selection_border;
+            const float stroke_w = thin ? (1.0f / border_target_.scale()) : 2.5f;
+            cv.stroke(D2D1::RectF(0.0f, 0.0f, sz.width, sz.height), hex(0xff4d4f, 0.92f), stroke_w, thin ? dash_stroke_.get() : nullptr);
         });
     }
 
@@ -300,6 +314,7 @@ private:
     HWND pill_hwnd_ = nullptr;
     WindowTarget border_target_;
     WindowTarget pill_target_;
+    wil::com_ptr<ID2D1StrokeStyle1> dash_stroke_;
     std::vector<Hit> pill_hits_;
     std::vector<Hit> pill_scratch_hits_;
     HCURSOR cursor_arrow_ = nullptr;

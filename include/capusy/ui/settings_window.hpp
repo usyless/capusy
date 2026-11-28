@@ -255,6 +255,7 @@ private:
         IdToggleAutoCopy,
         IdToggleCaptureCursor,
         IdToggleInstantRegion,
+        IdToggleRegionSnap,
         IdToggleThinBorder,
         IdToggleRegionMagnifier,
         IdToggleRegionCrosshairs,
@@ -413,6 +414,7 @@ private:
         sw_auto_copy_.set(sh_.settings.auto_copy_clipboard ? 1.0f : 0.0f, animate);
         sw_cap_cursor_.set(sh_.settings.capture_cursor ? 1.0f : 0.0f, animate);
         sw_instant_region_.set(sh_.settings.region_instant_capture ? 1.0f : 0.0f, animate);
+        sw_region_snap_.set(sh_.settings.region_snap_enabled ? 1.0f : 0.0f, animate);
         sw_thin_border_.set(sh_.settings.thin_selection_border ? 1.0f : 0.0f, animate);
         sw_region_magnifier_.set(sh_.settings.region_show_magnifier ? 1.0f : 0.0f, animate);
         sw_region_crosshairs_.set(sh_.settings.region_show_crosshairs ? 1.0f : 0.0f, animate);
@@ -483,6 +485,7 @@ private:
         check(sw_auto_copy_, IdToggleAutoCopy);
         check(sw_cap_cursor_, IdToggleCaptureCursor);
         check(sw_instant_region_, IdToggleInstantRegion);
+        check(sw_region_snap_, IdToggleRegionSnap);
         check(sw_thin_border_, IdToggleThinBorder);
         check(sw_region_magnifier_, IdToggleRegionMagnifier);
         check(sw_region_crosshairs_, IdToggleRegionCrosshairs);
@@ -512,6 +515,7 @@ private:
         if (sw_auto_copy_.step(dt, 22.0f, 0.004f)) moving = true;
         if (sw_cap_cursor_.step(dt, 22.0f, 0.004f)) moving = true;
         if (sw_instant_region_.step(dt, 22.0f, 0.004f)) moving = true;
+        if (sw_region_snap_.step(dt, 22.0f, 0.004f)) moving = true;
         if (sw_thin_border_.step(dt, 22.0f, 0.004f)) moving = true;
         if (sw_region_magnifier_.step(dt, 22.0f, 0.004f)) moving = true;
         if (sw_region_crosshairs_.step(dt, 22.0f, 0.004f)) moving = true;
@@ -1248,24 +1252,28 @@ private:
         // 2b. Region Overlay & Guides card
         {
             const CardHeader hd = make_header(cv, rw, L"Region Overlay & Guides", cv.theme().on_surface,
-                                              L"Selection and recording border thickness, pixel magnifier loupe, and cursor alignment lines");
-            const std::wstring_view l1 = L"Thinner (1px) borders for region selection & screen recording";
-            const std::wstring_view l2 = L"Show magnifying glass during region select & corner resize";
-            const std::wstring_view l3 = L"Show full-screen cursor alignment lines (crosshairs)";
+                                              L"Window & edge snapping, border style, pixel magnifier loupe, and cursor alignment lines");
+            const std::wstring_view l1 = L"Snap to windows & edges by default (hold Shift to toggle)";
+            const std::wstring_view l2 = L"Thinner (1px) dashed borders for region selection & screen recording";
+            const std::wstring_view l3 = L"Show magnifying glass during region select & corner resize";
+            const std::wstring_view l4 = L"Show full-screen cursor alignment lines (crosshairs)";
             const float r1_h = toggle_row_height(cv, l1, rw);
             const float r2_h = toggle_row_height(cv, l2, rw);
             const float r3_h = toggle_row_height(cv, l3, rw);
+            const float r4_h = toggle_row_height(cv, l4, rw);
 
             const float r1_y = y + 16.0f + hd.h + 12.0f;
             const float r2_y = r1_y + r1_h + 6.0f;
             const float r3_y = r2_y + r2_h + 6.0f;
-            const float card_h = (r3_y + r3_h + 16.0f) - y;
+            const float r4_y = r3_y + r3_h + 6.0f;
+            const float card_h = (r4_y + r4_h + 16.0f) - y;
             const float next_y = card_begin(cv, x, y, w, card_h, CARD_GAP);
 
             (void)draw_header(cv, lx, y, rw, hd);
-            draw_toggle_row(cv, lx, r1_y, rw, r1_h, l1, hover_.alpha(IdToggleThinBorder), sw_thin_border_.value, IdToggleThinBorder);
-            draw_toggle_row(cv, lx, r2_y, rw, r2_h, l2, hover_.alpha(IdToggleRegionMagnifier), sw_region_magnifier_.value, IdToggleRegionMagnifier);
-            draw_toggle_row(cv, lx, r3_y, rw, r3_h, l3, hover_.alpha(IdToggleRegionCrosshairs), sw_region_crosshairs_.value, IdToggleRegionCrosshairs);
+            draw_toggle_row(cv, lx, r1_y, rw, r1_h, l1, hover_.alpha(IdToggleRegionSnap), sw_region_snap_.value, IdToggleRegionSnap);
+            draw_toggle_row(cv, lx, r2_y, rw, r2_h, l2, hover_.alpha(IdToggleThinBorder), sw_thin_border_.value, IdToggleThinBorder);
+            draw_toggle_row(cv, lx, r3_y, rw, r3_h, l3, hover_.alpha(IdToggleRegionMagnifier), sw_region_magnifier_.value, IdToggleRegionMagnifier);
+            draw_toggle_row(cv, lx, r4_y, rw, r4_h, l4, hover_.alpha(IdToggleRegionCrosshairs), sw_region_crosshairs_.value, IdToggleRegionCrosshairs);
 
             y = next_y;
         }
@@ -2488,6 +2496,12 @@ private:
                 sync_state(true);
                 start_anim();
                 return;
+            case IdToggleRegionSnap:
+                sh_.settings.region_snap_enabled = !sh_.settings.region_snap_enabled;
+                sh_.save();
+                sync_state(true);
+                start_anim();
+                return;
             case IdToggleThinBorder:
                 sh_.settings.thin_selection_border = !sh_.settings.thin_selection_border;
                 sh_.save();
@@ -2976,6 +2990,7 @@ private:
     AnimFloat sw_auto_copy_;
     AnimFloat sw_cap_cursor_;
     AnimFloat sw_instant_region_;
+    AnimFloat sw_region_snap_;
     AnimFloat sw_thin_border_;
     AnimFloat sw_region_magnifier_;
     AnimFloat sw_region_crosshairs_;
