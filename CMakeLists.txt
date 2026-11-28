@@ -5,7 +5,7 @@ set(CMAKE_FIND_USE_PACKAGE_REGISTRY OFF CACHE BOOL "" FORCE)
 
 project(
     capusy
-    VERSION 0.1.3
+    VERSION 0.1.4
     LANGUAGES C CXX RC
 )
 
