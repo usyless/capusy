@@ -8,6 +8,8 @@
 #include <capusy/settings.hpp>
 #include <capusy/update_logic.hpp>
 
+#include <usylibpp/ui/drag_drop.hpp>
+
 #include <atomic>
 #include <dwmapi.h>
 #include <limits>
@@ -276,170 +278,15 @@ inline std::optional<std::wstring> browse_file_dialog(HWND owner, const wchar_t*
 }
 
 // ---------------------------------------------------------------------------------------------
-// OLE Drag & Drop + Clipboard (exact architecture reused from usyseek)
+// OLE Drag & Drop + Clipboard (shared implementation in usylibpp::ui::drag_drop)
 // ---------------------------------------------------------------------------------------------
 
-inline bool set_data_bytes(IDataObject* obj, CLIPFORMAT cf, const void* data, size_t n) noexcept {
-    if (!obj || !data || n == 0) return false;
-    HGLOBAL h = GlobalAlloc(GMEM_MOVEABLE, n);
-    if (!h) return false;
-    void* p = GlobalLock(h);
-    if (!p) {
-        GlobalFree(h);
-        return false;
-    }
-    std::memcpy(p, data, n);
-    GlobalUnlock(h);
-    FORMATETC fe{.cfFormat = cf, .ptd = nullptr, .dwAspect = DVASPECT_CONTENT, .lindex = -1, .tymed = TYMED_HGLOBAL};
-    STGMEDIUM sm{};
-    sm.tymed = TYMED_HGLOBAL;
-    sm.hGlobal = h;
-    if (SUCCEEDED(obj->SetData(&fe, &sm, TRUE))) return true;
-    GlobalFree(h);
-    return false;
-}
-
-inline wil::com_ptr<IDataObject> media_data_object(std::span<const std::wstring> paths) {
-    std::vector<PIDLIST_ABSOLUTE> pidls;
-    std::vector<std::wstring> found;
-    pidls.reserve(paths.size());
-    found.reserve(paths.size());
-    for (const auto& p : paths) {
-        if (PIDLIST_ABSOLUTE id = ILCreateFromPathW(p.c_str())) {
-            pidls.push_back(id);
-            found.push_back(p);
-        }
-    }
-    const auto free_pidls = wil::scope_exit([&] {
-        for (auto* id : pidls) ILFree(id);
-    });
-    if (pidls.empty()) return nullptr;
-
-    PIDLIST_ABSOLUTE parent = ILCloneFull(pidls.front());
-    if (!parent) return nullptr;
-    const auto free_parent = wil::scope_exit([&] { ILFree(parent); });
-    ILRemoveLastID(parent);
-    bool same_parent = true;
-    for (const auto* id : pidls) {
-        PIDLIST_ABSOLUTE pp = ILCloneFull(id);
-        if (!pp) return nullptr;
-        ILRemoveLastID(pp);
-        const bool eq = ILIsEqual(pp, parent) != FALSE;
-        ILFree(pp);
-        if (!eq) {
-            same_parent = false;
-            break;
-        }
-    }
-    std::vector<PCUITEMID_CHILD> children;
-    children.reserve(pidls.size());
-    for (const auto* id : pidls) children.push_back(same_parent ? ILFindLastID(id) : reinterpret_cast<PCUITEMID_CHILD>(id));
-    wil::com_ptr<IDataObject> obj;
-    if (FAILED(SHCreateDataObject(same_parent ? parent : nullptr, static_cast<UINT>(children.size()), children.data(), nullptr, IID_PPV_ARGS(&obj)))) return nullptr;
-
-    std::vector<uint8_t> buf(sizeof(DROPFILES));
-    for (const auto& p : found) {
-        const auto* b = reinterpret_cast<const uint8_t*>(p.c_str());
-        buf.insert(buf.end(), b, b + ((p.size() + 1) * sizeof(wchar_t)));
-    }
-    buf.insert(buf.end(), sizeof(wchar_t), 0);
-    DROPFILES df{};
-    df.pFiles = sizeof(DROPFILES);
-    df.fWide = TRUE;
-    std::memcpy(buf.data(), &df, sizeof(df));
-    set_data_bytes(obj.get(), CF_HDROP, buf.data(), buf.size());
-
-    const DWORD effect = DROPEFFECT_COPY;
-    set_data_bytes(obj.get(), static_cast<CLIPFORMAT>(RegisterClipboardFormatW(CFSTR_PREFERREDDROPEFFECT)), &effect, sizeof(effect));
-    return obj;
-}
-
-class AsyncDataObject final : public IDataObject, public IDataObjectAsyncCapability {
-public:
-    explicit AsyncDataObject(wil::com_ptr<IDataObject> inner) noexcept : inner_(std::move(inner)) {}
-    AsyncDataObject(const AsyncDataObject&) = delete;
-    AsyncDataObject& operator=(const AsyncDataObject&) = delete;
-    AsyncDataObject(AsyncDataObject&&) = delete;
-    AsyncDataObject& operator=(AsyncDataObject&&) = delete;
-
-    IFACEMETHODIMP QueryInterface(REFIID riid, void** ppv) noexcept override {
-        if (!ppv) return E_POINTER;
-        *ppv = nullptr;
-        if (riid == __uuidof(IUnknown) || riid == __uuidof(IDataObject)) {
-            *ppv = static_cast<IDataObject*>(this);
-        } else if (riid == __uuidof(IDataObjectAsyncCapability)) {
-            *ppv = static_cast<IDataObjectAsyncCapability*>(this);
-        }
-        if (*ppv) {
-            AddRef();
-            return S_OK;
-        }
-        return E_NOINTERFACE;
-    }
-
-    IFACEMETHODIMP_(ULONG) AddRef() noexcept override { return ++ref_count_; }
-    IFACEMETHODIMP_(ULONG) Release() noexcept override {
-        const ULONG count = --ref_count_;
-        if (count == 0) delete this;
-        return count;
-    }
-
-    IFACEMETHODIMP SetAsyncMode(BOOL fDoOpAsync) noexcept override {
-        async_mode_ = fDoOpAsync ? VARIANT_TRUE : VARIANT_FALSE;
-        return S_OK;
-    }
-    IFACEMETHODIMP GetAsyncMode(BOOL* pfIsOpAsync) noexcept override {
-        if (!pfIsOpAsync) return E_POINTER;
-        *pfIsOpAsync = async_mode_;
-        return S_OK;
-    }
-    IFACEMETHODIMP StartOperation(IBindCtx*) noexcept override {
-        in_operation_ = VARIANT_TRUE;
-        return S_OK;
-    }
-    IFACEMETHODIMP InOperation(BOOL* pfInAsyncOp) noexcept override {
-        if (!pfInAsyncOp) return E_POINTER;
-        *pfInAsyncOp = in_operation_;
-        return S_OK;
-    }
-    IFACEMETHODIMP EndOperation(HRESULT, IBindCtx*, DWORD) noexcept override {
-        in_operation_ = VARIANT_FALSE;
-        return S_OK;
-    }
-
-    [[nodiscard]] bool is_operation_active() const noexcept {
-        return in_operation_.load(std::memory_order_acquire) != VARIANT_FALSE &&
-               ref_count_.load(std::memory_order_acquire) > 1;
-    }
-
-    IFACEMETHODIMP GetData(FORMATETC* f, STGMEDIUM* m) noexcept override { return inner_ ? inner_->GetData(f, m) : E_UNEXPECTED; }
-    IFACEMETHODIMP GetDataHere(FORMATETC* f, STGMEDIUM* m) noexcept override { return inner_ ? inner_->GetDataHere(f, m) : E_UNEXPECTED; }
-    IFACEMETHODIMP QueryGetData(FORMATETC* f) noexcept override { return inner_ ? inner_->QueryGetData(f) : E_UNEXPECTED; }
-    IFACEMETHODIMP GetCanonicalFormatEtc(FORMATETC* a, FORMATETC* b) noexcept override { return inner_ ? inner_->GetCanonicalFormatEtc(a, b) : E_UNEXPECTED; }
-    IFACEMETHODIMP SetData(FORMATETC* f, STGMEDIUM* m, BOOL r) noexcept override { return inner_ ? inner_->SetData(f, m, r) : E_UNEXPECTED; }
-    IFACEMETHODIMP EnumFormatEtc(DWORD d, IEnumFORMATETC** e) noexcept override { return inner_ ? inner_->EnumFormatEtc(d, e) : E_UNEXPECTED; }
-    IFACEMETHODIMP DAdvise(FORMATETC* f, DWORD a, IAdviseSink* s, DWORD* c) noexcept override { return inner_ ? inner_->DAdvise(f, a, s, c) : E_UNEXPECTED; }
-    IFACEMETHODIMP DUnadvise(DWORD c) noexcept override { return inner_ ? inner_->DUnadvise(c) : E_UNEXPECTED; }
-    IFACEMETHODIMP EnumDAdvise(IEnumSTATDATA** e) noexcept override { return inner_ ? inner_->EnumDAdvise(e) : E_UNEXPECTED; }
-
-private:
-    ~AsyncDataObject() = default;
-    wil::com_ptr<IDataObject> inner_;
-    std::atomic<ULONG> ref_count_{1};
-    std::atomic<BOOL> async_mode_{VARIANT_TRUE};
-    std::atomic<BOOL> in_operation_{VARIANT_FALSE};
-};
+using ulp::ui::AsyncDataObject;
+using ulp::ui::media_data_object;
+using ulp::ui::set_data_bytes;
 
 inline wil::com_ptr<AsyncDataObject> drag_media(HWND hwnd, std::span<const std::wstring> paths) {
-    auto inner = media_data_object(paths);
-    if (!inner) return nullptr;
-    wil::com_ptr<AsyncDataObject> obj;
-    obj.attach(new (std::nothrow) AsyncDataObject(std::move(inner)));
-    if (!obj) return nullptr;
-    DWORD effect = DROPEFFECT_NONE;
-    (void)SHDoDragDrop(hwnd, static_cast<IDataObject*>(obj.get()), nullptr, DROPEFFECT_COPY | DROPEFFECT_LINK, &effect);
-    if (obj->is_operation_active()) return obj;
-    return nullptr;
+    return ulp::ui::drag_files(hwnd, paths);
 }
 
 struct ClipboardPayload {
