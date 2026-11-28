@@ -12,7 +12,6 @@
 
 #include <atomic>
 #include <dwmapi.h>
-#include <limits>
 #include <shellapi.h>
 #include <shlobj.h>
 #include <windowsx.h>
