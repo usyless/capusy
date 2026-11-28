@@ -96,10 +96,64 @@ struct CaptureDateTime {
     return dir;
 }
 
+/// Extracts a safe filename prefix from a window executable/process name (e.g. "Code.exe" -> "Code").
+/// Strips any directory prefix, trailing ".exe" (case-insensitive), trims whitespace/dots,
+/// replaces invalid Windows filename characters with '_', and falls back to "capusy" when empty.
+[[nodiscard]] inline FixedWString<64> sanitize_capture_prefix(std::wstring_view raw) noexcept {
+    if (const size_t slash = raw.find_last_of(L"\\/"); slash != std::wstring_view::npos) {
+        raw.remove_prefix(slash + 1);
+    }
+
+    const auto is_ws = [](wchar_t c) noexcept {
+        return c == L' ' || c == L'\t' || c == L'\r' || c == L'\n';
+    };
+    while (!raw.empty() && is_ws(raw.front())) raw.remove_prefix(1);
+    while (!raw.empty() && is_ws(raw.back())) raw.remove_suffix(1);
+
+    if (raw.size() >= 4) {
+        const std::wstring_view tail = raw.substr(raw.size() - 4);
+        const auto ascii_low = [](wchar_t c) noexcept -> wchar_t {
+            return (c >= L'A' && c <= L'Z') ? static_cast<wchar_t>(c + (L'a' - L'A')) : c;
+        };
+        if (tail[0] == L'.' && ascii_low(tail[1]) == L'e' && ascii_low(tail[2]) == L'x' && ascii_low(tail[3]) == L'e') {
+            raw.remove_suffix(4);
+        }
+    }
+
+    while (!raw.empty() && (is_ws(raw.front()) || raw.front() == L'.')) raw.remove_prefix(1);
+    while (!raw.empty() && (is_ws(raw.back()) || raw.back() == L'.')) raw.remove_suffix(1);
+
+    if (raw.size() > FixedWString<64>::capacity()) {
+        raw = raw.substr(0, FixedWString<64>::capacity());
+        while (!raw.empty() && (is_ws(raw.back()) || raw.back() == L'.')) raw.remove_suffix(1);
+    }
+
+    FixedWString<64> out;
+    bool has_valid_char = false;
+    for (const wchar_t raw_c : raw) {
+        if (raw_c < 0x20 || raw_c == L'<' || raw_c == L'>' || raw_c == L':' || raw_c == L'"' ||
+            raw_c == L'/' || raw_c == L'\\' || raw_c == L'|' || raw_c == L'?' || raw_c == L'*') {
+            out.push_back(L'_');
+        } else {
+            out.push_back(raw_c);
+            has_valid_char = true;
+        }
+    }
+
+    if (!has_valid_char || out.empty()) {
+        out.assign(L"capusy");
+    }
+    return out;
+}
+
 /// Pure path builder taking explicit local date/time & sequence number (for deterministic testing).
 [[nodiscard]] inline std::filesystem::path make_capture_path_for_time(const std::filesystem::path& dir, std::wstring_view ext,
-                                                                      const CaptureDateTime& dt, uint64_t seq, bool split_by_month = true) {
-    FixedWString<96> name{L"capusy_"};
+                                                                      const CaptureDateTime& dt, uint64_t seq, bool split_by_month = true,
+                                                                      std::wstring_view prefix = {}) {
+    const FixedWString<64> clean_prefix = sanitize_capture_prefix(prefix);
+    FixedWString<160> name;
+    name.append(clean_prefix.view());
+    name.push_back(L'_');
     const auto push2 = [&](uint16_t v) noexcept {
         name.push_back(static_cast<wchar_t>(L'0' + ((v / 10) % 10)));
         name.push_back(static_cast<wchar_t>(L'0' + (v % 10)));

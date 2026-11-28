@@ -450,7 +450,8 @@ private:
                     saver_queue_.pop_front();
                 }
 
-                const fs::path path = make_capture_path(job.save_dir, image_format_ext(job.image_format), job.split_by_month);
+                const std::wstring prefix = job.window_info.process_name.empty() ? std::wstring{} : to_wide(job.window_info.process_name);
+                const fs::path path = make_capture_path(job.save_dir, image_format_ext(job.image_format), job.split_by_month, prefix);
                 uint64_t bytes = 0;
                 if (!save_raster_image(job.raster, path, job.image_format, job.image_quality, &bytes, wic.get())) continue;
 

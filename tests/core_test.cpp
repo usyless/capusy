@@ -262,6 +262,28 @@ static void test_capture_paths_and_formats() {
     const fs::path flat = make_capture_path_for_time(fs::path{L"C:\\Caps"}, L".jpg", dt, 2, false);
     CHECK(flat == fs::path{L"C:\\Caps"} / L"capusy_2026-04-07_09-05-03_042_2.jpg");
 
+    // Window executable name prefix with fallback to "capusy"
+    CHECK(sanitize_capture_prefix(L"Code.exe").view() == L"Code");
+    CHECK(sanitize_capture_prefix(L"chrome.EXE").view() == L"chrome");
+    CHECK(sanitize_capture_prefix(L"Discord").view() == L"Discord");
+    CHECK(sanitize_capture_prefix(L"C:\\Program Files\\App\\My App.exe").view() == L"My App");
+    CHECK(sanitize_capture_prefix(L"foo:bar*baz.exe").view() == L"foo_bar_baz");
+    CHECK(sanitize_capture_prefix(L"").view() == L"capusy");
+    CHECK(sanitize_capture_prefix(L"   ").view() == L"capusy");
+    CHECK(sanitize_capture_prefix(L".exe").view() == L"capusy");
+    CHECK(sanitize_capture_prefix(L"***").view() == L"capusy");
+    CHECK(sanitize_capture_prefix(L"...").view() == L"capusy");
+
+    const fs::path with_exe = make_capture_path_for_time(fs::path{L"C:\\Caps"}, L".png", dt, 3, true, L"Code.exe");
+    CHECK(with_exe == fs::path{L"C:\\Caps"} / L"2026-04" / L"Code_2026-04-07_09-05-03_042_3.png");
+
+    const fs::path fallback_empty = make_capture_path_for_time(fs::path{L"C:\\Caps"}, L".png", dt, 4, false, L"");
+    CHECK(fallback_empty == fs::path{L"C:\\Caps"} / L"capusy_2026-04-07_09-05-03_042_4.png");
+
+    const std::wstring long_exe(100, L'A');
+    const fs::path long_path = make_capture_path_for_time(fs::path{L"C:\\Caps"}, L".png", dt, 5, false, long_exe);
+    CHECK(long_path.filename().wstring() == std::wstring(63, L'A') + L"_2026-04-07_09-05-03_042_5.png");
+
     CHECK(resolve_active_capture_dir_for_time(fs::path{L"C:\\Caps"}, dt, true) == fs::path{L"C:\\Caps"} / L"2026-04");
     CHECK(resolve_active_capture_dir_for_time(fs::path{L"C:\\Caps"}, dt, false) == fs::path{L"C:\\Caps"});
 

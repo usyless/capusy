@@ -405,7 +405,8 @@ inline std::optional<ui::Raster> crop_virtual_capture(const VirtualCapture& cap,
 
 /// Generates a unique timestamped filename in `dir` (optionally nested in `YYYY-MM`) with an atomic sequence suffix
 /// so unlimited rapid-fire screenshots never collide.
-inline fs::path make_capture_path(const fs::path& dir, std::wstring_view ext, bool split_by_month = true) {
+inline fs::path make_capture_path(const fs::path& dir, std::wstring_view ext, bool split_by_month = true,
+                                  std::wstring_view prefix = {}) {
     static std::atomic<uint64_t> seq{0};
     const uint64_t n = ++seq;
     SYSTEMTIME st{};
@@ -419,7 +420,7 @@ inline fs::path make_capture_path(const fs::path& dir, std::wstring_view ext, bo
         .second = st.wSecond,
         .millisecond = st.wMilliseconds,
     };
-    return make_capture_path_for_time(dir, ext, dt, n, split_by_month);
+    return make_capture_path_for_time(dir, ext, dt, n, split_by_month, prefix);
 }
 
 /// Encodes a 32bpp BGRA raster to the chosen WIC container format (PNG, JPEG, BMP, TIFF),
