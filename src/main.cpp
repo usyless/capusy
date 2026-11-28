@@ -202,7 +202,7 @@ private:
             show_balloon(ulp::str::concat_strings(L"Update available: capusy ", ver_label, L". Click to open Settings -> About."), NIIF_INFO);
         };
 
-        toast_win_->on_clicked = [this](const std::wstring& path) {
+        toast_win_->on_clicked = [](const std::wstring& path) {
             if (!path.empty()) (void)open_file(path);
         };
 
